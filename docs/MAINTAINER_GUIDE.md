@@ -37,6 +37,15 @@
 - 运行时私有扫描格式、恢复参数和新会话参数必须留在对应适配器中。
 - 公共流程只依赖注册表和统一接力模型。
 
+## 开源发布
+
+- GitHub 公开仓库是 `https://github.com/x0c/session-continue`，本地远端名为 `github`；原 `origin` 仍指向内部 Forgejo，用于同步备份。
+- 项目历史版本线已经到 `v0.2.x`，新增公开发布版本必须沿现有标签递增，不能从 `0.1.0` 重新开始。
+- 打包元数据同时维护 `pyproject.toml` 和 `setup.cfg`。当前环境的旧版 setuptools 会把只写在 `pyproject.toml` 的包名解析成 `UNKNOWN-0.0.0`，所以改版本号、入口、描述或项目链接时要同步两处。
+- 发布前至少构建一次 wheel，确认产物名形如 `session_continue-<version>-py3-none-any.whl`，并用临时目录安装后检查 `sc = sc:main` 入口元数据。
+- 开源前隐私扫描要覆盖准备提交的文件和完整 Git 历史补丁内容；本机 `.git/config` 里的内部远端不进入仓库内容，但真实文件、历史提交、Release 说明和 README 不能包含密钥、个人路径、内网地址或占位符。
+- GitHub Release 发布后检查 Actions、Release、topics 和仓库可见性；当前仓库 topics 为 `claude-code`、`codex-cli`、`terminal`、`tui`、`session-manager`、`ai-coding-agent`。
+
 ## 真实路径验证
 
 改标题、排序或列宽后，除编译和单测外，还要做真实路径验证：
