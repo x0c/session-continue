@@ -585,6 +585,39 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(sc._fit_cell("标题很长", 5), "标题 ")
         self.assertEqual(sc._text_width(sc._fit_cell("✅完成", 8)), 8)
 
+    def test_preview_wraps_chinese_and_shows_recent_messages(self) -> None:
+        session = {
+            "cwd_display": "~/Codes/demo",
+            "mtime": 1_000_000.0,
+            "size_kb": 2048,
+            "status_tag": "✅已完成",
+            "first_user_msg": "请分析启动速度",
+            "last_user_msg": "再增加会话预览",
+            "last_agent_msg": "已经完成实现和验证",
+        }
+
+        with mock.patch.object(sc, "_format_relative_time", return_value="刚刚"):
+            lines = sc._preview_lines(session, "终端会话工具", 12)
+
+        self.assertIn("会话开头", lines)
+        self.assertIn("最近提问", lines)
+        self.assertIn("最近回复", lines)
+        self.assertTrue(all(sc._text_width(line) <= 12 for line in lines))
+
+    def test_preview_hides_duplicate_first_and_last_user_message(self) -> None:
+        session = {
+            "mtime": 1_000_000.0,
+            "size_kb": 0,
+            "first_user_msg": "同一条问题",
+            "last_user_msg": "同一条问题",
+            "last_agent_msg": "回复内容",
+        }
+
+        lines = sc._preview_lines(session, "标题", 40)
+
+        self.assertNotIn("最近提问", lines)
+        self.assertEqual(lines.count("同一条问题"), 1)
+
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
         col_num, col_title, col_dir, col_time, col_size, col_status = sc._column_widths(120)
 
