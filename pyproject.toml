@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "session-continue"
+version = "0.1.0"
+description = "Terminal session picker and handoff tool for Claude Code and Codex CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "session-continue contributors" }]
+keywords = [
+  "claude-code",
+  "codex-cli",
+  "terminal",
+  "tui",
+  "session-manager",
+  "ai-coding-agent",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console :: Curses",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: Terminals",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/x0c/session-continue"
+Issues = "https://github.com/x0c/session-continue/issues"
+
+[project.scripts]
+sc = "sc:main"
+
+[tool.setuptools]
+py-modules = ["models", "sc", "scan_claude", "scan_codex", "titles"]
+packages = ["runtime"]
