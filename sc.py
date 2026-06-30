@@ -443,13 +443,6 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
     stdscr.refresh()
 
 
-def _preview_geometry(height: int, width: int) -> tuple[int, int, int, int]:
-    """计算居中预览弹窗的位置与尺寸。"""
-    box_width = min(100, max(20, width - 4))
-    box_height = min(28, max(7, height - 4))
-    return (height - box_height) // 2, (width - box_width) // 2, box_height, box_width
-
-
 def _draw_preview(
     stdscr,
     messages: list[ConversationMessage],
@@ -457,30 +450,27 @@ def _draw_preview(
     runtime_name: str,
     scroll: int,
 ) -> int:
-    """在主列表上绘制聊天记录弹窗，返回修正后的滚动位置。"""
+    """全屏绘制聊天记录，返回修正后的滚动位置。"""
+    stdscr.erase()
     height, width = stdscr.getmaxyx()
-    if height < 9 or width < 30:
+    if height < 5 or width < 20:
+        stdscr.refresh()
         return 0
 
-    top, left, box_height, box_width = _preview_geometry(height, width)
     normal = curses.color_pair(PAIR_DIM)
     dim = normal | curses.A_DIM
     key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
     user_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
     assistant_attr = curses.color_pair(PAIR_DONE) | curses.A_BOLD
-    inner_width = box_width - 4
+    inner_width = width - 3
     lines = _preview_lines(messages, runtime_name, inner_width)
-    visible_height = box_height - 4
+    visible_height = height - 4
     max_scroll = max(0, len(lines) - visible_height)
     scroll = min(max(0, scroll), max_scroll)
 
-    stdscr.addnstr(top, left, "┌" + "─" * (box_width - 2) + "┐", box_width, normal)
-    for row in range(1, box_height - 1):
-        stdscr.addnstr(top + row, left, "│" + " " * (box_width - 2) + "│", box_width, normal)
-    stdscr.addnstr(top + box_height - 1, left, "└" + "─" * (box_width - 2) + "┘", box_width, normal)
-
     header = f" 对话预览 · {title} "
-    stdscr.addnstr(top, left + 2, header, box_width - 4, user_attr)
+    stdscr.addnstr(0, 0, header, width - 1, user_attr)
+    stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
     for row, (kind, line) in enumerate(lines[scroll:scroll + visible_height]):
         if kind == "user":
             attr = user_attr
@@ -490,15 +480,15 @@ def _draw_preview(
             attr = dim
         else:
             attr = curses.A_NORMAL
-        stdscr.addnstr(top + 1 + row, left + 2, line, inner_width, attr)
+        stdscr.addnstr(2 + row, 1, line, inner_width, attr)
 
-    footer_y = top + box_height - 3
-    stdscr.addnstr(footer_y, left, "├" + "─" * (box_width - 2) + "┤", box_width, dim)
+    footer_y = height - 2
+    stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
     hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Space/q 关闭"
-    stdscr.addnstr(footer_y + 1, left + 2, hint, inner_width, key_attr)
+    stdscr.addnstr(footer_y + 1, 0, hint, width - 1, key_attr)
     if max_scroll:
         progress = f"{scroll + 1}/{max_scroll + 1}"
-        progress_x = left + box_width - 2 - _text_width(progress)
+        progress_x = max(0, width - 1 - _text_width(progress))
         stdscr.addnstr(footer_y + 1, progress_x, progress, len(progress), dim)
     stdscr.refresh()
     return scroll
@@ -518,6 +508,7 @@ def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> Non
         if ch == -1:
             continue
         if ch in (ord(" "), ord("q")):
+            stdscr.clear()
             return
         if ch in (curses.KEY_UP, ord("k")):
             scroll = max(0, scroll - 1)

@@ -690,11 +690,27 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(text_lines.count("◆ Codex"), 2)
         self.assertTrue(all(sc._text_width(line) <= 16 for line in text_lines))
 
-    def test_preview_is_a_centered_popup(self) -> None:
-        top, left, height, width = sc._preview_geometry(40, 140)
+    def test_preview_uses_full_terminal_and_clears_before_returning(self) -> None:
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        messages = [sc.ConversationMessage("user", "问题")]
 
-        self.assertEqual((height, width), (28, 100))
-        self.assertEqual((top, left), (6, 20))
+        with mock.patch.object(sc.curses, "color_pair", return_value=0):
+            sc._draw_preview(screen, messages, "标题", "Claude", 0)
+
+        screen.erase.assert_called_once_with()
+        positions = {(call.args[0], call.args[1]) for call in screen.addnstr.call_args_list}
+        self.assertIn((0, 0), positions)
+        self.assertIn((23, 0), positions)
+
+        store = mock.Mock()
+        store.get_conversation.return_value = messages
+        store.registry.get.return_value.display_name = "Claude"
+        session = {"source": "claude", "id": "abc"}
+        screen.getch.return_value = ord("q")
+        with mock.patch.object(sc, "_draw_preview", return_value=0):
+            sc._show_preview(screen, store, session, "标题")
+        screen.clear.assert_called_once_with()
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
         col_num, col_title, col_dir, col_time, col_size, col_status = sc._column_widths(120)
