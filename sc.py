@@ -484,7 +484,7 @@ def _draw_preview(
 
     footer_y = height - 2
     stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
-    hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Space/q 关闭"
+    hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Enter 恢复  Space/q 关闭"
     stdscr.addnstr(footer_y + 1, 0, hint, width - 1, key_attr)
     if max_scroll:
         progress = f"{scroll + 1}/{max_scroll + 1}"
@@ -494,8 +494,8 @@ def _draw_preview(
     return scroll
 
 
-def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> None:
-    """打开聊天记录弹窗；空格或 q 关闭，方向键滚动。"""
+def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> bool:
+    """打开全屏聊天记录；回车恢复会话，空格或 q 关闭。"""
     messages = store.get_conversation(session)
     runtime_name = store.registry.get(str(session.get("source") or "")).display_name
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
@@ -509,7 +509,10 @@ def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> Non
             continue
         if ch in (ord(" "), ord("q")):
             stdscr.clear()
-            return
+            return False
+        if ch in (10, 13, curses.KEY_ENTER):
+            stdscr.clear()
+            return True
         if ch in (curses.KEY_UP, ord("k")):
             scroll = max(0, scroll - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
@@ -659,7 +662,9 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
         elif ch == ord(" "):
             if sessions:
                 session = sessions[idx]
-                _show_preview(stdscr, store, session, store.get_title(session))
+                title = store.get_title(session)
+                if _show_preview(stdscr, store, session, title):
+                    return LaunchRequest(session, source, title)
         elif ch in (10, 13, curses.KEY_ENTER):
             if sessions:
                 session = sessions[idx]

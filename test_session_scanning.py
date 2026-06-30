@@ -709,7 +709,15 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc"}
         screen.getch.return_value = ord("q")
         with mock.patch.object(sc, "_draw_preview", return_value=0):
-            sc._show_preview(screen, store, session, "标题")
+            should_resume = sc._show_preview(screen, store, session, "标题")
+        self.assertFalse(should_resume)
+        screen.clear.assert_called_once_with()
+
+        screen.clear.reset_mock()
+        screen.getch.return_value = 10
+        with mock.patch.object(sc, "_draw_preview", return_value=0):
+            should_resume = sc._show_preview(screen, store, session, "标题")
+        self.assertTrue(should_resume)
         screen.clear.assert_called_once_with()
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
