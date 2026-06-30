@@ -17,6 +17,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
+from models import ConversationMessage
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects/")
 
@@ -431,6 +432,64 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     _apply_effective_times(results)
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results[:limit]
+
+
+def load_conversation(path: str) -> list[ConversationMessage]:
+    """按时间顺序读取真实用户消息和 Claude 每轮最终答复。"""
+    messages: list[ConversationMessage] = []
+    pending_legacy_answer: str | None = None
+
+    def flush_legacy_answer() -> None:
+        nonlocal pending_legacy_answer
+        if pending_legacy_answer and (
+            not messages or messages[-1].role != "assistant" or messages[-1].text != pending_legacy_answer
+        ):
+            messages.append(ConversationMessage("assistant", pending_legacy_answer))
+        pending_legacy_answer = None
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as file:
+            for line in file:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("isMeta") or entry.get("isSidechain"):
+                    continue
+
+                entry_type = entry.get("type")
+                message = entry.get("message", {})
+                if not isinstance(message, dict):
+                    continue
+
+                if entry_type == "user":
+                    text = _extract_text(message.get("content", ""))
+                    if text and text != _INTERRUPTED_MARKER:
+                        flush_legacy_answer()
+                        messages.append(ConversationMessage("user", text))
+                    continue
+
+                if entry_type != "assistant" or message.get("stop_reason") not in (None, "end_turn"):
+                    continue
+                content = message.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                text_parts = [
+                    str(part.get("text", "")).strip()
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text", "").strip()
+                ]
+                if text_parts:
+                    text = "\n\n".join(text_parts)
+                    if message.get("stop_reason") is None:
+                        pending_legacy_answer = text
+                    elif not messages or messages[-1].role != "assistant" or messages[-1].text != text:
+                        pending_legacy_answer = None
+                        messages.append(ConversationMessage("assistant", text))
+    except OSError:
+        return []
+    flush_legacy_answer()
+    return messages
 
 
 if __name__ == "__main__":

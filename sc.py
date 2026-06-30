@@ -30,7 +30,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import titles
-from models import LaunchRequest, session_key
+from models import ConversationMessage, LaunchRequest, session_key
 from runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch
 
 
@@ -126,40 +126,26 @@ def _wrap_preview_text(text: str, width: int) -> list[str]:
     return lines
 
 
-def _preview_lines(session: dict, title: str, width: int) -> list[str]:
-    """把统一会话摘要整理成与具体运行时无关的预览内容。"""
-    content_width = max(1, width)
-    lines: list[str] = []
+def _preview_lines(
+    messages: list[ConversationMessage], runtime_name: str, width: int,
+) -> list[tuple[str, str]]:
+    """把真实会话消息整理为带角色样式的聊天记录行。"""
+    content_width = max(1, width - 2)
+    if not messages:
+        return [("dim", "没有可预览的用户消息或最终答复")]
 
-    def add(label: str, value: str) -> None:
-        if not value.strip():
-            return
+    lines: list[tuple[str, str]] = []
+    for message in messages:
         if lines:
-            lines.append("")
-        lines.append(label)
-        lines.extend(_wrap_preview_text(value.strip(), content_width))
-
-    lines.extend(_wrap_preview_text(title, content_width))
-    metadata = "  ".join(
-        value for value in (
-            session.get("cwd_display", ""),
-            _format_relative_time(session.get("mtime", 0)),
-            _format_size(session.get("size_kb", 0)),
-            session.get("status_tag", ""),
-        ) if value
-    )
-    if metadata:
-        lines.extend(_wrap_preview_text(metadata, content_width))
-
-    first_user = session.get("first_user_msg", "")
-    last_user = session.get("last_user_msg", "")
-    last_agent = session.get("last_agent_msg", "")
-    add("会话开头", first_user)
-    if last_user and last_user != first_user:
-        add("最近提问", last_user)
-    add("最近回复", last_agent)
-    if not first_user and not last_user and not last_agent:
-        add("会话内容", "没有可预览的文本内容")
+            lines.append(("blank", ""))
+        if message.role == "user":
+            lines.append(("user", "● 你"))
+        else:
+            lines.append(("assistant", f"◆ {runtime_name}"))
+        lines.extend(
+            ("body", f"  {line}")
+            for line in _wrap_preview_text(message.text.strip(), content_width)
+        )
     return lines
 
 
@@ -243,6 +229,7 @@ class SessionStore:
         self.dirty = threading.Event()
         self.cache = titles.load_cache()
         self.generating: set[str] = set()  # 仍是临时兜底、等待后台进程产出的会话键（转圈圈）
+        self.conversations: dict[str, list[ConversationMessage]] = {}
         self._cache_mtime: float = self._cache_file_mtime()
 
     @staticmethod
@@ -298,6 +285,18 @@ class SessionStore:
     def get_title(self, session: dict) -> str:
         with self.lock:
             return self.display_titles.get(session_key(session), session["fallback_title"])
+
+    def get_conversation(self, session: dict) -> list[ConversationMessage]:
+        """按需读取并缓存选中会话的真实聊天记录。"""
+        key = session_key(session)
+        with self.lock:
+            if key in self.conversations:
+                return list(self.conversations[key])
+        runtime = self.registry.get(str(session.get("source") or ""))
+        messages = runtime.load_conversation(session)
+        with self.lock:
+            self.conversations[key] = list(messages)
+        return messages
 
 
 def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: int = 0) -> None:
@@ -444,45 +443,74 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
     stdscr.refresh()
 
 
-def _draw_preview(stdscr, session: dict, title: str, scroll: int) -> int:
-    """绘制会话预览，返回按当前终端尺寸修正后的滚动位置。"""
-    stdscr.erase()
+def _preview_geometry(height: int, width: int) -> tuple[int, int, int, int]:
+    """计算居中预览弹窗的位置与尺寸。"""
+    box_width = min(100, max(20, width - 4))
+    box_height = min(28, max(7, height - 4))
+    return (height - box_height) // 2, (width - box_width) // 2, box_height, box_width
+
+
+def _draw_preview(
+    stdscr,
+    messages: list[ConversationMessage],
+    title: str,
+    runtime_name: str,
+    scroll: int,
+) -> int:
+    """在主列表上绘制聊天记录弹窗，返回修正后的滚动位置。"""
     height, width = stdscr.getmaxyx()
-    if height < 5 or width < 20:
-        stdscr.refresh()
+    if height < 9 or width < 30:
         return 0
 
-    dim = curses.color_pair(PAIR_DIM) | curses.A_DIM
-    heading = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
+    top, left, box_height, box_width = _preview_geometry(height, width)
+    normal = curses.color_pair(PAIR_DIM)
+    dim = normal | curses.A_DIM
     key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
-    content_width = max(1, width - 3)
-    lines = _preview_lines(session, title, content_width)
-    visible_height = max(1, height - 4)
+    user_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
+    assistant_attr = curses.color_pair(PAIR_DONE) | curses.A_BOLD
+    inner_width = box_width - 4
+    lines = _preview_lines(messages, runtime_name, inner_width)
+    visible_height = box_height - 4
     max_scroll = max(0, len(lines) - visible_height)
     scroll = min(max(0, scroll), max_scroll)
 
-    stdscr.addnstr(0, 0, " 会话预览 ", width - 1, heading)
-    stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
-    for row, line in enumerate(lines[scroll:scroll + visible_height]):
-        attr = heading if line in {"会话开头", "最近提问", "最近回复", "会话内容"} else curses.A_NORMAL
-        stdscr.addnstr(2 + row, 1, line, content_width, attr)
+    stdscr.addnstr(top, left, "┌" + "─" * (box_width - 2) + "┐", box_width, normal)
+    for row in range(1, box_height - 1):
+        stdscr.addnstr(top + row, left, "│" + " " * (box_width - 2) + "│", box_width, normal)
+    stdscr.addnstr(top + box_height - 1, left, "└" + "─" * (box_width - 2) + "┘", box_width, normal)
 
-    stdscr.addnstr(height - 2, 0, "─" * (width - 1), width - 1, dim)
-    hint = "↑↓/j/k 滚动   Space/q 关闭"
-    stdscr.addnstr(height - 1, 0, hint, width - 1, key_attr)
+    header = f" 对话预览 · {title} "
+    stdscr.addnstr(top, left + 2, header, box_width - 4, user_attr)
+    for row, (kind, line) in enumerate(lines[scroll:scroll + visible_height]):
+        if kind == "user":
+            attr = user_attr
+        elif kind == "assistant":
+            attr = assistant_attr
+        elif kind == "dim":
+            attr = dim
+        else:
+            attr = curses.A_NORMAL
+        stdscr.addnstr(top + 1 + row, left + 2, line, inner_width, attr)
+
+    footer_y = top + box_height - 3
+    stdscr.addnstr(footer_y, left, "├" + "─" * (box_width - 2) + "┤", box_width, dim)
+    hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Space/q 关闭"
+    stdscr.addnstr(footer_y + 1, left + 2, hint, inner_width, key_attr)
     if max_scroll:
         progress = f"{scroll + 1}/{max_scroll + 1}"
-        progress_x = max(0, width - 1 - _text_width(progress))
-        stdscr.addnstr(height - 1, progress_x, progress, width - 1 - progress_x, dim)
+        progress_x = left + box_width - 2 - _text_width(progress)
+        stdscr.addnstr(footer_y + 1, progress_x, progress, len(progress), dim)
     stdscr.refresh()
     return scroll
 
 
-def _show_preview(stdscr, session: dict, title: str) -> None:
-    """打开只读会话预览；空格或 q 关闭，方向键滚动。"""
-    scroll = 0
+def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> None:
+    """打开聊天记录弹窗；空格或 q 关闭，方向键滚动。"""
+    messages = store.get_conversation(session)
+    runtime_name = store.registry.get(str(session.get("source") or "")).display_name
+    scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
     while True:
-        scroll = _draw_preview(stdscr, session, title, scroll)
+        scroll = _draw_preview(stdscr, messages, title, runtime_name, scroll)
         try:
             ch = stdscr.getch()
         except curses.error:
@@ -496,9 +524,13 @@ def _show_preview(stdscr, session: dict, title: str) -> None:
         elif ch in (curses.KEY_DOWN, ord("j")):
             scroll += 1
         elif ch == curses.KEY_PPAGE:
-            scroll = max(0, scroll - max(1, stdscr.getmaxyx()[0] - 4))
+            scroll = max(0, scroll - 10)
         elif ch == curses.KEY_NPAGE:
-            scroll += max(1, stdscr.getmaxyx()[0] - 4)
+            scroll += 10
+        elif ch == curses.KEY_HOME:
+            scroll = 0
+        elif ch == curses.KEY_END:
+            scroll = 10 ** 9
 
 
 def _draw_runtime_menu(stdscr, store: SessionStore, source: str, selected: int) -> None:
@@ -636,7 +668,7 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
         elif ch == ord(" "):
             if sessions:
                 session = sessions[idx]
-                _show_preview(stdscr, session, store.get_title(session))
+                _show_preview(stdscr, store, session, store.get_title(session))
         elif ch in (10, 13, curses.KEY_ENTER):
             if sessions:
                 session = sessions[idx]

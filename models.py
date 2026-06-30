@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 
 class SessionInfo(TypedDict):
@@ -31,6 +31,14 @@ def session_key(session: SessionInfo | dict) -> str:
     """返回跨运行时唯一的会话键，避免不同运行时的 ID 相互覆盖。"""
     runtime_id = str(session.get("source") or "unknown")
     return f"{runtime_id}:{session['id']}"
+
+
+@dataclass(frozen=True)
+class ConversationMessage:
+    """从运行时私有历史中提取出的单条用户消息或最终答复。"""
+
+    role: Literal["user", "assistant"]
+    text: str
 
 
 @dataclass(frozen=True)

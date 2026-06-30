@@ -7,6 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 import titles
+import runtime.registry as runtime_registry
 from models import Handoff, LaunchPlan, LaunchRequest, session_key
 from runtime import BaseRuntime, LaunchError, RuntimeRegistry, default_registry
 
@@ -18,6 +19,9 @@ class FakeRuntime(BaseRuntime):
     history_reading_hint = "测试格式"
 
     def scan_sessions(self, limit: int) -> list[dict]:
+        return []
+
+    def load_conversation(self, session: dict) -> list:
         return []
 
     def build_resume_plan(self, session: dict) -> LaunchPlan:
@@ -110,6 +114,19 @@ class RuntimeTests(unittest.TestCase):
         codex = {"source": "codex", "id": "same"}
 
         self.assertNotEqual(session_key(claude), session_key(codex))
+
+    def test_execute_launch_wraps_command_with_tmux(self) -> None:
+        plan = LaunchPlan(("claude", "--resume", "session-123"), None)
+        with (
+            mock.patch.object(runtime_registry.shutil, "which", return_value="/usr/bin/tool"),
+            mock.patch.object(runtime_registry.os, "execvp") as execvp,
+        ):
+            runtime_registry.execute_launch(plan, use_tmux=True, session_id="session-123")
+
+        execvp.assert_called_once_with(
+            "tmux",
+            ["tmux", "new-session", "-A", "-s", "sc-claude-session-", "--", *plan.argv],
+        )
 
     def test_generated_title_cache_is_runtime_scoped(self) -> None:
         sessions = [

@@ -6,7 +6,7 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 
-from models import Handoff, LaunchPlan, SessionInfo
+from models import ConversationMessage, Handoff, LaunchPlan, SessionInfo
 
 
 class LaunchError(RuntimeError):
@@ -32,6 +32,10 @@ class BaseRuntime(ABC):
     @abstractmethod
     def scan_sessions(self, limit: int) -> list[SessionInfo]:
         """扫描并返回该运行时的本地会话。"""
+
+    @abstractmethod
+    def load_conversation(self, session: SessionInfo) -> list[ConversationMessage]:
+        """按时间顺序读取用户消息和每轮最终答复。"""
 
     @abstractmethod
     def build_resume_plan(self, session: SessionInfo) -> LaunchPlan:

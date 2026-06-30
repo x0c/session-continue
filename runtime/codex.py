@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import scan_codex
-from models import Handoff, LaunchPlan, SessionInfo
+from models import ConversationMessage, Handoff, LaunchPlan, SessionInfo
 from runtime.base import BaseRuntime, usable_cwd
 
 
@@ -20,6 +20,9 @@ class CodexRuntime(BaseRuntime):
 
     def scan_sessions(self, limit: int) -> list[SessionInfo]:
         return scan_codex.scan_sessions(limit=limit)
+
+    def load_conversation(self, session: SessionInfo) -> list[ConversationMessage]:
+        return scan_codex.load_conversation(str(session.get("path") or ""))
 
     def build_resume_plan(self, session: SessionInfo) -> LaunchPlan:
         return LaunchPlan(
@@ -48,4 +51,3 @@ class CodexRuntime(BaseRuntime):
             ),
             cwd=usable_cwd(handoff.original_cwd),
         )
-

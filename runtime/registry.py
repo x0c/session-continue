@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from collections.abc import Iterable
 
@@ -55,13 +56,23 @@ def default_registry() -> RuntimeRegistry:
     return RuntimeRegistry((ClaudeRuntime(), CodexRuntime()))
 
 
-def execute_launch(plan: LaunchPlan) -> None:
-    """校验启动计划并让目标运行时接管当前终端。"""
+def execute_launch(plan: LaunchPlan, use_tmux: bool = False, session_id: str = "") -> None:
+    """校验启动计划，并按需通过 tmux 保活后接管当前终端。"""
     executable = plan.argv[0]
     if shutil.which(executable) is None:
         raise LaunchError(f"未找到 {executable} 命令，请先安装对应运行时")
     if plan.cwd:
         os.chdir(plan.cwd)
+    if use_tmux:
+        if shutil.which("tmux") is None:
+            raise LaunchError("未找到 tmux 命令，请先安装 tmux")
+        safe_id = re.sub(r"[^a-zA-Z0-9-]", "", session_id[:8]) if session_id else "new"
+        tmux_name = f"sc-{executable}-{safe_id}"
+        try:
+            os.execvp("tmux", ["tmux", "new-session", "-A", "-s", tmux_name, "--", *plan.argv])
+            return
+        except OSError as exc:
+            raise LaunchError(f"无法启动 tmux：{exc}") from exc
     try:
         os.execvp(executable, list(plan.argv))
     except OSError as exc:

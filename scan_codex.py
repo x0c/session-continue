@@ -15,6 +15,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
+from models import ConversationMessage
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 SESSION_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
@@ -283,6 +284,40 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results[:limit]
+
+
+def load_conversation(path: str) -> list[ConversationMessage]:
+    """按时间顺序读取真实用户消息和 Codex 每轮最终答复。"""
+    messages: list[ConversationMessage] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as file:
+            for line in file:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "event_msg":
+                    continue
+                payload = entry.get("payload", {})
+                if not isinstance(payload, dict):
+                    continue
+
+                payload_type = payload.get("type")
+                if payload_type == "user_message":
+                    text = str(payload.get("message", "")).strip()
+                    if text:
+                        messages.append(ConversationMessage("user", text))
+                elif payload_type == "agent_message" and payload.get("phase") in (None, "final_answer"):
+                    text = str(payload.get("message", "")).strip()
+                    if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
+                        messages.append(ConversationMessage("assistant", text))
+                elif payload_type == "task_complete":
+                    text = str(payload.get("last_agent_message", "")).strip()
+                    if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
+                        messages.append(ConversationMessage("assistant", text))
+    except OSError:
+        return []
+    return messages
 
 
 if __name__ == "__main__":

@@ -506,6 +506,67 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             self.assertEqual(info["first_user_msg"], "修复会话展示")
 
 
+class ConversationPreviewTests(unittest.TestCase):
+    def test_claude_conversation_keeps_users_and_end_turn_answers_only(self) -> None:
+        entries = [
+            {"type": "user", "message": {"content": "第一个问题"}},
+            {
+                "type": "assistant",
+                "message": {"stop_reason": "tool_use", "content": [{"type": "text", "text": "处理中间状态"}]},
+            },
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "工具结果"}]}},
+            {
+                "type": "assistant",
+                "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "第一个最终答复"}]},
+            },
+            {"type": "user", "isMeta": True, "message": {"content": "内部提醒"}},
+            {"type": "user", "message": {"content": "第二个问题"}},
+            {
+                "type": "assistant",
+                "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "第二个最终答复"}]},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_claude.load_conversation(str(path))
+
+        self.assertEqual(
+            [(message.role, message.text) for message in messages],
+            [
+                ("user", "第一个问题"),
+                ("assistant", "第一个最终答复"),
+                ("user", "第二个问题"),
+                ("assistant", "第二个最终答复"),
+            ],
+        )
+
+    def test_codex_conversation_uses_final_answer_and_removes_task_complete_duplicate(self) -> None:
+        entries = [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "用户问题"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "commentary", "message": "处理中间状态"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": "最终答复"},
+            },
+            {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "最终答复"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_codex.load_conversation(str(path))
+
+        self.assertEqual(
+            [(message.role, message.text) for message in messages],
+            [("user", "用户问题"), ("assistant", "最终答复")],
+        )
+
+
 class TuiLayoutTests(unittest.TestCase):
     def test_session_store_uses_compact_title_before_background_generation(self) -> None:
         session = {
@@ -566,6 +627,33 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertNotIn(key, store.generating)
         self.assertTrue(store.dirty.is_set())
 
+    def test_conversation_is_loaded_lazily_and_cached(self) -> None:
+        session = {
+            "source": "claude",
+            "id": "abc",
+            "short_id": "abc",
+            "mtime": 1,
+            "size_bytes": 1,
+            "size_kb": 1,
+            "native_title": None,
+            "fallback_title": "测试会话",
+        }
+        runtime = mock.Mock()
+        runtime.id = "claude"
+        runtime.display_name = "Claude"
+        runtime.scan_sessions.return_value = [session]
+        runtime.load_conversation.return_value = [sc.ConversationMessage("user", "问题")]
+        registry = sc.RuntimeRegistry((runtime,))
+
+        with mock.patch.object(sc.titles, "load_cache", return_value={}):
+            store = sc.SessionStore(limit=20, registry=registry)
+            store.load()
+
+        runtime.load_conversation.assert_not_called()
+        self.assertEqual(store.get_conversation(session), [sc.ConversationMessage("user", "问题")])
+        self.assertEqual(store.get_conversation(session), [sc.ConversationMessage("user", "问题")])
+        runtime.load_conversation.assert_called_once_with(session)
+
     def test_format_relative_time_thresholds(self) -> None:
         now = 1_000_000.0
         self.assertEqual(sc._format_relative_time(now - 5, now), "刚刚")
@@ -585,38 +673,28 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(sc._fit_cell("标题很长", 5), "标题 ")
         self.assertEqual(sc._text_width(sc._fit_cell("✅完成", 8)), 8)
 
-    def test_preview_wraps_chinese_and_shows_recent_messages(self) -> None:
-        session = {
-            "cwd_display": "~/Codes/demo",
-            "mtime": 1_000_000.0,
-            "size_kb": 2048,
-            "status_tag": "✅已完成",
-            "first_user_msg": "请分析启动速度",
-            "last_user_msg": "再增加会话预览",
-            "last_agent_msg": "已经完成实现和验证",
-        }
+    def test_preview_renders_messages_as_chronological_chat(self) -> None:
+        messages = [
+            sc.ConversationMessage("user", "请分析启动速度"),
+            sc.ConversationMessage("assistant", "主要耗时来自历史扫描"),
+            sc.ConversationMessage("user", "再增加聊天记录预览"),
+            sc.ConversationMessage("assistant", "已经完成实现和验证"),
+        ]
 
-        with mock.patch.object(sc, "_format_relative_time", return_value="刚刚"):
-            lines = sc._preview_lines(session, "终端会话工具", 12)
+        lines = sc._preview_lines(messages, "Codex", 16)
+        text_lines = [line for _, line in lines]
 
-        self.assertIn("会话开头", lines)
-        self.assertIn("最近提问", lines)
-        self.assertIn("最近回复", lines)
-        self.assertTrue(all(sc._text_width(line) <= 12 for line in lines))
+        self.assertEqual(text_lines[0], "● 你")
+        self.assertIn("◆ Codex", text_lines)
+        self.assertEqual(text_lines.count("● 你"), 2)
+        self.assertEqual(text_lines.count("◆ Codex"), 2)
+        self.assertTrue(all(sc._text_width(line) <= 16 for line in text_lines))
 
-    def test_preview_hides_duplicate_first_and_last_user_message(self) -> None:
-        session = {
-            "mtime": 1_000_000.0,
-            "size_kb": 0,
-            "first_user_msg": "同一条问题",
-            "last_user_msg": "同一条问题",
-            "last_agent_msg": "回复内容",
-        }
+    def test_preview_is_a_centered_popup(self) -> None:
+        top, left, height, width = sc._preview_geometry(40, 140)
 
-        lines = sc._preview_lines(session, "标题", 40)
-
-        self.assertNotIn("最近提问", lines)
-        self.assertEqual(lines.count("同一条问题"), 1)
+        self.assertEqual((height, width), (28, 100))
+        self.assertEqual((top, left), (6, 20))
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
         col_num, col_title, col_dir, col_time, col_size, col_status = sc._column_widths(120)
