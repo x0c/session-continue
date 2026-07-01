@@ -1,0 +1,22 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  bump-homebrew-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: session-continue
+          formula-path: Formula/session-continue.rb
+          homebrew-tap: x0c/homebrew-tap
+          base-branch: main
+          download-url: https://github.com/x0c/session-continue/archive/refs/tags/${{ github.ref_name }}.tar.gz
+          commit-message: |
+            {{formulaName}} {{version}}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

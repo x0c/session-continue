@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# 一键安装 session-continue（不使用 Homebrew 的场景，例如 Linux 或未装 Homebrew 的 macOS）。
+# 用法：curl -fsSL https://raw.githubusercontent.com/x0c/session-continue/main/install.sh | bash
+set -euo pipefail
+
+REPO="x0c/session-continue"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "错误：未找到 python3，请先安装 Python 3.10 及以上版本" >&2
+  exit 1
+fi
+
+PYMAJOR=$(python3 -c 'import sys; print(sys.version_info[0])')
+PYMINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
+if [ "$PYMAJOR" -lt 3 ] || { [ "$PYMAJOR" -eq 3 ] && [ "$PYMINOR" -lt 10 ]; }; then
+  echo "错误：需要 Python 3.10 及以上版本，当前是 ${PYMAJOR}.${PYMINOR}" >&2
+  exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "错误：未找到 curl，无法查询最新版本号" >&2
+  exit 1
+fi
+
+VERSION="${SC_VERSION:-}"
+if [ -z "$VERSION" ]; then
+  VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+fi
+
+echo "正在安装 session-continue ${VERSION} ..."
+python3 -m pip install --user --upgrade "git+https://github.com/${REPO}.git@${VERSION}"
+
+SCRIPTS_DIR="$(python3 -m site --user-base)/bin"
+case ":${PATH}:" in
+  *":${SCRIPTS_DIR}:"*)
+    echo "安装完成，运行 sc 开始使用。"
+    ;;
+  *)
+    echo ""
+    echo "安装完成，但 ${SCRIPTS_DIR} 不在 PATH 中。"
+    echo "请将以下内容加入你的 shell 配置文件（如 ~/.bashrc 或 ~/.zshrc）后重新打开终端："
+    echo "  export PATH=\"${SCRIPTS_DIR}:\$PATH\""
+    ;;
+esac

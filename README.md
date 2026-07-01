@@ -38,6 +38,20 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 
 ## Install
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install x0c/tap/session-continue
+```
+
+### Install Script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/x0c/session-continue/main/install.sh | bash
+```
+
+Requires Python 3.10+. Installs via `pip install --user` and prints a `PATH` hint if the install directory isn't already on it.
+
 ### From Source
 
 ```bash
