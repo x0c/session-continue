@@ -95,6 +95,28 @@ sc --json --limit 5 # script-friendly small result set
 
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
 
+## Agent / Automation
+
+`sc` also exposes read-only, structured subcommands meant for AI agents to query local session
+history — list, search, inspect, and build a handoff context package. None of them launch or
+resume anything; what to do with the data is left to the caller.
+
+```bash
+sc list --cwd my-app --status pending   # structured session list, filterable
+sc search weather app --deep            # find sessions by topic (title/messages/cwd)
+sc show <session-id-prefix>             # session detail + conversation
+sc context <session-id-prefix>          # handoff package: history path, suggested prompt, resume command
+sc describe [command]                   # machine-readable command/argument/field reference
+```
+
+Every command prints a JSON envelope (`{ok, data, error, meta}`) and uses fine-grained exit codes
+(`0` success, `2` usage error, `3` not found, `5` ambiguous session reference). Running `sc` with no
+subcommand outside a real terminal (piped, scripted, or invoked by an agent) also falls back to a
+JSON session list instead of trying to start the curses TUI.
+
+See [docs/SKILL.md](docs/SKILL.md) for the full command reference, field semantics, and typical
+agent workflows.
+
 ## Key Bindings
 
 | Key | Action |
@@ -140,11 +162,13 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 | Path | Purpose |
 | --- | --- |
 | `sc.py` | curses TUI, preview screen, JSON output, and process handoff |
+| `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
 | `models.py` | shared session, handoff, and launch-plan data models |
 | `runtime/` | runtime adapters for scanning, native resume, and new-session launch |
 | `scan_claude.py` | Claude Code history scanner |
 | `scan_codex.py` | Codex CLI history scanner |
 | `titles.py` | local title fallback, cache, status labels, and batch generation |
+| `docs/SKILL.md` | agent-facing command reference (SKILL.md convention) |
 | `test_*.py` | unit tests |
 
 ## Development

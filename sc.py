@@ -5,13 +5,21 @@
 上下选行，回车后原生恢复，或通过高级操作交给其他运行时接力。
 
 注意：默认启动交互式终端 TUI（curses），需要真实终端，不能被自动化脚本或
-大模型直接调用。若需要机器可读输出，使用 --json 参数。
+大模型直接调用。非真实终端环境（管道、脚本、Agent 调用）会自动退化为 JSON
+会话列表。大模型 Agent 需要结构化查询（列表/搜索/详情/接续上下文）时，使用
+`sc list` / `sc search` / `sc show` / `sc context` / `sc describe` 子命令，
+详见 agent_api.py 和 docs/SKILL.md。
 
 用法：
     sc                  # 启动 TUI（交互式，需要真实终端）
     sc --limit 30        # 每个来源最多列出 30 条
-    sc --json            # 输出 JSON 会话列表后退出，不启动 TUI
+    sc --json            # 输出 JSON 会话列表后退出，不启动 TUI（旧格式，仍保留）
     sc --json --limit 5  # JSON 模式，每个来源最多 5 条
+    sc list              # 结构化会话列表（推荐给 Agent 使用，字段更完整）
+    sc search 天气 app    # 按关键词搜会话
+    sc show <会话ID前缀>  # 查看会话详情和对话内容
+    sc context <会话ID前缀>  # 生成接续该会话所需的上下文数据包
+    sc describe          # 查看全部子命令的参数与输出字段说明
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import agent_api
 import titles
 from models import ConversationMessage, LaunchRequest, session_key
 from runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch
@@ -779,19 +788,25 @@ def _spawn_title_daemon(limit: int) -> None:
 
 
 def main() -> None:
+    # list/search/show/context/describe 是面向 Agent 的机器可读子命令，整体转发给
+    # agent_api，不与下面的 TUI/--json 旧参数共用同一个 parser。
+    if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_NAMES:
+        sys.exit(agent_api.dispatch(sys.argv[1:]))
+
     parser = argparse.ArgumentParser(
         description=(
             "sc：终端会话接力工具。\n"
             "列出 Claude Code / Codex 最近的会话，选择后原生恢复或跨运行时接力。\n"
-            "默认启动交互式 TUI（curses），需要真实终端；"
-            "自动化调用请使用 --json 参数。"
+            "默认启动交互式 TUI（curses），需要真实终端；非真实终端自动退化为 JSON。\n"
+            "大模型 Agent 结构化查询请用 list/search/show/context/describe 子命令。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
             "  sc                 # 启动 TUI，交互式选择并接管终端\n"
-            "  sc --json          # 输出 JSON 会话列表后退出，不启动 TUI\n"
+            "  sc --json          # 输出 JSON 会话列表后退出，不启动 TUI（旧格式）\n"
             "  sc --json --limit 5  # JSON 模式，每个运行时最多 5 条\n"
+            "  sc describe        # 查看 list/search/show/context 等子命令的用法\n"
             "\n"
             "JSON 输出字段说明：\n"
             "  runtime        运行时标识（claude / codex）\n"
@@ -820,6 +835,12 @@ def main() -> None:
         return
 
     if args.json_mode:
+        _output_json(registry, args.limit)
+        return
+
+    # 没有真实终端（管道、脚本、被 Agent 直接调用）时，curses 无法初始化；自动退化
+    # 为 JSON 列表而不是崩溃。stdin/stdout 分开检测：任一端不是真实终端都不能进 TUI。
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
         _output_json(registry, args.limit)
         return
 

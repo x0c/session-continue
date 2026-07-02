@@ -4,6 +4,7 @@
 
 - `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力前必读。
 - `docs/MAINTAINER_GUIDE.md`：修改、评审或排查标题生成、扫描排序、界面列宽、会话预览、运行时边界、打包发布和 GitHub 开源维护前必读。
+- `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义前必读；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里。
 - `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界前必读。
 - `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求前必读。
 
@@ -15,13 +16,14 @@
 - 同运行时使用原生恢复；跨运行时必须新建目标会话、让目标 Agent 按需读取原始 JSONL，不能改写或伪造原会话。
 - 标题生成是独立服务，不属于任何运行时适配器。标题和界面状态使用“运行时 + 会话 ID”作为唯一键，新增运行时不得退回纯会话 ID。
 - 会话预览使用全屏页面；预览页回车必须直接原生恢复当前会话，关闭预览时必须清屏并让主列表按当前终端尺寸完整重绘，禁止改回覆盖主列表的居中弹窗。
+- `agent_api.py`（`sc list`/`search`/`show`/`context`/`describe`）是只读数据接口，禁止新增任何执行/拉起副作用命令——sc 只负责把会话数据交出来，怎么用是调用方的事。命令参数与 `sc describe` 的输出必须共用同一份 `COMMANDS` 定义，不能各写一份导致漂移。新增或修改子命令时同步 `docs/SKILL.md`。
 
 ## 验证要求
 
 改动代码、界面或运行时适配器后至少执行：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 

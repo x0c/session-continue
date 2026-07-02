@@ -37,6 +37,22 @@
 - 运行时私有扫描格式、恢复参数和新会话参数必须留在对应适配器中。
 - 公共流程只依赖注册表和统一接力模型。
 
+## 机器接口维护（agent_api.py）
+
+- `list`/`search`/`show`/`context`/`describe` 的 JSON envelope 结构（`{ok, data, error, meta}`）、
+  退出码分配（0/1/2/3/5）和已发布字段名是对外契约，一旦发布过版本就按“只加不改不删”演进；
+  确需破坏性变更时同步提升 `agent_api.AGENT_API_VERSION` 并在 `docs/SKILL.md` 标注。
+- 新增子命令或参数只在 `agent_api.py` 的 `COMMANDS` 列表里加一份定义——`sc describe` 的输出、
+  `argparse` 的参数解析共用同一份数据，不要为 `describe` 另写一套文案，否则会和真实行为漂移。
+- `title` 字段只读 `titles.load_cache()`，不得在 `agent_api.py` 里触发 `refresh_titles`；机器接口
+  不消耗 Claude 额度是硬约束，触发生成的入口只能是 `_spawn_title_daemon` 拉起的后台进程。
+- `status` 是给程序判断用的英文枚举（`STATUS_LABELS`），`status_tag` 是给人看的中文 + emoji；
+  新增状态时两边要同步更新，不能只加一边。
+- `sc.py` 的非 TTY 自动降级（`sys.stdin.isatty() and sys.stdout.isatty()`）和 `list/search/show/
+  context/describe` 子命令分发写在 `main()` 顶部，早于旧版 `--json`/`--limit` 的 legacy parser；
+  改 `main()` 时不要把两条路径的参数解析合并到同一个 `argparse.ArgumentParser`，legacy 路径的报错
+  仍是给人看的文本，机器接口路径的报错必须是 JSON envelope，混用会破坏其中一边的调用方假设。
+
 ## 开源发布
 
 - GitHub 公开仓库是 `https://github.com/x0c/session-continue`，本地远端名为 `github`；原 `origin` 仍指向内部 Forgejo，用于同步备份。
@@ -59,7 +75,7 @@
 改标题、排序或列宽后，除编译和单测外，还要做真实路径验证：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 
