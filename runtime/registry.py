@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 from models import LaunchPlan, LaunchRequest, SessionInfo
 from runtime.base import BaseRuntime, LaunchError
@@ -38,7 +39,12 @@ class RuntimeRegistry:
             raise LaunchError(f"未注册的运行时：{runtime_id}") from exc
 
     def scan_all(self, limit: int) -> dict[str, list[SessionInfo]]:
-        return {runtime.id: runtime.scan_sessions(limit) for runtime in self}
+        """并发扫描各运行时。各适配器只读各自独立的历史目录，互不干扰，
+        用线程池重叠磁盘 I/O 等待时间即可，不需要多进程。"""
+        runtimes = list(self)
+        with ThreadPoolExecutor(max_workers=max(1, len(runtimes))) as pool:
+            scanned = pool.map(lambda runtime: runtime.scan_sessions(limit), runtimes)
+        return {runtime.id: result for runtime, result in zip(runtimes, scanned)}
 
     def build_launch_plan(self, request: LaunchRequest) -> LaunchPlan:
         source_id = str(request.session.get("source") or "")

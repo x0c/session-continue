@@ -173,8 +173,12 @@ PAIR_ABORTED = 7       # 状态：已中断
 PAIR_KEY = 8           # 底部快捷键提示中的按键名
 
 
+DIM_EXTRA_ATTR = curses.A_DIM  # 由 _init_colors 按终端能力覆盖，见其中说明
+
+
 def _init_colors() -> None:
     """绑定颜色对；终端不支持彩色时静默跳过，退化为单色显示。"""
+    global DIM_EXTRA_ATTR
     if not curses.has_colors():
         return
     curses.start_color()
@@ -183,9 +187,26 @@ def _init_colors() -> None:
         bg = -1
     except curses.error:
         bg = curses.COLOR_BLACK
+
+    # 弱化文字（分隔线/次要列/帮助文字）不能用 curses.COLOR_WHITE 强制写死前景色：
+    # 之前固定用白色 + A_DIM，在浅色/白色背景终端里等于「白底写白字再调暗」，
+    # 几乎不可读（用户实测反馈）。终端支持 256 色时改用真正的中灰（xterm 256 色
+    # 第 244 号，在浅色和深色背景下对比度都够），不再叠加 A_DIM（灰色本身已经
+    # 够暗，再叠加会变得过淡）；只有退化到 8/16 色终端时才回退到「终端默认前景
+    # 色 + A_DIM」这个次优方案（无法访问 256 色时能做到的最好效果）。
+    if curses.COLORS >= 256:
+        dim_fg = 244
+        DIM_EXTRA_ATTR = 0
+    else:
+        # 8/16 色终端拿不到真正的中灰：bg=-1（默认色可用）时用终端默认前景色，
+        # 至少能随浅色/深色主题自适应；用不了默认色的老终端只能假定黑底、退回
+        # 白字，和改动前行为一致。
+        dim_fg = -1 if bg == -1 else curses.COLOR_WHITE
+        DIM_EXTRA_ATTR = curses.A_DIM
+
     curses.init_pair(PAIR_TAB_ACTIVE, curses.COLOR_CYAN, bg)
-    curses.init_pair(PAIR_TAB_INACTIVE, curses.COLOR_WHITE, bg)
-    curses.init_pair(PAIR_DIM, curses.COLOR_WHITE, bg)
+    curses.init_pair(PAIR_TAB_INACTIVE, dim_fg, bg)
+    curses.init_pair(PAIR_DIM, dim_fg, bg)
     curses.init_pair(PAIR_SELECTED, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(PAIR_DONE, curses.COLOR_GREEN, bg)
     curses.init_pair(PAIR_PENDING, curses.COLOR_YELLOW, bg)
@@ -193,14 +214,9 @@ def _init_colors() -> None:
     curses.init_pair(PAIR_KEY, curses.COLOR_CYAN, bg)
 
 
-def _status_attr(tag: str) -> int:
-    if "完成" in tag:
-        return curses.color_pair(PAIR_DONE)
-    if "回复" in tag:
-        return curses.color_pair(PAIR_PENDING)
-    if "中断" in tag:
-        return curses.color_pair(PAIR_ABORTED)
-    return curses.A_DIM
+def _status_attr(live: bool) -> int:
+    """状态列颜色：进行中（进程活着）用绿色高亮，已结束用暗色。"""
+    return curses.color_pair(PAIR_DONE) if live else curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
 
 
 def _column_widths(screen_width: int) -> tuple[int, int, int, int, int, int]:
@@ -316,11 +332,11 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
     if height < 7 or width < 20:
         return
 
-    dim = curses.color_pair(PAIR_DIM) | curses.A_DIM
+    dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
 
     # 顶部来源切换条由注册表动态生成，新增运行时无需修改界面逻辑
     active_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
-    inactive_attr = curses.color_pair(PAIR_TAB_INACTIVE) | curses.A_DIM
+    inactive_attr = curses.color_pair(PAIR_TAB_INACTIVE) | DIM_EXTRA_ATTR
     x = 0
     runtimes = list(store.registry)
     for position, runtime in enumerate(runtimes):
@@ -378,10 +394,10 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
             dir_col = _fit_cell(s["cwd_display"], col_dir)
             time_col = _fit_cell(_format_relative_time(s["mtime"]), col_time)
             size_col = _fit_cell_right(_format_size(s["size_kb"]), col_size)
-            status_col = _fit_cell(s["status_tag"], col_status)
+            status_col = _fit_cell("进行中" if s["live"] else "已结束", col_status)
 
             base_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD if selected else curses.A_NORMAL
-            status_attr = base_attr if selected else _status_attr(s["status_tag"])
+            status_attr = base_attr if selected else _status_attr(s["live"])
 
             y = 4 + row
             x = 0
@@ -466,8 +482,7 @@ def _draw_preview(
         stdscr.refresh()
         return 0
 
-    normal = curses.color_pair(PAIR_DIM)
-    dim = normal | curses.A_DIM
+    dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
     key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
     user_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
     assistant_attr = curses.color_pair(PAIR_DONE) | curses.A_BOLD
@@ -549,7 +564,7 @@ def _draw_runtime_menu(stdscr, store: SessionStore, source: str, selected: int) 
     left = (width - box_width) // 2
     top = (height - box_height) // 2
     normal = curses.color_pair(PAIR_DIM) | curses.A_BOLD
-    dim = curses.color_pair(PAIR_DIM) | curses.A_DIM
+    dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
     selected_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
 
     stdscr.addnstr(top, left, "┌" + "─" * (box_width - 2) + "┐", box_width, normal)

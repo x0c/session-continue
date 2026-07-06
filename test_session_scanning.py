@@ -11,7 +11,9 @@ from pathlib import Path
 import scan_claude
 import scan_codex
 import sc
+import agent_api
 import titles
+from models import ConversationMessage, LaunchPlan
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -465,6 +467,127 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         self.assertEqual(len(result), titles._BATCH_SIZE * 3)
         self.assertEqual(save_mock.call_count, 3)
 
+    def test_scan_sessions_memoizes_cwd_isdir_and_peek_skips_noise_and_dead_cwd(self) -> None:
+        # 首屏 ≤1s 的回归防退化用例：不依赖真实数据。构造大量会话共享极少数
+        # cwd，断言 (1) 内容只保留真实会话且排序正确；(2) os.path.isdir 按 cwd
+        # 记忆化，不随会话条数线性增长；(3) 廉价预探提前跳过噪音/死 cwd 会话，
+        # 不必等整文件解析完才丢弃。
+        old_projects_dir = scan_claude.PROJECTS_DIR
+        try:
+            with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as workspace:
+                scan_claude.PROJECTS_DIR = td
+                project = Path(td) / "proj"
+                # cwd 路径特意放在 PROJECTS_DIR 之外的独立目录树，避免被目录遍历
+                # 循环自身的 os.path.isdir(proj_base) 检查提前访问，干扰调用计数。
+                real_cwd = Path(workspace) / "real_cwd"
+                real_cwd.mkdir()
+                dead_cwd = str(Path(workspace) / "dead_cwd_does_not_exist")
+
+                base_mtime = 1_800_000_000
+                file_index = 0
+
+                def write_session(content: str, cwd: str, minute_offset: int) -> Path:
+                    nonlocal file_index
+                    file_index += 1
+                    path = project / f"s{file_index}.jsonl"
+                    _write_jsonl(
+                        path,
+                        [
+                            {
+                                "type": "user",
+                                "message": {"content": content},
+                                "timestamp": "2026-06-22T08:11:26.000Z",
+                                "cwd": cwd,
+                            }
+                        ],
+                    )
+                    mtime = base_mtime + minute_offset * 120  # 分钟桶两两不同，避免污染检测分支
+                    os.utime(path, (mtime, mtime))
+                    return path
+
+                for i in range(5):
+                    write_session(f"真实问题 {i}", str(real_cwd), minute_offset=i)
+                noise_paths = [
+                    write_session(f"{titles.PROMPT_MARKER} 摘录 {i}", str(real_cwd), minute_offset=10 + i)
+                    for i in range(4)
+                ]
+                dead_cwd_paths = [
+                    write_session(f"真实问题但目录已删 {i}", dead_cwd, minute_offset=20 + i)
+                    for i in range(3)
+                ]
+                for i in range(2):
+                    write_session_empty_path = project / f"empty{i}.jsonl"
+                    _write_jsonl(
+                        write_session_empty_path,
+                        [{"type": "mode", "mode": "normal"}],
+                    )
+                    mtime = base_mtime + (30 + i) * 120
+                    os.utime(write_session_empty_path, (mtime, mtime))
+
+                real_isdir = scan_claude.os.path.isdir
+                isdir_calls: list[str] = []
+
+                def counting_isdir(path: str) -> bool:
+                    isdir_calls.append(path)
+                    return real_isdir(path)
+
+                real_build = scan_claude._build_session_info
+                build_calls: list[str] = []
+
+                def counting_build(fpath: str, proj: str):
+                    build_calls.append(fpath)
+                    return real_build(fpath, proj)
+
+                with (
+                    mock.patch.object(scan_claude.os.path, "isdir", side_effect=counting_isdir),
+                    mock.patch.object(scan_claude, "_build_session_info", side_effect=counting_build),
+                ):
+                    sessions = scan_claude.scan_sessions(limit=10)
+        finally:
+            scan_claude.PROJECTS_DIR = old_projects_dir
+
+        # 1) 内容正确：只剩 5 条真实会话，噪音/死 cwd/空会话全部被过滤，按 mtime 降序。
+        self.assertEqual(len(sessions), 5)
+        self.assertEqual(
+            [s["fallback_title"] for s in sessions],
+            [f"真实问题 {i}" for i in range(4, -1, -1)],
+        )
+
+        # 2) 判活去重生效：5 个真实会话 + 4 个噪音会话都引用同一个 real_cwd，
+        #    但真正落到 os.path.isdir(real_cwd) 的调用只有 1 次（记忆化）；
+        #    3 个死 cwd 会话同理只触发 1 次。
+        self.assertEqual(isdir_calls.count(str(real_cwd)), 1)
+        self.assertEqual(isdir_calls.count(dead_cwd), 1)
+
+        # 3) 预探跳噪音生效：噪音（4）和死 cwd（3）会话的完整解析被提前拦截，
+        #    整文件解析只发生在 5 个真实会话 + 2 个空会话（peek 探测不到首条
+        #    用户消息，只能落回完整解析兜底）身上，一共 7 次，而不是 5+4+3+2=14。
+        self.assertEqual(len(build_calls), 7)
+        for path in noise_paths + dead_cwd_paths:
+            self.assertNotIn(str(path), build_calls)
+
+    def test_live_session_ids_matches_alive_pid_and_skips_dead_pid(self) -> None:
+        # 状态列判活：只有 pid 文件里的进程真的还存活才算 live。
+        with tempfile.TemporaryDirectory() as td:
+            alive_pid = os.getpid()  # 当前测试进程本身，保证存活
+            dead_pid = 99999999  # 大概率不存在的 pid
+            (Path(td) / f"{alive_pid}.json").write_text(
+                json.dumps({"sessionId": "alive-session"}), encoding="utf-8"
+            )
+            (Path(td) / f"{dead_pid}.json").write_text(
+                json.dumps({"sessionId": "dead-session"}), encoding="utf-8"
+            )
+
+            old_sessions_dir = scan_claude.SESSIONS_DIR
+            scan_claude.SESSIONS_DIR = td
+            try:
+                live_ids = scan_claude._live_session_ids()
+            finally:
+                scan_claude.SESSIONS_DIR = old_sessions_dir
+
+        self.assertIn("alive-session", live_ids)
+        self.assertNotIn("dead-session", live_ids)
+
 
 class CodexScanTests(TimezoneMixin, unittest.TestCase):
     def test_file_mtime_overrides_event_time_and_tail_keeps_first_line_for_small_files(self) -> None:
@@ -504,6 +627,86 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             self.assertEqual(scan_codex._format_display_time(info["event_time"]), "06-25 18:12")
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
             self.assertEqual(info["first_user_msg"], "修复会话展示")
+
+    def test_scan_sessions_memoizes_cwd_isdir_check(self) -> None:
+        # 首屏 ≤1s 回归防退化：多个会话共享同一个 cwd 时，os.path.isdir 只应
+        # 被真正调用一次（记忆化），不随会话条数线性增长。
+        old_sessions_dir = scan_codex.SESSIONS_DIR
+        old_session_index = scan_codex.SESSION_INDEX
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                scan_codex.SESSIONS_DIR = td
+                scan_codex.SESSION_INDEX = os.path.join(td, "session_index.jsonl")  # 不存在，_load_index 返回空
+                real_cwd = Path(td) / "real_cwd"
+                real_cwd.mkdir()
+
+                for i in range(5):
+                    uuid = f"019efe42-6d51-7fb3-ad48-112a8eefa0{i:02d}"
+                    path = Path(td) / f"rollout-2026-06-25T18-1{i}-26-{uuid}.jsonl"
+                    _write_jsonl(
+                        path,
+                        [
+                            {
+                                "timestamp": "2026-06-25T10:10:26.837Z",
+                                "type": "session_meta",
+                                "payload": {"id": uuid, "cwd": str(real_cwd)},
+                            },
+                            {
+                                "timestamp": "2026-06-25T10:10:50.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "user_message", "message": f"真实问题 {i}"},
+                            },
+                        ],
+                    )
+                    mtime = 1_800_000_000 + i * 120
+                    os.utime(path, (mtime, mtime))
+
+                real_isdir = scan_codex.os.path.isdir
+                isdir_calls: list[str] = []
+
+                def counting_isdir(path: str) -> bool:
+                    isdir_calls.append(path)
+                    return real_isdir(path)
+
+                with mock.patch.object(scan_codex.os.path, "isdir", side_effect=counting_isdir):
+                    sessions = scan_codex.scan_sessions(limit=10)
+        finally:
+            scan_codex.SESSIONS_DIR = old_sessions_dir
+            scan_codex.SESSION_INDEX = old_session_index
+
+        self.assertEqual(len(sessions), 5)
+        self.assertEqual(isdir_calls.count(str(real_cwd)), 1)
+
+    def test_live_session_ids_parses_uuid_from_lsof_rollout_line(self) -> None:
+        # 状态列判活：codex 进程持有自己的 rollout jsonl（写模式），从 lsof
+        # 输出的文件名里抽出会话 UUID 即视为存活。
+        uuid = "019f2c27-c9b0-7dc3-a600-8678bf0e8dcc"
+        lsof_output = (
+            f"codex     47372 geraltgraham   45w      REG     1,17  468333  651218417 "
+            f"/Users/geraltgraham/.codex/sessions/2026/07/04/"
+            f"rollout-2026-07-04T16-03-52-{uuid}.jsonl\n"
+        )
+
+        def fake_check_output(cmd, **kwargs):
+            if cmd[0] == "pgrep":
+                return b"47372\n"
+            if cmd[0] == "lsof":
+                return lsof_output.encode()
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with mock.patch("scan_codex.subprocess.check_output", side_effect=fake_check_output):
+            live_ids = scan_codex._live_session_ids()
+
+        self.assertEqual(live_ids, {uuid})
+
+    def test_live_session_ids_returns_empty_when_pgrep_unavailable(self) -> None:
+        # pgrep 缺失或调用失败时静默降级为空集，不抛异常。
+        with mock.patch(
+            "scan_codex.subprocess.check_output", side_effect=FileNotFoundError()
+        ):
+            live_ids = scan_codex._live_session_ids()
+
+        self.assertEqual(live_ids, set())
 
 
 class ConversationPreviewTests(unittest.TestCase):
@@ -729,6 +932,139 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(
             sum((col_num, col_title, col_dir, col_time, col_size, col_status)) + len(sc.COL_GAP) * 5,
             119,
+        )
+
+
+class AgentApiTests(unittest.TestCase):
+    def _session(self, sid: str, title: str, mtime: int, *, cwd: str = "/tmp/demo", status=titles.STATUS_DONE) -> dict:
+        return {
+            "source": "claude",
+            "id": sid,
+            "short_id": sid[:8],
+            "cwd": cwd,
+            "cwd_display": cwd,
+            "mtime": mtime,
+            "display_time": "07-01 12:00",
+            "size_bytes": 1000,
+            "size_kb": 1.0,
+            "native_title": None,
+            "fallback_title": title,
+            "status_tag": status,
+            "live": False,
+            "first_user_msg": title,
+            "last_user_msg": "",
+            "last_agent_msg": "",
+            "path": f"/tmp/{sid}.jsonl",
+        }
+
+    def _registry(self, sessions: list[dict], messages: list[ConversationMessage] | None = None):
+        runtime = mock.Mock()
+        runtime.id = "claude"
+        runtime.display_name = "Claude"
+        runtime.scan_sessions.return_value = sessions
+        runtime.load_conversation.return_value = messages or []
+        runtime.build_resume_plan.side_effect = (
+            lambda session: LaunchPlan(argv=("claude", "--resume", session["id"]), cwd=session.get("cwd"))
+        )
+
+        class FakeRegistry:
+            def __iter__(self):
+                return iter([runtime])
+
+            def get(self, runtime_id: str):
+                if runtime_id != "claude":
+                    raise AssertionError(runtime_id)
+                return runtime
+
+        return FakeRegistry(), runtime
+
+    def test_list_top_is_result_limit_and_compact_fields_include_resume(self) -> None:
+        # --limit 是扫描深度，--top 才是返回条数上限；compact 默认只保留 Agent 常用字段。
+        sessions = [
+            self._session("aaa11111", "第一个", 30),
+            self._session("bbb22222", "第二个", 20),
+            self._session("ccc33333", "第三个", 10),
+        ]
+        registry, runtime = self._registry(sessions)
+        args = mock.Mock(runtime=None, limit=3, top=2, compact=True, status=None, cwd=None, fields=None)
+
+        result = agent_api.cmd_list(args, registry)
+
+        runtime.scan_sessions.assert_called_once_with(3)
+        self.assertEqual(result["data"]["count"], 2)
+        first = result["data"]["sessions"][0]
+        self.assertEqual(first["id"], "aaa11111")
+        self.assertEqual(first["resume_command"], "claude --resume aaa11111")
+        self.assertTrue(first["resumable"])
+        self.assertNotIn("history_path", first)
+
+    def test_search_scores_and_sorts_by_relevance_before_time(self) -> None:
+        # 标题命中比分散字段命中权重更高；排序先看相关性，再按更新时间。
+        sessions = [
+            self._session("oldtitle", "fable 数据修复", 10),
+            self._session("newcwdxx", "普通问题", 999, cwd="/tmp/fable-project"),
+            self._session("nomatchx", "普通问题", 1000),
+        ]
+        registry, _ = self._registry(sessions)
+        args = mock.Mock(
+            keywords=["fable"], deep=False, runtime=None, limit=10, top=2, compact=True, fields=None,
+        )
+
+        result = agent_api.cmd_search(args, registry)
+
+        found = result["data"]["sessions"]
+        self.assertEqual([item["id"] for item in found], ["oldtitle", "newcwdxx"])
+        self.assertGreater(found[0]["score"], found[1]["score"])
+        self.assertEqual(found[0]["matched_via"], "quick")
+        self.assertEqual(found[0]["matched_fields"], ["title", "fallback_title", "first_user_msg"])
+        self.assertIn("resume_command", found[0])
+
+    def test_show_out_writes_full_result_and_stdout_returns_reference(self) -> None:
+        session = self._session("show1234", "查看完整会话", 1)
+        messages = [
+            ConversationMessage("user", "问题一"),
+            ConversationMessage("assistant", "答复一"),
+            ConversationMessage("user", "问题二"),
+        ]
+        registry, _ = self._registry([session], messages)
+        with tempfile.TemporaryDirectory() as td:
+            out_path = os.path.join(td, "show.json")
+            args = mock.Mock(session="claude:show1234", limit=10, full=True, messages=None, out=out_path, compact=True)
+
+            result = agent_api.cmd_show(args, registry)
+
+            self.assertTrue(result["data"]["messages_omitted"])
+            self.assertEqual(result["data"]["output_path"], out_path)
+            self.assertNotIn("messages", result["data"])
+            saved = json.loads(Path(out_path).read_text(encoding="utf-8"))
+
+        self.assertTrue(saved["ok"])
+        self.assertEqual(saved["data"]["message_count_shown"], 3)
+        self.assertEqual(saved["data"]["messages"][2]["text"], "问题二")
+
+
+class StartupLatencyTests(unittest.TestCase):
+    """首屏延迟硬性上限闸门：改动扫描/界面/标题相关代码后必须跑这个用例。
+
+    见 AGENTS.md「验证要求」：sc 首屏（启动到首次渲染）延迟必须 ≤1s。
+    registry.scan_all() 就是 main() 里 store.load() 实际同步阻塞首屏的调用；
+    本机无真实会话数据时（例如 CI/新机）跳过，避免假失败。
+    """
+
+    def test_scan_all_first_screen_under_one_second(self) -> None:
+        from runtime import default_registry
+
+        has_data = os.path.isdir(scan_claude.PROJECTS_DIR) or bool(scan_codex._find_all_session_files())
+        if not has_data:
+            self.skipTest("本机无真实会话数据，首屏延迟闸门跳过")
+
+        registry = default_registry()
+        t0 = time.perf_counter()
+        registry.scan_all(50)
+        elapsed = time.perf_counter() - t0
+
+        self.assertLess(
+            elapsed, 1.0, f"registry.scan_all(50) 耗时 {elapsed * 1000:.0f}ms，超过首屏 1s 硬性上限"
         )
 
 

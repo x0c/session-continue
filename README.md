@@ -102,9 +102,11 @@ history — list, search, inspect, and build a handoff context package. None of 
 resume anything; what to do with the data is left to the caller.
 
 ```bash
-sc list --cwd my-app --status pending   # structured session list, filterable
-sc search weather app --deep            # find sessions by topic (title/messages/cwd)
-sc show <session-id-prefix>             # session detail + conversation
+sc list --cwd my-app --status pending --top 5 --compact # compact, capped session list
+sc search weather app --top 3 --compact                 # relevance-ranked topic search
+sc search weather app --deep                            # include full conversation search
+sc show <session-id-prefix> --messages 10 --compact     # session detail + recent conversation
+sc show <session-id-prefix> --full --out /tmp/sc.json    # write large full output to a file
 sc context <session-id-prefix>          # handoff package: history path, suggested prompt, resume command
 sc describe [command]                   # machine-readable command/argument/field reference
 ```
@@ -113,6 +115,11 @@ Every command prints a JSON envelope (`{ok, data, error, meta}`) and uses fine-g
 (`0` success, `2` usage error, `3` not found, `5` ambiguous session reference). Running `sc` with no
 subcommand outside a real terminal (piped, scripted, or invoked by an agent) also falls back to a
 JSON session list instead of trying to start the curses TUI.
+
+For `list` and `search`, `--limit` is scan depth per runtime and `--top` is the returned result
+count cap. `search` returns `score`, `matched_via`, and `matched_fields`; `list`/`search` rows
+include `resumable` and `resume_command` so automation can decide whether to resume in place or
+start fresh.
 
 See [docs/SKILL.md](docs/SKILL.md) for the full command reference, field semantics, and typical
 agent workflows.

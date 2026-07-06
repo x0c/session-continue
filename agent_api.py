@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 import titles
@@ -35,6 +36,15 @@ STATUS_LABELS = {
 }
 
 _RESOLVE_SCAN_LIMIT = 200  # show/context 按标识定位会话时的扫描深度，独立于 list/search 的展示条数
+
+# --compact 模式下 list 的精简默认字段集（省 token）；需要更多字段用 --fields 显式指定
+DEFAULT_LIST_FIELDS = (
+    "id", "short_id", "runtime", "title", "status", "mtime", "cwd_display",
+    "resumable", "resume_command",
+)
+# search 的精简字段集在 list 基础上额外保留命中方式、命中字段和相关性得分，方便调用方理解排序
+DEFAULT_SEARCH_FIELDS = DEFAULT_LIST_FIELDS + ("matched_via", "matched_fields", "score")
+DEFAULT_SHOW_FIELDS = DEFAULT_LIST_FIELDS + ("messages", "message_count_shown", "message_count_total")
 
 
 class ApiError(Exception):
@@ -67,8 +77,11 @@ class JSONArgumentParser(argparse.ArgumentParser):
         raise SystemExit(EXIT_USAGE)
 
 
-def _print_envelope(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+def _print_envelope(payload: dict, compact: bool = False) -> None:
+    if compact:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _ok(data) -> dict:
@@ -101,10 +114,26 @@ def _format_resume_command(argv: tuple[str, ...]) -> str:
     return " ".join(parts)
 
 
-def session_payload(session: dict, cache: dict, fields: list[str] | None = None) -> dict:
+def _resume_command(runtime, session: dict) -> str | None:
+    """生成同运行时原生恢复命令；失败时只标记不可恢复，不影响列表输出。"""
+    try:
+        plan = runtime.build_resume_plan(session)
+    except Exception:
+        return None
+    return _format_resume_command(plan.argv)
+
+
+def _apply_fields(payload: dict, fields: list[str] | None) -> dict:
+    if not fields:
+        return payload
+    return {k: v for k, v in payload.items() if k in fields}
+
+
+def session_payload(session: dict, cache: dict, runtime=None, fields: list[str] | None = None) -> dict:
     """把内部会话结构裁剪为对 Agent 友好的输出：语义化标题、英文状态枚举。"""
     title, _ = titles.resolve_initial_title(session, cache)
     status_tag = session.get("status_tag") or ""
+    resume_command = _resume_command(runtime, session) if runtime is not None else None
     payload = {
         "runtime": session.get("source"),
         "id": session.get("id"),
@@ -118,10 +147,10 @@ def session_payload(session: dict, cache: dict, fields: list[str] | None = None)
         "status": STATUS_LABELS.get(status_tag, "unknown"),
         "status_tag": status_tag,
         "history_path": session.get("path") or "",
+        "resumable": bool(resume_command),
+        "resume_command": resume_command,
     }
-    if fields:
-        payload = {k: v for k, v in payload.items() if k in fields}
-    return payload
+    return _apply_fields(payload, fields)
 
 
 def _match_sessions(sessions: list[dict], ident: str) -> list[dict]:
@@ -180,25 +209,76 @@ def _find_snippet(messages, keywords: list[str]) -> str | None:
     return None
 
 
+def _parse_fields(raw: str | None, default: tuple[str, ...] | None = None) -> list[str] | None:
+    if raw:
+        return [f.strip() for f in raw.split(",") if f.strip()]
+    if default:
+        return list(default)
+    return None
+
+
+def _apply_top(items: list, top: int | None) -> list:
+    if top is None:
+        return items
+    return items[:max(0, top)]
+
+
+def _score_quick_match(session: dict, title: str, keywords: list[str]) -> tuple[int, list[str]]:
+    sources = [
+        ("title", title, 100),
+        ("fallback_title", session.get("fallback_title"), 80),
+        ("first_user_msg", session.get("first_user_msg"), 60),
+        ("last_user_msg", session.get("last_user_msg"), 60),
+        ("last_agent_msg", session.get("last_agent_msg"), 35),
+        ("cwd", session.get("cwd"), 20),
+        ("cwd_display", session.get("cwd_display"), 20),
+    ]
+    score = 0
+    matched: list[str] = []
+    for name, value, weight in sources:
+        text = str(value or "").lower()
+        if not text:
+            continue
+        hits = sum(1 for kw in keywords if kw in text)
+        if hits:
+            score += weight * hits
+            matched.append(name)
+    return score, matched
+
+
 def cmd_list(args, registry) -> dict:
-    fields = [f.strip() for f in args.fields.split(",")] if args.fields else None
+    compact = getattr(args, "compact", False)
+    top = getattr(args, "top", None)
+    fields = _parse_fields(getattr(args, "fields", None), DEFAULT_LIST_FIELDS if compact else None)
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
     cache = titles.load_cache()
 
-    sessions = []
+    candidates = []
     for runtime in runtimes:
         for session in runtime.scan_sessions(args.limit):
             if args.status and STATUS_LABELS.get(session.get("status_tag") or "", "unknown") != args.status:
                 continue
             if args.cwd and args.cwd.lower() not in str(session.get("cwd") or "").lower():
                 continue
-            sessions.append(session_payload(session, cache, fields))
+            candidates.append((runtime, session))
 
-    return _ok({"count": len(sessions), "sessions": sessions})
+    candidates.sort(key=lambda item: item[1].get("mtime") or 0, reverse=True)
+    candidates = _apply_top(candidates, top)
+    sessions = [session_payload(session, cache, runtime, fields) for runtime, session in candidates]
+
+    return _ok({
+        "count": len(sessions),
+        "scan_limit": args.limit,
+        "top": top,
+        "sessions": sessions,
+    })
 
 
 def cmd_search(args, registry) -> dict:
     keywords = [k.lower() for k in args.keywords]
+    compact = getattr(args, "compact", False)
+    top = getattr(args, "top", None)
+    fields = _parse_fields(getattr(args, "fields", None), DEFAULT_SEARCH_FIELDS if compact else None)
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
     cache = titles.load_cache()
 
@@ -206,7 +286,7 @@ def cmd_search(args, registry) -> dict:
     for runtime in runtimes:
         for session in runtime.scan_sessions(args.limit):
             title, _ = titles.resolve_initial_title(session, cache)
-            haystack = " ".join(filter(None, [
+            quick_parts = [
                 title,
                 session.get("fallback_title"),
                 session.get("first_user_msg"),
@@ -214,41 +294,85 @@ def cmd_search(args, registry) -> dict:
                 session.get("last_agent_msg"),
                 session.get("cwd"),
                 session.get("cwd_display"),
-            ])).lower()
+            ]
+            haystack = " ".join(filter(None, quick_parts)).lower()
 
             if all(kw in haystack for kw in keywords):
-                payload = session_payload(session, cache)
-                payload["matched_via"] = "quick"
-                results.append(payload)
+                score, matched_fields = _score_quick_match(session, title, keywords)
+                results.append((score, "quick", matched_fields, runtime, session, None))
             elif args.deep:
                 messages = runtime.load_conversation(session)
                 full_text = "\n".join(m.text for m in messages).lower()
                 if all(kw in full_text for kw in keywords):
-                    payload = session_payload(session, cache)
-                    payload["matched_via"] = "deep"
+                    score, matched_fields = _score_quick_match(session, title, keywords)
+                    matched_fields = matched_fields + ["conversation"]
+                    score += 10
                     snippet = _find_snippet(messages, keywords)
-                    if snippet:
-                        payload["snippet"] = snippet
-                    results.append(payload)
+                    results.append((score, "deep", matched_fields, runtime, session, snippet))
 
-    results.sort(key=lambda p: p.get("mtime") or 0, reverse=True)
-    return _ok({"query": args.keywords, "deep": args.deep, "count": len(results), "sessions": results})
+    results.sort(key=lambda item: (item[0], item[4].get("mtime") or 0), reverse=True)
+    results = _apply_top(results, top)
+    sessions = []
+    for score, matched_via, matched_fields, runtime, session, snippet in results:
+        payload = session_payload(session, cache, runtime)
+        payload["score"] = score
+        payload["matched_via"] = matched_via
+        payload["matched_fields"] = matched_fields
+        if snippet:
+            payload["snippet"] = snippet
+        sessions.append(_apply_fields(payload, fields))
+
+    return _ok({
+        "query": args.keywords,
+        "deep": args.deep,
+        "count": len(sessions),
+        "scan_limit": args.limit,
+        "top": top,
+        "sessions": sessions,
+    })
 
 
 def cmd_show(args, registry) -> dict:
     session = resolve_ref(registry, args.session, args.limit)
     cache = titles.load_cache()
-    payload = session_payload(session, cache)
-
     runtime = registry.get(str(session.get("source") or ""))
+    compact = getattr(args, "compact", False)
+    out = getattr(args, "out", None)
+    fields = _parse_fields(None, DEFAULT_SHOW_FIELDS if compact else None)
+    payload = session_payload(session, cache, runtime)
     messages = runtime.load_conversation(session)
+    total_messages = len(messages)
     if not args.full:
         n = args.messages if args.messages else 20
         messages = messages[-n:]
 
     payload["messages"] = [{"role": m.role, "text": m.text} for m in messages]
     payload["message_count_shown"] = len(payload["messages"])
-    return _ok(payload)
+    payload["message_count_total"] = total_messages
+
+    if out:
+        envelope = _ok(payload)
+        output_path = os.path.abspath(out)
+        parent = os.path.dirname(output_path) or "."
+        if not os.path.isdir(parent):
+            raise ApiError("usage_error", f"输出目录不存在：{parent}", EXIT_USAGE)
+        if os.path.isdir(output_path):
+            raise ApiError("usage_error", f"输出路径是目录：{output_path}", EXIT_USAGE)
+        with open(output_path, "w", encoding="utf-8") as fp:
+            json.dump(envelope, fp, ensure_ascii=False, separators=(",", ":") if compact else None,
+                      indent=None if compact else 2)
+            fp.write("\n")
+        summary = session_payload(session, cache, runtime, DEFAULT_LIST_FIELDS if compact else None)
+        summary.update({
+            "output_path": output_path,
+            "output_bytes": os.path.getsize(output_path),
+            "message_count_written": len(payload["messages"]),
+            "message_count_total": total_messages,
+            "messages_omitted": True,
+        })
+        return _ok(summary)
+
+    return _ok(_apply_fields(payload, fields))
 
 
 def cmd_context(args, registry) -> dict:
@@ -315,7 +439,9 @@ COMMANDS = [
         "help": "结构化列出已注册运行时的会话",
         "args": [
             {"flags": ["--runtime"], "kwargs": {"help": "只看指定运行时（claude / codex）"}},
-            {"flags": ["--limit"], "kwargs": {"type": int, "default": 50, "help": "每个运行时最多扫描/返回多少条"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": 50, "help": "每个运行时最多扫描多少条历史（扫描深度）"}},
+            {"flags": ["--top"], "kwargs": {"type": int, "help": "最多返回多少条结果；不影响扫描深度"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON，并默认只返回常用字段"}},
             {"flags": ["--status"], "kwargs": {"choices": ["done", "pending", "aborted", "unknown"], "help": "按状态过滤"}},
             {"flags": ["--cwd"], "kwargs": {"help": "按工作目录子串过滤（大小写不敏感）"}},
             {"flags": ["--fields"], "kwargs": {"help": "逗号分隔的字段名，只返回这些字段"}},
@@ -333,6 +459,8 @@ COMMANDS = [
             "status": "英文状态枚举：done / pending / aborted / unknown",
             "status_tag": "中文状态标签（含图标），供人类展示用",
             "history_path": "历史 JSONL 文件路径",
+            "resumable": "是否可生成同运行时原生恢复命令",
+            "resume_command": "同运行时原生恢复该会话的 shell 命令（可能为 null）",
         },
     },
     {
@@ -343,10 +471,15 @@ COMMANDS = [
             {"flags": ["--deep"], "kwargs": {"action": "store_true", "help": "对未命中的会话额外读取完整对话内容再搜一遍（较慢）"}},
             {"flags": ["--runtime"], "kwargs": {"help": "只搜指定运行时"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 50, "help": "每个运行时最多扫描多少条参与搜索"}},
+            {"flags": ["--top"], "kwargs": {"type": int, "help": "最多返回多少条结果；不影响扫描深度"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON，并默认只返回常用字段"}},
+            {"flags": ["--fields"], "kwargs": {"help": "逗号分隔的字段名，只返回这些字段"}},
         ],
         "fields": {
             "...": "与 list 命令的字段相同",
-            "matched_via": "quick（元数据命中）或 deep（全文命中）",
+            "score": "相关性分数；分数越高排序越靠前，同分按 mtime 倒序",
+            "matched_via": "quick（元数据命中）或 deep（全文命中），兼容旧调用方",
+            "matched_fields": "命中的字段列表，如 title / first_user_msg / conversation",
             "snippet": "deep 命中时的上下文片段",
         },
     },
@@ -357,12 +490,16 @@ COMMANDS = [
             {"flags": ["session"], "kwargs": {"help": "会话标识：完整 ID / ID 前缀 / runtime:id"}},
             {"flags": ["--messages"], "kwargs": {"type": int, "help": "只显示最后 N 条消息（默认 20）"}},
             {"flags": ["--full"], "kwargs": {"action": "store_true", "help": "显示完整对话，忽略 --messages"}},
+            {"flags": ["--out"], "kwargs": {"help": "把 show 结果写入指定 JSON 文件，stdout 只返回文件引用摘要"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON，并默认只返回常用字段"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 200, "help": "定位会话时的扫描深度"}},
         ],
         "fields": {
             "...": "与 list 命令的字段相同",
             "messages": "[{role: user|assistant, text}]，按时间顺序的用户消息和每轮最终答复",
             "message_count_shown": "本次实际返回的消息条数",
+            "message_count_total": "该会话可提取的消息总数",
+            "output_path": "--out 模式下写入的 JSON 文件绝对路径",
         },
     },
     {
@@ -432,10 +569,10 @@ def dispatch(argv: list[str]) -> int:
     try:
         result = handler(args, registry)
     except ApiError as exc:
-        _print_envelope(_err(exc))
+        _print_envelope(_err(exc), compact=getattr(args, "compact", False))
         return exc.exit_code
 
-    _print_envelope(result)
+    _print_envelope(result, compact=getattr(args, "compact", False))
     return EXIT_OK
 
 

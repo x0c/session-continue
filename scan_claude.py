@@ -390,6 +390,7 @@ def _build_session_info(fpath: str, proj: str) -> dict:
         "native_title": ai_title,
         "fallback_title": fallback,
         "status_tag": status_tag,
+        "live": False,  # scan_sessions 统一按 _live_session_ids() 回填
         "first_user_msg": (first_user_msg or "")[:300],
         "last_user_msg": (last_user_msg or "")[:300],
         "last_agent_msg": (last_agent_msg or "")[:300],
@@ -397,12 +398,99 @@ def _build_session_info(fpath: str, proj: str) -> dict:
     }
 
 
+SESSIONS_DIR = os.path.expanduser("~/.claude/sessions/")
+
+
+def _live_session_ids() -> set[str]:
+    """扫描 ~/.claude/sessions/{pid}.json，返回进程仍存活的 sessionId 集合。
+
+    与 active-claude-sessions skill 同一判活思路：pid 文件是 Claude Code 自己
+    维护的运行时状态，os.kill(pid, 0) 能确认进程是否还真实存在（而不是残留的
+    陈旧文件）。
+    """
+    live_ids: set[str] = set()
+    if not os.path.isdir(SESSIONS_DIR):
+        return live_ids
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            pid = int(fname[: -len(".json")])
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, fname)) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        session_id = data.get("sessionId")
+        if session_id:
+            live_ids.add(session_id)
+    return live_ids
+
+
+def _peek_head_meta(path: str, max_lines: int = 40) -> tuple[str | None, str | None]:
+    """只读文件头部少量行，廉价探出 cwd 和首条用户消息，供跳过前置过滤用。
+
+    对撞上首屏 1s 硬指标的两个根因做提前拦截：自产噪音会话（后台标题生成
+    调 claude/codex 留下的、以 PROMPT_MARKER 开头的会话）和 cwd 已删的会话，
+    不必等 _build_session_info 读完整 300 行头 + 64KB 尾才发现能丢弃。
+    只要拿到 cwd 和首条用户消息就早停；两者任一没探到时上层不跳过，照常走
+    完整解析（避免误杀头部很长的真实会话）。
+    """
+    cwd: str | None = None
+    first_user: str | None = None
+    try:
+        with open(path, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if cwd is None and obj.get("cwd"):
+                    cwd = obj.get("cwd")
+                if obj.get("type") == "user" and first_user is None:
+                    text = _extract_text(obj.get("message", {}).get("content", ""))
+                    if text:
+                        first_user = text
+                if cwd is not None and first_user is not None:
+                    break
+    except OSError:
+        pass
+    return cwd, first_user
+
+
 def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
-    """扫描所有项目下的 Claude Code 会话，返回统一结构列表，按 mtime 降序。"""
+    """扫描所有项目下的 Claude Code 会话，返回统一结构列表，按 mtime 降序。
+
+    历史会话可能有成百上千个，但调用方只要最近 limit 条。真正耗时的
+    _build_session_info 会读取整个文件头尾并解析 JSONL，所以先用一次廉价的
+    os.stat 按文件 mtime 排好序，只对最可能入选的候选文件做完整解析；凑够
+    limit 条后，再看看当前 mtime 分钟桶是否已经跨完——跨完才停，避免批量
+    touch 造成的同分钟桶被从中间截断，影响 _apply_effective_times 的判污染
+    准确性。
+
+    首屏必须 ≤1s（见 AGENTS.md 验证要求），这里做两项针对性优化，改动前后
+    结果字节级一致（已用真实会话数据核验 id 顺序、兜底标题、原生标题）：
+    - cwd 判活按 cwd 记忆化（同一次扫描里大量会话共享极少数 cwd，重复
+      os.path.isdir 在同步/网络目录上很慢，是首屏卡顿主因之一）；
+    - 完整解析前先用 _peek_head_meta 廉价探测，提前跳过自产噪音会话和
+      cwd 已删的会话，避免整文件解析后才发现能丢弃（另一大主因）。
+    """
     if not os.path.isdir(PROJECTS_DIR):
         return []
 
-    candidates: list[tuple[str, str]] = []
+    live_ids = _live_session_ids()
+    candidates: list[tuple[float, str, str]] = []
     for proj in os.listdir(PROJECTS_DIR):
         proj_base = os.path.join(PROJECTS_DIR, proj)
         if not os.path.isdir(proj_base):
@@ -411,10 +499,36 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             if not fname.endswith(".jsonl"):
                 continue
             fpath = os.path.join(proj_base, fname)
-            candidates.append((fpath, proj))
+            try:
+                mtime = os.stat(fpath).st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, fpath, proj))
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    isdir_cache: dict[str, bool] = {}
+
+    def cached_isdir(path: str) -> bool:
+        cached = isdir_cache.get(path)
+        if cached is None:
+            cached = os.path.isdir(path)
+            isdir_cache[path] = cached
+        return cached
 
     results: list[dict] = []
-    for fpath, proj in candidates:
+    stop_after_bucket: int | None = None
+    for mtime, fpath, proj in candidates:
+        bucket = int(mtime // 60)
+        if stop_after_bucket is not None and bucket != stop_after_bucket:
+            break
+
+        peek_cwd, peek_first_user = _peek_head_meta(fpath)
+        if peek_first_user is not None and peek_first_user.startswith(titles.PROMPT_MARKER):
+            continue  # 廉价探测已确认是自产噪音会话，跳过整文件解析
+        if peek_cwd and not cached_isdir(peek_cwd):
+            continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
+
         try:
             info = _build_session_info(fpath, proj)
         except OSError:
@@ -422,12 +536,15 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         if not info["first_user_msg"] or info["fallback_title"] == "(仅本地命令)":
             continue  # 无用户消息的空会话
         if info["first_user_msg"].startswith(titles.PROMPT_MARKER):
-            continue  # sc 自己生成标题留下的噪音会话，跳过
-        if info["cwd"] and not os.path.isdir(info["cwd"]):
+            continue  # sc 自己生成标题留下的噪音会话，跳过（廉价探测失手时的兜底）
+        if info["cwd"] and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
+        info["live"] = info["id"] in live_ids
         results.append(info)
+        if len(results) >= limit and stop_after_bucket is None:
+            stop_after_bucket = bucket
 
     _apply_effective_times(results)
     results.sort(key=lambda s: s["mtime"], reverse=True)
@@ -502,6 +619,6 @@ if __name__ == "__main__":
     for i, s in enumerate(sessions):
         print(
             f"{i+1:>2}. [{s['short_id']}] {s['cwd_display']:<24} {s['display_time']:<12} "
-            f"{s['size_kb']:>7}KB {s['status_tag']:<6} "
+            f"{s['size_kb']:>7}KB {'进行中' if s['live'] else '已结束':<6} "
             f"native={s['native_title']!r} fallback={s['fallback_title']!r}"
         )

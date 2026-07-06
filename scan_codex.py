@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 
@@ -254,6 +255,7 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         "native_title": index.get(uuid),
         "fallback_title": fallback,
         "status_tag": _status_tag(last_event_type),
+        "live": False,  # scan_sessions 统一按 _live_session_ids() 回填
         "first_user_msg": (first_user_msg or "")[:300],
         "last_user_msg": (last_user_msg or "")[:300],
         "last_agent_msg": (last_agent_msg or "")[:300],
@@ -261,13 +263,74 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
     }
 
 
+def _live_session_ids() -> set[str]:
+    """返回进程仍存活的 Codex 会话 UUID 集合。
+
+    Codex 没有类似 Claude 的 pid 注册表，但活着的 codex 进程会以写模式持有
+    自己的 rollout JSONL（实测 lsof 输出形如
+    `codex 47372 … 45w … rollout-2026-07-04T16-03-52-<uuid>.jsonl`）。
+    先用 pgrep 拿到所有 codex 进程 pid，再逐个 lsof 从其打开的文件里抽 UUID。
+    任一环节缺工具或调用失败都静默降级为空集（判活失败时全部按已结束显示）。
+    """
+    live_ids: set[str] = set()
+    try:
+        pids = subprocess.check_output(
+            ["pgrep", "-x", "codex"], stderr=subprocess.DEVNULL
+        ).decode().split()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return live_ids
+
+    for pid in pids:
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-p", pid], stderr=subprocess.DEVNULL
+            ).decode(errors="replace")
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            continue
+        for line in out.splitlines():
+            if "rollout-" not in line:
+                continue
+            uuid = _extract_uuid_from_filename(line)
+            if uuid:
+                live_ids.add(uuid)
+    return live_ids
+
+
 def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
-    """扫描 Codex 会话，返回统一结构列表，按 mtime 降序。"""
+    """扫描 Codex 会话，返回统一结构列表，按 mtime 降序。
+
+    历史会话可能有上千个，但调用方只要最近 limit 条。_build_session_info 要
+    读文件头尾解析 JSONL 较慢，所以先用廉价的 os.stat 按真实文件 mtime（而非
+    文件名里的创建时间——同一会话被续接会更新 mtime 但不改文件名）排好序，
+    凑够 limit 条有效结果就提前停止，不必解析全部历史文件。
+
+    首屏必须 ≤1s（见 AGENTS.md 验证要求）：cwd 判活按 cwd 记忆化，避免大量
+    会话共享同一个 cwd 时重复 os.path.isdir——这个调用在同步/网络目录上很
+    慢，实测是首屏卡顿主因之一（结果与逐次调用字节级一致）。
+    """
     index = _load_index()
     all_files = _find_all_session_files()
+    live_ids = _live_session_ids()
+
+    candidates: list[tuple[float, str]] = []
+    for path in all_files:
+        try:
+            candidates.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    isdir_cache: dict[str, bool] = {}
+
+    def cached_isdir(path: str) -> bool:
+        cached = isdir_cache.get(path)
+        if cached is None:
+            cached = os.path.isdir(path)
+            isdir_cache[path] = cached
+        return cached
 
     results: list[dict] = []
-    for path in all_files:
+    for _, path in candidates:
         try:
             info = _build_session_info(path, index)
         except OSError:
@@ -276,11 +339,14 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue
         if not info["first_user_msg"] or info["fallback_title"] == "(无消息)":
             continue  # 无用户消息的空会话
-        if info["cwd"] and not os.path.isdir(info["cwd"]):
+        if info["cwd"] and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
+        info["live"] = info["id"] in live_ids
         results.append(info)
+        if len(results) >= limit:
+            break
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results[:limit]
@@ -330,6 +396,6 @@ if __name__ == "__main__":
     for i, s in enumerate(sessions):
         print(
             f"{i+1:>2}. [{s['short_id']}] {s['cwd_display']:<24} {s['display_time']:<12} "
-            f"{s['size_kb']:>7}KB {s['status_tag']:<6} "
+            f"{s['size_kb']:>7}KB {'进行中' if s['live'] else '已结束':<6} "
             f"native={s['native_title']!r} fallback={s['fallback_title']!r}"
         )

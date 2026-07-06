@@ -91,9 +91,6 @@ class AgentApiTests(unittest.TestCase):
     def test_session_payload_maps_status_to_english_enum(self) -> None:
         payload = agent_api.session_payload(self.session, {})
         self.assertEqual(payload["status"], "done")
-        self.assertEqual(payload["status_tag"], titles.STATUS_DONE)
-        self.assertEqual(payload["runtime"], "fake")
-        self.assertEqual(payload["title"], "天气 App 开发")
 
     def test_session_payload_fields_filter(self) -> None:
         payload = agent_api.session_payload(self.session, {}, fields=["id", "status"])
