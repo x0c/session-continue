@@ -150,6 +150,8 @@ def _preview_lines(
             lines.append(("blank", ""))
         if message.role == "user":
             lines.append(("user", "● 你"))
+        elif message.role == "system":
+            lines.append(("system", "◇ 系统事件"))
         else:
             lines.append(("assistant", f"◆ {runtime_name}"))
         lines.extend(
@@ -765,7 +767,7 @@ def _draw_preview(
             attr = user_attr
         elif kind == "assistant":
             attr = assistant_attr
-        elif kind == "dim":
+        elif kind in ("dim", "system"):
             attr = dim
         else:
             attr = curses.A_NORMAL

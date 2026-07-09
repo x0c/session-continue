@@ -852,6 +852,40 @@ class ConversationPreviewTests(unittest.TestCase):
             ],
         )
 
+    def test_claude_conversation_tags_task_notification_as_system_not_user(self) -> None:
+        """Monitor/task-notification 事件在原始记录里也挂在 user 轮次下（`origin.kind` 是
+        "task-notification" 而不是 "human"），预览页不能把它当成用户手动输入的消息展示。"""
+        entries = [
+            {
+                "type": "user",
+                "origin": {"kind": "human"},
+                "message": {"content": "真人提问"},
+            },
+            {
+                "type": "user",
+                "origin": {"kind": "task-notification"},
+                "message": {"content": "<task-notification>系统事件内容</task-notification>"},
+            },
+            {
+                "type": "user",
+                "message": {"content": "/plan 之类无 origin 字段但仍是真人输入"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_claude.load_conversation(str(path))
+
+        self.assertEqual(
+            [(message.role, message.text) for message in messages],
+            [
+                ("user", "真人提问"),
+                ("system", "<task-notification>系统事件内容</task-notification>"),
+                ("user", "/plan 之类无 origin 字段但仍是真人输入"),
+            ],
+        )
+
     def test_codex_conversation_uses_final_answer_and_removes_task_complete_duplicate(self) -> None:
         entries = [
             {"type": "event_msg", "payload": {"type": "user_message", "message": "用户问题"}},
@@ -999,6 +1033,19 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(text_lines.count("● 你"), 2)
         self.assertEqual(text_lines.count("◆ Codex"), 2)
         self.assertTrue(all(sc._text_width(line) <= 16 for line in text_lines))
+
+    def test_preview_renders_system_role_distinctly_from_user(self) -> None:
+        """Monitor/task-notification 事件（role="system"）不能渲染成"● 你"，否则看起来像用户发的消息。"""
+        messages = [
+            sc.ConversationMessage("user", "真人提问"),
+            sc.ConversationMessage("system", "<task-notification>...</task-notification>"),
+        ]
+
+        lines = sc._preview_lines(messages, "Claude", 40)
+        text_lines = [line for _, line in lines]
+
+        self.assertEqual(text_lines.count("● 你"), 1)
+        self.assertEqual(text_lines.count("◇ 系统事件"), 1)
 
     def test_preview_uses_full_terminal_and_clears_before_returning(self) -> None:
         screen = mock.Mock()

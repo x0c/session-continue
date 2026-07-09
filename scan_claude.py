@@ -543,7 +543,12 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     text = _extract_text(message.get("content", ""))
                     if text and text != _INTERRUPTED_MARKER:
                         flush_legacy_answer()
-                        messages.append(ConversationMessage("user", text))
+                        origin = entry.get("origin")
+                        origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+                        # task-notification 等系统注入事件也挂在 user 轮次下，但不是真人输入，
+                        # 展示时必须和真实用户消息区分开，否则看起来像是用户发了条奇怪的消息。
+                        role = "user" if origin_kind in (None, "human") else "system"
+                        messages.append(ConversationMessage(role, text))
                     continue
 
                 if entry_type != "assistant":
