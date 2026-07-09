@@ -505,7 +505,14 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
 
 
 def load_conversation(path: str) -> list[ConversationMessage]:
-    """按时间顺序读取真实用户消息和 Claude 每轮最终答复。"""
+    """按时间顺序读取真实用户消息和 Claude 的每段文本回复。
+
+    注意：一次 assistant 轮次里 thinking/text/tool_use 各是独立的 JSONL 行，且共享同一个
+    `stop_reason`（哪怕这行本身是纯文本、后面还接着工具调用，`stop_reason` 也是
+    `tool_use`）。之前按 `stop_reason in (None, "end_turn")` 过滤会把工具调用前后夹带的文本
+    说明整段丢掉，只保留触发了 `stop_reason=None` 分支的历史遗留格式和轮次末尾无工具调用
+    的纯文本；这里只按内容是否为空文本过滤，不再看 `stop_reason`。
+    """
     messages: list[ConversationMessage] = []
     pending_legacy_answer: str | None = None
 
@@ -539,7 +546,7 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                         messages.append(ConversationMessage("user", text))
                     continue
 
-                if entry_type != "assistant" or message.get("stop_reason") not in (None, "end_turn"):
+                if entry_type != "assistant":
                     continue
                 content = message.get("content", [])
                 if not isinstance(content, list):

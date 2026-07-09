@@ -809,12 +809,19 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
 
 
 class ConversationPreviewTests(unittest.TestCase):
-    def test_claude_conversation_keeps_users_and_end_turn_answers_only(self) -> None:
+    def test_claude_conversation_keeps_assistant_text_even_before_tool_calls(self) -> None:
+        """真实 JSONL 里一次 assistant 轮次的 thinking/text/tool_use 是各自独立的行，且共享同一个
+        stop_reason；文本紧跟着工具调用时该行的 stop_reason 也是 tool_use，不代表这段文本不重要
+        （历史上按 stop_reason 过滤把这类文本整段丢了，是本用例要回归防止的 bug）。"""
         entries = [
             {"type": "user", "message": {"content": "第一个问题"}},
             {
                 "type": "assistant",
-                "message": {"stop_reason": "tool_use", "content": [{"type": "text", "text": "处理中间状态"}]},
+                "message": {"stop_reason": "tool_use", "content": [{"type": "text", "text": "工具调用前的说明"}]},
+            },
+            {
+                "type": "assistant",
+                "message": {"stop_reason": "tool_use", "content": [{"type": "tool_use", "name": "Bash"}]},
             },
             {"type": "user", "message": {"content": [{"type": "tool_result", "content": "工具结果"}]}},
             {
@@ -838,6 +845,7 @@ class ConversationPreviewTests(unittest.TestCase):
             [(message.role, message.text) for message in messages],
             [
                 ("user", "第一个问题"),
+                ("assistant", "工具调用前的说明"),
                 ("assistant", "第一个最终答复"),
                 ("user", "第二个问题"),
                 ("assistant", "第二个最终答复"),
