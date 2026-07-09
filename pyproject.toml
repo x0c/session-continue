@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "session-continue"
-version = "0.4.0"
+version = "0.5.0"
 description = "Terminal session picker and handoff tool for Claude Code and Codex CLI."
 readme = "README.md"
 requires-python = ">=3.10"

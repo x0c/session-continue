@@ -7,7 +7,7 @@ import shutil
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 
-from models import LaunchPlan, LaunchRequest, SessionInfo
+from models import LaunchPlan, LaunchRequest, NewSessionRequest, SessionInfo
 from runtime.base import BaseRuntime, LaunchError
 from runtime.claude import ClaudeRuntime
 from runtime.codex import CodexRuntime
@@ -54,6 +54,10 @@ class RuntimeRegistry:
             return source.build_resume_plan(request.session)
         handoff = source.export_handoff(request.session, request.title)
         return target.build_new_plan(handoff)
+
+    def build_new_session_plan(self, request: NewSessionRequest) -> LaunchPlan:
+        """构造不关联任何已有会话历史的空白新会话计划。"""
+        return self.get(request.target_runtime_id).build_new_session_plan(request.cwd)
 
 
 def default_registry() -> RuntimeRegistry:

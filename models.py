@@ -101,6 +101,14 @@ class LaunchRequest:
 
 
 @dataclass(frozen=True)
+class NewSessionRequest:
+    """用户在界面中确认的“空白新会话”选择：不关联任何已有会话历史。"""
+
+    target_runtime_id: str
+    cwd: str
+
+
+@dataclass(frozen=True)
 class LaunchPlan:
     """可独立测试、最终交给操作系统执行的启动计划。"""
 

@@ -45,6 +45,10 @@ class BaseRuntime(ABC):
     def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
         """构造读取其他运行时历史的新会话计划。"""
 
+    @abstractmethod
+    def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
+        """构造不关联任何已有会话历史的空白新会话计划。"""
+
     def export_handoff(self, session: SessionInfo, title: str) -> Handoff:
         """把运行时私有会话导出为统一接力信息。"""
         raw_history_path = str(session.get("path") or "")

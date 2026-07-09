@@ -47,3 +47,12 @@ class ClaudeRuntime(BaseRuntime):
             ),
             cwd=usable_cwd(handoff.original_cwd),
         )
+
+    def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
+        return LaunchPlan(
+            argv=(
+                self.executable,
+                "--dangerously-skip-permissions",
+            ),
+            cwd=usable_cwd(cwd),
+        )

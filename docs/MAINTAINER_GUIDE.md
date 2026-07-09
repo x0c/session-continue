@@ -55,6 +55,13 @@
 - 会话列表侧的所有取数入口统一收敛到 `sc._visible_sessions(store, ui, sidebar_visible)`，新增依赖当前列表内容的逻辑（预览、恢复、高级操作）应该消费它的返回值，不要绕过它直接读 `store.sessions[source]`，否则会漏过滤。
 - 终端 resize 导致侧边栏被隐藏时，`ui.focus` 强制回 `"list"` 但 `ui.proj_idx` 保留、只是过滤旁路（`sidebar_visible=False` 时 `_visible_sessions` 直接返回未过滤列表）；拉宽后自动恢复原过滤状态，不需要用户重新选择项目。
 
+### 会话级快捷键与预览页一致性（`_session_action`）
+
+- 列表页和预览页（Space 打开）共用同一个分发点 `sc._session_action(ch, stdscr, store, ui, session, sidebar_visible)`，返回三态之一：一个启动请求（冒泡给调用方退出 TUI 执行）、`_ACTION_STAY`（按键已处理——弹窗被取消或 beep 拒绝，调用方留在当前视图重绘）、`_ACTION_PASS`（不是会话级动作键，调用方自行处理导航/滚动）。**新增会话级快捷键只需要在这一个函数里加分支**，列表页和预览页会自动同时生效，禁止在两处分别写一份重复的按键判断。
+- `n`（新建空白会话）：工作目录由 `sc._new_session_cwd` 解析——侧边栏选中具体项目时用该项目路径，否则退回光标所在会话的 `cwd`；两者都拿不到，或解析出的目录在本机不存在（`usable_cwd` 校验），一律 `curses.beep()` 后停留，不弹窗、不报错。运行时选择：焦点在 Claude/Codex 标签页时直接用当前标签对应的运行时，不弹窗；焦点在侧边栏（只选中了项目、没有具体运行时上下文）时弹 `_pick_runtime_for_new_session` 菜单，默认高亮当前标签对应的运行时。预览页里 `ui.focus` 恒为 `"list"`（只能从列表进入预览），所以预览页按 `n` 永远直接用当前标签、不弹窗。
+- `a`（跨运行时接力）在侧边栏焦点或预览页里没有具体会话上下文时（`session is None`）同样只是 beep，不弹菜单。
+- 运行时选择弹窗底层复用同一个 `sc._pick_runtime(stdscr, store, title, action_for, default_index)`：`_choose_target_runtime`（接力）和 `_pick_runtime_for_new_session`（新建）只是传不同标题、不同每项说明文案和不同默认选中项的薄封装，不要再各写一份绘制+按键循环。
+
 ## 运行时边界
 
 - 界面和接力编排禁止新增 `if source == "claude"` 这类运行时分支。

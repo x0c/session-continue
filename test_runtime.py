@@ -7,7 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 import titles
-from models import Handoff, LaunchPlan, LaunchRequest, session_key
+from models import Handoff, LaunchPlan, LaunchRequest, NewSessionRequest, session_key
 from runtime import BaseRuntime, LaunchError, RuntimeRegistry, default_registry
 
 
@@ -28,6 +28,9 @@ class FakeRuntime(BaseRuntime):
 
     def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
         return LaunchPlan((self.executable, handoff.render_prompt()), None)
+
+    def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
+        return LaunchPlan((self.executable,), cwd)
 
 
 class RuntimeTests(unittest.TestCase):
@@ -107,6 +110,38 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(registry.ids, ("claude", "codex", "gemini"))
         self.assertEqual(plan.argv[0], "gemini")
         self.assertIn("验证扩展能力", plan.argv[-1])
+
+    def test_claude_new_session_plan_has_no_handoff_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan = default_registry().build_new_session_plan(NewSessionRequest("claude", td))
+
+        self.assertEqual(plan.argv, ("claude", "--dangerously-skip-permissions"))
+        self.assertEqual(plan.cwd, td)
+
+    def test_codex_new_session_plan_has_no_handoff_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan = default_registry().build_new_session_plan(NewSessionRequest("codex", td))
+
+        self.assertEqual(
+            plan.argv,
+            ("codex", "-c", 'model_reasoning_effort="high"', "--dangerously-bypass-approvals-and-sandbox"),
+        )
+        self.assertEqual(plan.cwd, td)
+
+    def test_new_session_plan_drops_nonexistent_cwd(self) -> None:
+        plan = default_registry().build_new_session_plan(
+            NewSessionRequest("claude", "/tmp/does-not-exist-sc-test")
+        )
+
+        self.assertIsNone(plan.cwd)
+
+    def test_new_session_plan_dispatches_to_registered_runtime(self) -> None:
+        registry = RuntimeRegistry((*default_registry(), FakeRuntime()))
+        with tempfile.TemporaryDirectory() as td:
+            plan = registry.build_new_session_plan(NewSessionRequest("gemini", td))
+
+        self.assertEqual(plan.argv, ("gemini",))
+        self.assertEqual(plan.cwd, td)
 
     def test_session_key_is_runtime_scoped(self) -> None:
         claude = {"source": "claude", "id": "same"}

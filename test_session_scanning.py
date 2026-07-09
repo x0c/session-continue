@@ -1008,17 +1008,18 @@ class TuiLayoutTests(unittest.TestCase):
         store.get_conversation.return_value = messages
         store.registry.get.return_value.display_name = "Claude"
         session = {"source": "claude", "id": "abc"}
+        ui = sc.UIState(source="claude")
         screen.getch.return_value = ord("q")
         with mock.patch.object(sc, "_draw_preview", return_value=0):
-            should_resume = sc._show_preview(screen, store, session, "标题")
-        self.assertFalse(should_resume)
+            result = sc._show_preview(screen, store, ui, session, "标题", False)
+        self.assertIsNone(result)
         screen.clear.assert_called_once_with()
 
         screen.clear.reset_mock()
         screen.getch.return_value = 10
         with mock.patch.object(sc, "_draw_preview", return_value=0):
-            should_resume = sc._show_preview(screen, store, session, "标题")
-        self.assertTrue(should_resume)
+            result = sc._show_preview(screen, store, ui, session, "标题", False)
+        self.assertEqual(result, sc.LaunchRequest(session, "claude", "标题"))
         screen.clear.assert_called_once_with()
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
@@ -1144,6 +1145,116 @@ class ProjectSidebarTests(unittest.TestCase):
 
         hidden = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=1), sidebar_visible=False)
         self.assertEqual(hidden, sessions)
+
+    def _store_with_projects(self, projects: list[dict]) -> mock.Mock:
+        store = mock.Mock()
+        store.projects.return_value = projects
+        return store
+
+    def test_new_session_cwd_prefers_selected_project_over_session(self) -> None:
+        store = self._store_with_projects([{"cwd_key": "/proj/a", "label": "a"}])
+        ui = sc.UIState(source="claude", proj_idx=1)
+        session = {"cwd": "/proj/other"}
+
+        self.assertEqual(sc._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/a")
+
+    def test_new_session_cwd_falls_back_to_session_cwd_when_all_projects(self) -> None:
+        store = self._store_with_projects([{"cwd_key": "/proj/a", "label": "a"}])
+        ui = sc.UIState(source="claude", proj_idx=0)
+        session = {"cwd": "/proj/session"}
+
+        self.assertEqual(sc._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/session")
+
+    def test_new_session_cwd_none_without_project_or_session(self) -> None:
+        store = self._store_with_projects([])
+        ui = sc.UIState(source="claude", proj_idx=0)
+
+        self.assertIsNone(sc._new_session_cwd(store, ui, None, sidebar_visible=True))
+        self.assertIsNone(sc._new_session_cwd(store, ui, None, sidebar_visible=False))
+
+    def test_new_session_cwd_unknown_project_returns_none(self) -> None:
+        # cwd_key == "" 表示"(未知目录)"分组，没有真实路径可用。
+        store = self._store_with_projects([{"cwd_key": "", "label": sc.UNKNOWN_PROJECT_LABEL}])
+        ui = sc.UIState(source="claude", proj_idx=1)
+
+        self.assertIsNone(sc._new_session_cwd(store, ui, {"cwd": "/should/not/use"}, sidebar_visible=True))
+
+
+class SessionActionTests(unittest.TestCase):
+    """列表页与预览页共用的会话级快捷键分发（`a` 接力 / `n` 新建）。"""
+
+    def setUp(self) -> None:
+        self.store = mock.Mock()
+        self.beep_patch = mock.patch.object(sc.curses, "beep")
+        self.beep = self.beep_patch.start()
+        self.addCleanup(self.beep_patch.stop)
+
+    def test_unhandled_key_passes_through(self) -> None:
+        ui = sc.UIState(source="claude")
+        result = sc._session_action(ord("z"), mock.Mock(), self.store, ui, None, False)
+        self.assertIs(result, sc._ACTION_PASS)
+
+    def test_a_without_session_beeps_and_stays(self) -> None:
+        ui = sc.UIState(source="claude")
+        result = sc._session_action(ord("a"), mock.Mock(), self.store, ui, None, False)
+        self.assertIs(result, sc._ACTION_STAY)
+        self.beep.assert_called_once()
+
+    def test_a_with_session_opens_relay_menu(self) -> None:
+        ui = sc.UIState(source="claude")
+        session = {"source": "claude", "id": "s1"}
+        self.store.get_title.return_value = "标题"
+        with mock.patch.object(sc, "_choose_target_runtime", return_value="codex") as choose:
+            result = sc._session_action(ord("a"), mock.Mock(), self.store, ui, session, False)
+        choose.assert_called_once_with(mock.ANY, self.store, "claude")
+        self.assertEqual(result, sc.LaunchRequest(session, "codex", "标题"))
+
+    def test_a_cancelled_menu_stays(self) -> None:
+        ui = sc.UIState(source="claude")
+        session = {"source": "claude", "id": "s1"}
+        with mock.patch.object(sc, "_choose_target_runtime", return_value=None):
+            result = sc._session_action(ord("a"), mock.Mock(), self.store, ui, session, False)
+        self.assertIs(result, sc._ACTION_STAY)
+
+    def test_n_without_directory_beeps_and_stays(self) -> None:
+        ui = sc.UIState(source="claude")
+        with mock.patch.object(sc, "_new_session_cwd", return_value=None):
+            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, False)
+        self.assertIs(result, sc._ACTION_STAY)
+        self.beep.assert_called_once()
+
+    def test_n_on_list_focus_uses_current_tab_without_popup(self) -> None:
+        ui = sc.UIState(source="claude", focus="list")
+        session = {"cwd": "/proj/a"}
+        with (
+            mock.patch.object(sc, "_new_session_cwd", return_value="/proj/a"),
+            mock.patch.object(sc, "usable_cwd", side_effect=lambda cwd: cwd),
+            mock.patch.object(sc, "_pick_runtime_for_new_session") as pick,
+        ):
+            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, session, False)
+        pick.assert_not_called()
+        self.assertEqual(result, sc.NewSessionRequest("claude", "/proj/a"))
+
+    def test_n_on_sidebar_focus_opens_runtime_picker(self) -> None:
+        ui = sc.UIState(source="claude", focus="sidebar", proj_idx=1)
+        with (
+            mock.patch.object(sc, "_new_session_cwd", return_value="/proj/a"),
+            mock.patch.object(sc, "usable_cwd", side_effect=lambda cwd: cwd),
+            mock.patch.object(sc, "_pick_runtime_for_new_session", return_value="codex") as pick,
+        ):
+            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
+        pick.assert_called_once_with(mock.ANY, self.store, "claude")
+        self.assertEqual(result, sc.NewSessionRequest("codex", "/proj/a"))
+
+    def test_n_on_sidebar_focus_cancelled_picker_stays(self) -> None:
+        ui = sc.UIState(source="claude", focus="sidebar", proj_idx=1)
+        with (
+            mock.patch.object(sc, "_new_session_cwd", return_value="/proj/a"),
+            mock.patch.object(sc, "usable_cwd", side_effect=lambda cwd: cwd),
+            mock.patch.object(sc, "_pick_runtime_for_new_session", return_value=None),
+        ):
+            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
+        self.assertIs(result, sc._ACTION_STAY)
 
 
 class AgentApiTests(unittest.TestCase):

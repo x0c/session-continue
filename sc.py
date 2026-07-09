@@ -40,8 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_api
 import titles
-from models import ConversationMessage, LaunchRequest, session_key
-from runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch
+from models import ConversationMessage, LaunchRequest, NewSessionRequest, session_key
+from runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch, usable_cwd
 
 
 def _format_size(size_kb: float) -> str:
@@ -471,6 +471,23 @@ def _visible_sessions(store: SessionStore, ui: UIState, sidebar_visible: bool) -
     return _filter_sessions(bucket, cwd_key)
 
 
+def _new_session_cwd(store: SessionStore, ui: UIState, session: dict | None, sidebar_visible: bool) -> str | None:
+    """解析"新建空白会话"应该使用的工作目录：优先侧边栏选中的项目，否则退回光标所在会话的目录。
+
+    侧边栏选中"全部项目"或未知目录项目、以及没有可用会话时都返回 None，
+    调用方据此 beep 提示无目录上下文，不尝试拼一个不可靠的目录。
+    """
+    if sidebar_visible and ui.proj_idx > 0:
+        projects = store.projects()
+        if ui.proj_idx - 1 < len(projects):
+            cwd_key = projects[ui.proj_idx - 1]["cwd_key"]
+            return cwd_key or None
+    if session is not None:
+        cwd_key = _normalize_cwd(session.get("cwd"))
+        return cwd_key or None
+    return None
+
+
 def _draw_sidebar(
     stdscr,
     projects: list[dict],
@@ -668,6 +685,7 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
             help_entries = (
                 ("↑↓", " 选项目   "),
                 ("→", " 回列表   "),
+                ("n", " 新建   "),
                 ("Tab", " 切来源   "),
                 ("q", " 退出"),
             )
@@ -679,6 +697,7 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 ("Space", " 预览   "),
                 ("Enter", " 原生恢复   "),
                 ("a", " 高级操作   "),
+                ("n", " 新建   "),
                 ("q", " 退出"),
             )
         else:
@@ -688,6 +707,7 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 ("Space", " 预览   "),
                 ("Enter", " 原生恢复   "),
                 ("a", " 高级操作   "),
+                ("n", " 新建   "),
                 ("q", " 退出"),
             )
         for keys, label in help_entries:
@@ -746,7 +766,7 @@ def _draw_preview(
 
     footer_y = height - 2
     stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
-    hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Enter 恢复  Space/q 关闭"
+    hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Enter 恢复  a 接力  n 新建  Space/q 关闭"
     stdscr.addnstr(footer_y + 1, 0, hint, width - 1, key_attr)
     if max_scroll:
         progress = f"{scroll + 1}/{max_scroll + 1}"
@@ -756,8 +776,15 @@ def _draw_preview(
     return scroll
 
 
-def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> bool:
-    """打开全屏聊天记录；回车恢复会话，空格或 q 关闭。"""
+def _show_preview(
+    stdscr,
+    store: SessionStore,
+    ui: UIState,
+    session: dict,
+    title: str,
+    sidebar_visible: bool,
+) -> LaunchRequest | NewSessionRequest | None:
+    """打开全屏聊天记录；回车原生恢复，空格或 q 关闭，`a`/`n` 等会话级快捷键与列表页一致。"""
     messages = store.get_conversation(session)
     runtime_name = store.registry.get(str(session.get("source") or "")).display_name
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
@@ -771,10 +798,10 @@ def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> boo
             continue
         if ch in (ord(" "), ord("q")):
             stdscr.clear()
-            return False
+            return None
         if ch in (10, 13, curses.KEY_ENTER):
             stdscr.clear()
-            return True
+            return LaunchRequest(session, ui.source, title)
         if ch in (curses.KEY_UP, ord("k")):
             scroll = max(0, scroll - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
@@ -787,16 +814,20 @@ def _show_preview(stdscr, store: SessionStore, session: dict, title: str) -> boo
             scroll = 0
         elif ch == curses.KEY_END:
             scroll = 10 ** 9
+        else:
+            result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
+            if result is not _ACTION_STAY and result is not _ACTION_PASS:
+                stdscr.clear()
+                return result
 
 
-def _draw_runtime_menu(stdscr, store: SessionStore, source: str, selected: int) -> None:
-    """在主列表之上绘制运行时选择弹窗。"""
+def _draw_runtime_menu(stdscr, store: SessionStore, title: str, action_for, selected: int) -> None:
+    """在主列表之上绘制运行时选择弹窗。action_for(runtime) 返回每一项的说明文案。"""
     height, width = stdscr.getmaxyx()
     runtimes = list(store.registry)
     if height < len(runtimes) + 7 or width < 44:
         return
 
-    source_name = store.registry.get(source).display_name
     box_width = min(76, width - 4)
     box_height = len(runtimes) + 5
     left = (width - box_width) // 2
@@ -806,18 +837,15 @@ def _draw_runtime_menu(stdscr, store: SessionStore, source: str, selected: int) 
     selected_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
 
     stdscr.addnstr(top, left, "┌" + "─" * (box_width - 2) + "┐", box_width, normal)
-    title = " 高级操作：选择接力运行时 "
-    stdscr.addnstr(top, left + max(1, (box_width - _text_width(title)) // 2), title, box_width - 2, normal)
+    title_text = f" {title} "
+    stdscr.addnstr(top, left + max(1, (box_width - _text_width(title_text)) // 2), title_text, box_width - 2, normal)
     for row in range(1, box_height - 1):
         stdscr.addnstr(top + row, left, "│" + " " * (box_width - 2) + "│", box_width, normal)
     stdscr.addnstr(top + box_height - 1, left, "└" + "─" * (box_width - 2) + "┘", box_width, normal)
 
     for index, runtime in enumerate(runtimes):
         available = runtime.is_available()
-        if runtime.id == source:
-            action = "原生恢复（保留完整上下文）"
-        else:
-            action = f"读取 {source_name} 历史后新建会话"
+        action = action_for(runtime)
         if not available:
             action += "［未安装］"
         prefix = "▸" if index == selected else " "
@@ -830,16 +858,13 @@ def _draw_runtime_menu(stdscr, store: SessionStore, source: str, selected: int) 
     stdscr.refresh()
 
 
-def _choose_target_runtime(stdscr, store: SessionStore, source: str) -> str | None:
-    """打开高级操作菜单；默认选中第一个可用的其他运行时。"""
+def _pick_runtime(stdscr, store: SessionStore, title: str, action_for, default_index: int) -> str | None:
+    """通用运行时选择弹窗：↑↓ 选择、Enter 确认（未安装则 beep 拒绝）、q 取消。"""
     runtimes = list(store.registry)
-    selected = next(
-        (i for i, runtime in enumerate(runtimes) if runtime.id != source and runtime.is_available()),
-        next((i for i, runtime in enumerate(runtimes) if runtime.id == source), 0),
-    )
+    selected = default_index
 
     while True:
-        _draw_runtime_menu(stdscr, store, source, selected)
+        _draw_runtime_menu(stdscr, store, title, action_for, selected)
         try:
             ch = stdscr.getch()
         except curses.error:
@@ -859,7 +884,78 @@ def _choose_target_runtime(stdscr, store: SessionStore, source: str) -> str | No
             curses.beep()
 
 
-def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
+def _choose_target_runtime(stdscr, store: SessionStore, source: str) -> str | None:
+    """打开高级操作菜单；默认选中第一个可用的其他运行时。"""
+    runtimes = list(store.registry)
+    source_name = store.registry.get(source).display_name
+
+    def action_for(runtime) -> str:
+        if runtime.id == source:
+            return "原生恢复（保留完整上下文）"
+        return f"读取 {source_name} 历史后新建会话"
+
+    default_index = next(
+        (i for i, runtime in enumerate(runtimes) if runtime.id != source and runtime.is_available()),
+        next((i for i, runtime in enumerate(runtimes) if runtime.id == source), 0),
+    )
+    return _pick_runtime(stdscr, store, "高级操作：选择接力运行时", action_for, default_index)
+
+
+def _pick_runtime_for_new_session(stdscr, store: SessionStore, default_id: str) -> str | None:
+    """新建会话菜单；默认高亮 default_id（当前所在标签的运行时）对应项。"""
+    runtimes = list(store.registry)
+
+    def action_for(_runtime) -> str:
+        return "在该目录下新建空白会话"
+
+    default_index = next(
+        (i for i, runtime in enumerate(runtimes) if runtime.id == default_id and runtime.is_available()),
+        next((i for i, runtime in enumerate(runtimes) if runtime.is_available()), 0),
+    )
+    return _pick_runtime(stdscr, store, "新建会话：选择运行时", action_for, default_index)
+
+
+_ACTION_STAY = object()  # 按键已被处理（弹窗被取消 / beep 拒绝），调用方留在当前视图重绘
+_ACTION_PASS = object()  # 不是会话级动作键，调用方自行处理（导航、滚动等）
+
+
+def _session_action(
+    ch: int,
+    stdscr,
+    store: SessionStore,
+    ui: UIState,
+    session: dict | None,
+    sidebar_visible: bool,
+):
+    """处理列表页与预览页共用的会话级快捷键：`a` 接力、`n` 新建会话。
+
+    列表页和预览页的按键循环都要经过这里，保证同一个键在两处行为一致；
+    未来新增会话级快捷键只需要在这里加一个分支，两处会自动同时支持。
+    """
+    if ch == ord("a"):
+        if session is None:
+            curses.beep()
+            return _ACTION_STAY
+        target = _choose_target_runtime(stdscr, store, ui.source)
+        if target is None:
+            return _ACTION_STAY
+        return LaunchRequest(session, target, store.get_title(session))
+    if ch == ord("n"):
+        cwd = usable_cwd(_new_session_cwd(store, ui, session, sidebar_visible))
+        if cwd is None:
+            curses.beep()
+            return _ACTION_STAY
+        if ui.focus == "sidebar":
+            target = _pick_runtime_for_new_session(stdscr, store, ui.source)
+            if target is None:
+                return _ACTION_STAY
+        else:
+            target = ui.source
+        return NewSessionRequest(target, cwd)
+    return _ACTION_PASS
+
+
+def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | None:
     curses.curs_set(0)
     _init_colors()
     stdscr.keypad(True)  # 关键：没有这行，方向键的 ESC 序列不会被解码成 KEY_LEFT/RIGHT/UP/DOWN，
@@ -944,6 +1040,11 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
                 ui.focus = "list"
             elif ch in (10, 13, curses.KEY_ENTER):
                 ui.focus = "list"
+            elif ch in (ord("a"), ord("n")):
+                # a 在侧边栏没有具体会话，_session_action 会 beep 拒绝；n 靠选中的项目目录新建
+                result = _session_action(ch, stdscr, store, ui, None, sidebar_visible)
+                if result is not _ACTION_STAY and result is not _ACTION_PASS:
+                    return result
             # KEY_LEFT：已经是侧边栏端点，停住不动（Tab 仍可循环切换来源）
         else:  # ui.focus == "list"
             if ch in (curses.KEY_UP, ord("k")):
@@ -971,27 +1072,31 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
                 if sessions:
                     session = sessions[ui.idx]
                     title = store.get_title(session)
-                    if _show_preview(stdscr, store, session, title):
-                        return LaunchRequest(session, ui.source, title)
+                    result = _show_preview(stdscr, store, ui, session, title, sidebar_visible)
+                    if result is not None:
+                        return result
             elif ch in (10, 13, curses.KEY_ENTER):
                 if sessions:
                     session = sessions[ui.idx]
                     return LaunchRequest(session, ui.source, store.get_title(session))
-            elif ch == ord("a"):
-                if sessions:
-                    target = _choose_target_runtime(stdscr, store, ui.source)
-                    if target is not None:
-                        session = sessions[ui.idx]
-                        return LaunchRequest(session, target, store.get_title(session))
+            else:
+                session = sessions[ui.idx] if sessions else None
+                result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
+                if result is not _ACTION_STAY and result is not _ACTION_PASS:
+                    return result
 
         # 光标移动、切换来源或切换项目都可能改变可见区，统一在这里对齐渲染滚动位置
         _sync_top()
         _sync_sidebar_top()
 
 
-def _launch(request: LaunchRequest, registry: RuntimeRegistry) -> None:
+def _launch(request: LaunchRequest | NewSessionRequest, registry: RuntimeRegistry) -> None:
     """生成启动计划并让目标运行时接管当前终端。"""
-    execute_launch(registry.build_launch_plan(request))
+    if isinstance(request, NewSessionRequest):
+        plan = registry.build_new_session_plan(request)
+    else:
+        plan = registry.build_launch_plan(request)
+    execute_launch(plan)
 
 
 def _format_resume_command(argv: tuple[str, ...]) -> str:

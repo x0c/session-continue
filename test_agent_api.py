@@ -39,6 +39,9 @@ class FakeRuntime(BaseRuntime):
     def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
         return LaunchPlan((self.executable, handoff.render_prompt()), None)
 
+    def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
+        return LaunchPlan((self.executable,), cwd)
+
 
 def _session(history_path: str, **overrides) -> dict:
     base = {
