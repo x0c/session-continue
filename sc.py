@@ -731,7 +731,8 @@ def _draw_preview(
     messages: list[ConversationMessage],
     title: str,
     runtime_name: str,
-    short_id: str,
+    session_id: str,
+    mouse_enabled: bool,
     scroll: int,
 ) -> int:
     """全屏绘制聊天记录，返回修正后的滚动位置。"""
@@ -753,8 +754,9 @@ def _draw_preview(
 
     header = f" 对话预览 · {title} "
     stdscr.addnstr(0, 0, header, width - 1, user_attr)
-    if short_id:
-        id_label = f" ID {short_id} "
+    if session_id:
+        # 展示完整会话 ID（而非 short_id 前缀），方便直接复制去跑 `claude --resume`/`codex resume` 等原生命令。
+        id_label = f" ID {session_id} "
         id_x = max(0, width - 1 - _text_width(id_label))
         stdscr.addnstr(0, id_x, id_label, width - 1 - id_x, dim)
     stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
@@ -771,7 +773,8 @@ def _draw_preview(
 
     footer_y = height - 2
     stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
-    hint = "↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  Enter 恢复  a 接力  n 新建  Space/q 关闭"
+    mouse_hint = "m 关闭鼠标滚轮" if mouse_enabled else "m 开启鼠标滚轮（当前可框选复制）"
+    hint = f"↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  {mouse_hint}  Enter 恢复  a 接力  n 新建  Space/q 关闭"
     stdscr.addnstr(footer_y + 1, 0, hint, width - 1, key_attr)
     if max_scroll:
         progress = f"{scroll + 1}/{max_scroll + 1}"
@@ -797,6 +800,15 @@ def _preview_mouse_scroll_delta() -> int | None:
     return None
 
 
+def _apply_preview_mousemask(enabled: bool) -> None:
+    """开关预览页的鼠标滚轮上报；关闭后终端会恢复原生的鼠标框选/复制。"""
+    mask = (curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0)) if enabled else 0
+    try:
+        curses.mousemask(mask)
+    except curses.error:
+        pass  # 终端或 curses 编译版本不支持鼠标上报时静默降级为纯键盘操作
+
+
 def _show_preview(
     stdscr,
     store: SessionStore,
@@ -807,20 +819,20 @@ def _show_preview(
 ) -> LaunchRequest | NewSessionRequest | None:
     """打开全屏聊天记录；回车原生恢复，空格或 q 关闭，`a`/`n` 等会话级快捷键与列表页一致。
 
-    进入预览页时临时开启鼠标滚轮上报，退出（含提前 return）时必须关闭——常驻开启会
-    让终端原生的鼠标选中/复制在主列表页也失效，所以只在预览页这个作用域内生效。
+    默认开启鼠标滚轮上报，按 `m` 可临时关闭以用回终端原生的鼠标框选/复制（开启鼠标
+    上报期间，终端会把所有鼠标事件——包括拖拽选中——都发给本程序，原生框选会失效，
+    这是终端鼠标协议的固有限制，不是可以只订阅滚轮事件就绕开的）。退出预览页（含所有
+    提前 return 路径）必须关闭鼠标上报，否则会连带影响主列表页/侧边栏的鼠标选中。
     """
     messages = store.get_conversation(session)
     runtime_name = store.registry.get(str(session.get("source") or "")).display_name
-    short_id = str(session.get("short_id") or "")
+    session_id = str(session.get("id") or "")
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
-    try:
-        curses.mousemask(curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
-    except curses.error:
-        pass  # 终端或 curses 编译版本不支持鼠标上报时静默降级为纯键盘操作
+    mouse_enabled = True
+    _apply_preview_mousemask(mouse_enabled)
     try:
         while True:
-            scroll = _draw_preview(stdscr, messages, title, runtime_name, short_id, scroll)
+            scroll = _draw_preview(stdscr, messages, title, runtime_name, session_id, mouse_enabled, scroll)
             try:
                 ch = stdscr.getch()
             except curses.error:
@@ -849,16 +861,16 @@ def _show_preview(
                 delta = _preview_mouse_scroll_delta()
                 if delta is not None:
                     scroll = max(0, scroll + delta)
+            elif ch == ord("m"):
+                mouse_enabled = not mouse_enabled
+                _apply_preview_mousemask(mouse_enabled)
             else:
                 result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
                 if result is not _ACTION_STAY and result is not _ACTION_PASS:
                     stdscr.clear()
                     return result
     finally:
-        try:
-            curses.mousemask(0)
-        except curses.error:
-            pass
+        _apply_preview_mousemask(False)
 
 
 def _draw_runtime_menu(stdscr, store: SessionStore, title: str, action_for, selected: int) -> None:

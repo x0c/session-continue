@@ -997,25 +997,27 @@ class TuiLayoutTests(unittest.TestCase):
         screen.getmaxyx.return_value = (24, 80)
         messages = [sc.ConversationMessage("user", "问题")]
 
+        full_id = "abc12345-1111-2222-3333-444444444444"
         with mock.patch.object(sc.curses, "color_pair", return_value=0):
-            sc._draw_preview(screen, messages, "标题", "Claude", "abc12345", 0)
+            sc._draw_preview(screen, messages, "标题", "Claude", full_id, True, 0)
 
         screen.erase.assert_called_once_with()
         positions = {(call.args[0], call.args[1]) for call in screen.addnstr.call_args_list}
         self.assertIn((0, 0), positions)
         self.assertIn((23, 0), positions)
         header_row_texts = [call.args[2] for call in screen.addnstr.call_args_list if call.args[0] == 0]
-        self.assertTrue(any("abc12345" in text for text in header_row_texts))
+        # 头部展示的是完整会话 ID（而非 8 位 short_id），直接可复制去跑原生 resume 命令。
+        self.assertTrue(any(full_id in text for text in header_row_texts))
 
         store = mock.Mock()
         store.get_conversation.return_value = messages
         store.registry.get.return_value.display_name = "Claude"
-        session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
+        session = {"source": "claude", "id": full_id, "short_id": "abc12345"}
         ui = sc.UIState(source="claude")
         screen.getch.return_value = ord("q")
         with mock.patch.object(sc, "_draw_preview", return_value=0) as draw:
             result = sc._show_preview(screen, store, ui, session, "标题", False)
-        draw.assert_called_once_with(screen, messages, "标题", "Claude", "abc12345", 10 ** 9)
+        draw.assert_called_once_with(screen, messages, "标题", "Claude", full_id, True, 10 ** 9)
         self.assertIsNone(result)
         screen.clear.assert_called_once_with()
 
@@ -1063,6 +1065,33 @@ class TuiLayoutTests(unittest.TestCase):
         # 第二次绘制应该带着鼠标滚轮增量后的滚动位置。
         second_call_scroll = draw.call_args_list[1].args[-1]
         self.assertEqual(second_call_scroll, 5 + sc.PREVIEW_MOUSE_SCROLL_LINES)
+
+    def test_preview_m_key_toggles_mouse_capture_off_then_on(self) -> None:
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        messages = [sc.ConversationMessage("user", "问题")]
+        store = mock.Mock()
+        store.get_conversation.return_value = messages
+        store.registry.get.return_value.display_name = "Claude"
+        session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
+        ui = sc.UIState(source="claude")
+
+        screen.getch.side_effect = [ord("m"), ord("m"), ord("q")]
+        with (
+            mock.patch.object(sc, "_draw_preview", return_value=0) as draw,
+            mock.patch.object(sc.curses, "mousemask") as mousemask,
+        ):
+            sc._show_preview(screen, store, ui, session, "标题", False)
+
+        default_mask = curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0)
+        # 进入开、按 m 关、再按 m 开、退出关：mousemask 调用序列必须完整反映这四步。
+        self.assertEqual(
+            [call.args[0] for call in mousemask.call_args_list],
+            [default_mask, 0, default_mask, 0],
+        )
+        # footer 提示随开关状态切换文案，用户能看出当前能不能用鼠标原生框选。
+        mouse_enabled_flags = [call.args[5] for call in draw.call_args_list]
+        self.assertEqual(mouse_enabled_flags, [True, False, True])
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
         col_num, col_title, col_dir, col_time, col_size, col_status = sc._column_widths(120)
