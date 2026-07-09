@@ -496,7 +496,7 @@ COMMANDS = [
         ],
         "fields": {
             "...": "与 list 命令的字段相同",
-            "messages": "[{role: user|assistant|system, text}]，按时间顺序的用户消息、每轮最终答复和系统事件（system 是 Monitor/task-notification 等非用户手动输入的系统注入事件，不代表用户说了这句话）",
+            "messages": "[{role: user|assistant, text}]，按时间顺序的用户消息和每轮最终答复；Monitor/task-notification 等系统注入事件已过滤，不出现在这里",
             "message_count_shown": "本次实际返回的消息条数",
             "message_count_total": "该会话可提取的消息总数",
             "output_path": "--out 模式下写入的 JSON 文件绝对路径",

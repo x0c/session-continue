@@ -370,17 +370,20 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                 if not isinstance(payload, dict):
                     continue
 
+                # payload 里的字段即使写了 key，值也可能是 JSON null（如任务无输出就结束的
+                # task_complete）；`.get(key, "")` 只在 key 缺失时才用默认值，key 存在但值为
+                # null 时会拿到 None，`str(None)` 变成字面量 "None" 混进正文，必须用 `or ""` 兜底。
                 payload_type = payload.get("type")
                 if payload_type == "user_message":
-                    text = str(payload.get("message", "")).strip()
+                    text = str(payload.get("message") or "").strip()
                     if text:
                         messages.append(ConversationMessage("user", text))
                 elif payload_type == "agent_message" and payload.get("phase") in (None, "final_answer"):
-                    text = str(payload.get("message", "")).strip()
+                    text = str(payload.get("message") or "").strip()
                     if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
                         messages.append(ConversationMessage("assistant", text))
                 elif payload_type == "task_complete":
-                    text = str(payload.get("last_agent_message", "")).strip()
+                    text = str(payload.get("last_agent_message") or "").strip()
                     if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
                         messages.append(ConversationMessage("assistant", text))
     except OSError:

@@ -540,15 +540,16 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     continue
 
                 if entry_type == "user":
+                    origin = entry.get("origin")
+                    origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+                    if origin_kind not in (None, "human"):
+                        # task-notification 等系统注入事件也挂在 user 轮次下，但不是真人输入。
+                        # 预览只展示 Agent 和真人的对话，这类系统事件价值很低，整条丢弃，不展示。
+                        continue
                     text = _extract_text(message.get("content", ""))
                     if text and text != _INTERRUPTED_MARKER:
                         flush_legacy_answer()
-                        origin = entry.get("origin")
-                        origin_kind = origin.get("kind") if isinstance(origin, dict) else None
-                        # task-notification 等系统注入事件也挂在 user 轮次下，但不是真人输入，
-                        # 展示时必须和真实用户消息区分开，否则看起来像是用户发了条奇怪的消息。
-                        role = "user" if origin_kind in (None, "human") else "system"
-                        messages.append(ConversationMessage(role, text))
+                        messages.append(ConversationMessage("user", text))
                     continue
 
                 if entry_type != "assistant":

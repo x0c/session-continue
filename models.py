@@ -58,13 +58,13 @@ def session_key(session: SessionInfo | dict) -> str:
 
 @dataclass(frozen=True)
 class ConversationMessage:
-    """从运行时私有历史中提取出的单条用户消息、最终答复或系统事件。
+    """从运行时私有历史中提取出的单条用户消息或最终答复。
 
-    `role="system"` 用于 Monitor/task-notification 等系统注入、并非用户手动输入的事件——
-    这类事件在原始记录里也挂在 user 轮次下，但不能和真人输入混为一谈展示。
+    Monitor/task-notification 等系统注入事件（原始记录里也挂在 user 轮次下，但不是真人
+    输入）价值很低，在各运行时的 `load_conversation` 里就地过滤掉，不进入这个类型。
     """
 
-    role: Literal["user", "assistant", "system"]
+    role: Literal["user", "assistant"]
     text: str
 
 

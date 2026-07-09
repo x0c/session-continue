@@ -852,9 +852,10 @@ class ConversationPreviewTests(unittest.TestCase):
             ],
         )
 
-    def test_claude_conversation_tags_task_notification_as_system_not_user(self) -> None:
+    def test_claude_conversation_drops_task_notification_system_events(self) -> None:
         """Monitor/task-notification 事件在原始记录里也挂在 user 轮次下（`origin.kind` 是
-        "task-notification" 而不是 "human"），预览页不能把它当成用户手动输入的消息展示。"""
+        "task-notification" 而不是 "human"），价值很低，消息历史只保留 Agent 和真人的对话，
+        这类系统事件应整条丢弃，不进入返回结果（不是标个 role 展示出来，是完全不展示）。"""
         entries = [
             {
                 "type": "user",
@@ -881,7 +882,6 @@ class ConversationPreviewTests(unittest.TestCase):
             [(message.role, message.text) for message in messages],
             [
                 ("user", "真人提问"),
-                ("system", "<task-notification>系统事件内容</task-notification>"),
                 ("user", "/plan 之类无 origin 字段但仍是真人输入"),
             ],
         )
@@ -909,6 +909,26 @@ class ConversationPreviewTests(unittest.TestCase):
             [(message.role, message.text) for message in messages],
             [("user", "用户问题"), ("assistant", "最终答复")],
         )
+
+    def test_codex_conversation_ignores_null_message_instead_of_literal_none(self) -> None:
+        """payload 里的字段即使有 key，值也可能是 JSON null（如任务无输出就结束的
+        task_complete）；`payload.get(key, "")` 只在 key 缺失时才用默认值，key 存在但值为
+        null 时会拿到 None，`str(None)` 会变成字面量 "None" 混进正文——回归用例覆盖这个坑。"""
+        entries = [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "问题"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": None},
+            },
+            {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": None}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_codex.load_conversation(str(path))
+
+        self.assertEqual([(message.role, message.text) for message in messages], [("user", "问题")])
 
 
 class TuiLayoutTests(unittest.TestCase):
@@ -1033,19 +1053,6 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(text_lines.count("● 你"), 2)
         self.assertEqual(text_lines.count("◆ Codex"), 2)
         self.assertTrue(all(sc._text_width(line) <= 16 for line in text_lines))
-
-    def test_preview_renders_system_role_distinctly_from_user(self) -> None:
-        """Monitor/task-notification 事件（role="system"）不能渲染成"● 你"，否则看起来像用户发的消息。"""
-        messages = [
-            sc.ConversationMessage("user", "真人提问"),
-            sc.ConversationMessage("system", "<task-notification>...</task-notification>"),
-        ]
-
-        lines = sc._preview_lines(messages, "Claude", 40)
-        text_lines = [line for _, line in lines]
-
-        self.assertEqual(text_lines.count("● 你"), 1)
-        self.assertEqual(text_lines.count("◇ 系统事件"), 1)
 
     def test_preview_uses_full_terminal_and_clears_before_returning(self) -> None:
         screen = mock.Mock()
