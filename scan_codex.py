@@ -258,6 +258,7 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         "fallback_title": fallback,
         "status_tag": _status_tag(last_event_type),
         "live": False,  # scan_sessions 统一按 _live_session_ids() 回填
+        "pid": None,  # 同上，运行中会话的进程号
         "first_user_msg": (first_user_msg or "")[:300],
         "last_user_msg": (last_user_msg or "")[:300],
         "last_agent_msg": (last_agent_msg or "")[:300],
@@ -265,16 +266,17 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
     }
 
 
-def _live_session_ids() -> set[str]:
-    """返回进程仍存活的 Codex 会话 UUID 集合。
+def _live_session_ids() -> dict[str, int]:
+    """返回进程仍存活的 Codex 会话 UUID -> pid 映射。
 
     Codex 没有类似 Claude 的 pid 注册表，但活着的 codex 进程会以写模式持有
     自己的 rollout JSONL（实测 lsof 输出形如
     `codex 47372 … 45w … rollout-2026-07-04T16-03-52-<uuid>.jsonl`）。
-    先用 pgrep 拿到所有 codex 进程 pid，再逐个 lsof 从其打开的文件里抽 UUID。
+    先用 pgrep 拿到所有 codex 进程 pid，再逐个 lsof 从其打开的文件里抽 UUID，
+    顺手记下 pid，供 Agent 接口把「哪个会话在跑」精确到进程号。
     任一环节缺工具或调用失败都静默降级为空集（判活失败时全部按已结束显示）。
     """
-    live_ids: set[str] = set()
+    live_ids: dict[str, int] = {}
     try:
         pids = subprocess.check_output(
             ["pgrep", "-x", "codex"], stderr=subprocess.DEVNULL
@@ -282,19 +284,23 @@ def _live_session_ids() -> set[str]:
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return live_ids
 
-    for pid in pids:
+    for pid_str in pids:
         try:
             out = subprocess.check_output(
-                ["lsof", "-p", pid], stderr=subprocess.DEVNULL
+                ["lsof", "-p", pid_str], stderr=subprocess.DEVNULL
             ).decode(errors="replace")
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            continue
+        try:
+            pid = int(pid_str)
+        except ValueError:
             continue
         for line in out.splitlines():
             if "rollout-" not in line:
                 continue
             uuid = _extract_uuid_from_filename(line)
             if uuid:
-                live_ids.add(uuid)
+                live_ids[uuid] = pid
     return live_ids
 
 
@@ -346,6 +352,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
         info["live"] = info["id"] in live_ids
+        info["pid"] = live_ids.get(info["id"])
         results.append(info)
         if len(results) >= limit:
             break

@@ -32,8 +32,8 @@ description: Query local Claude Code and Codex CLI session history through the `
 
 | 命令 | 用途 |
 | --- | --- |
-| `sc list [--runtime R] [--limit N] [--top N] [--compact] [--status S] [--cwd 子串] [--fields a,b]` | 结构化列出会话 |
-| `sc search <关键词...> [--deep] [--runtime R] [--limit N] [--top N] [--compact] [--fields a,b]` | 按主题找会话 |
+| `sc list [--runtime R] [--limit N] [--top N] [--compact] [--status S] [--cwd 子串] [--live] [--fields a,b]` | 结构化列出会话 |
+| `sc search <关键词...> [--deep] [--runtime R] [--limit N] [--top N] [--compact] [--live] [--fields a,b]` | 按主题找会话 |
 | `sc show <会话> [--messages N \| --full] [--compact] [--out 路径]` | 会话详情 + 对话内容 |
 | `sc context <会话>` | 生成接续该会话所需的上下文数据包 |
 | `sc describe [command]` | 查看命令 / 参数 / 输出字段说明 |
@@ -74,9 +74,33 @@ sc list --cwd my-weather-app --limit 80 --top 5 --compact
 sc list --status pending
 ```
 
+## 管家编排典型流程
+
+**找到当前正在运行的 CodingAgent,判断能不能直接下指令:**
+
+```bash
+sc list --live --compact                 # 一步拿到「现在有哪些会话进程真的在跑」
+sc list --live --status pending --compact # 更进一步：正在跑、且已在等你回复的
+```
+
+`live` 是按进程真实判活（pid 存活/写文件锁定），不是文件时间推断；`status` 是最后一轮角色推断的
+会话内容状态。两者组合判断能不能打扰：`live=true` 且 `status=done` 说明进程还开着但已经把当前
+任务处理完，可以直接接着聊；`live=true` 且 `status=pending` 说明正忙着等你回复，插话前先看
+`last_user`/`last_agent` 摘要搞清楚它在问什么。`live=false` 的会话只能走 `resume_command` 重新
+拉起一个进程，不能"接管"——sc 不提供向运行中进程注入输入的能力（本文档开头即说明：sc 只读、无
+副作用,拿到数据后要做什么由调用方决定）。
+
+`list`/`search` 默认输出已经带 `last_user`/`last_agent`（最近一轮真人消息和助手回复，硬截断精简），
+多数情况下看这两个字段就够判断"这条会话在干嘛"，不必为每条候选都跑一次 `sc show`。
+
 ## 字段说明要点
 
 - `title`：只读已生成的标题缓存或本地兜底标题，不会触发新的标题生成（不花账号额度）。
+- `live` / `pid`：`live` 是运行中会话的进程是否真实存活（Claude 用 pid 注册表 + `os.kill`，Codex
+  用 `pgrep`+`lsof` 探测持有对应会话文件的进程），不是根据文件时间猜的。`pid` 只在 `live=true`
+  时非空，供调用方定位/给该进程发信号；sc 本身不提供拉起/接管等副作用命令，`pid` 只是可见性。
+- `last_user` / `last_agent`：最后一条真人消息和助手最后一轮回复的硬截断摘要（约 120 字），用于
+  快速判断会话在干嘛；需要完整对话仍然用 `sc show`。
 - `status`：英文枚举 `done` / `pending` / `aborted` / `unknown`，程序判断用这个字段，不要解析
   `status_tag`（中文 + emoji，只给人看）。
 - `resumable` / `resume_command`：是否能生成同运行时原生恢复命令，以及可直接执行的恢复命令；这些字段

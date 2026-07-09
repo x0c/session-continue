@@ -15,7 +15,7 @@ import scan_codex
 import sc
 import agent_api
 import titles
-from models import ConversationMessage, LaunchPlan
+from models import ConversationMessage, Handoff, LaunchPlan
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -651,6 +651,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
 
         self.assertIn("alive-session", live_ids)
         self.assertNotIn("dead-session", live_ids)
+        self.assertEqual(live_ids["alive-session"], alive_pid)  # 判活的同时要能精确回填 pid
 
 
 class CodexScanTests(TimezoneMixin, unittest.TestCase):
@@ -796,7 +797,7 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
         with mock.patch("scan_codex.subprocess.check_output", side_effect=fake_check_output):
             live_ids = scan_codex._live_session_ids()
 
-        self.assertEqual(live_ids, {uuid})
+        self.assertEqual(live_ids, {uuid: 47372})  # 判活的同时要能精确回填 pid
 
     def test_live_session_ids_returns_empty_when_pgrep_unavailable(self) -> None:
         # pgrep 缺失或调用失败时静默降级为空集，不抛异常。
@@ -805,7 +806,7 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
         ):
             live_ids = scan_codex._live_session_ids()
 
-        self.assertEqual(live_ids, set())
+        self.assertEqual(live_ids, {})
 
 
 class ConversationPreviewTests(unittest.TestCase):
@@ -1391,7 +1392,10 @@ class SessionActionTests(unittest.TestCase):
 
 
 class AgentApiTests(unittest.TestCase):
-    def _session(self, sid: str, title: str, mtime: int, *, cwd: str = "/tmp/demo", status=titles.STATUS_DONE) -> dict:
+    def _session(
+        self, sid: str, title: str, mtime: int, *, cwd: str = "/tmp/demo", status=titles.STATUS_DONE,
+        live: bool = False, pid: int | None = None, last_user_msg: str = "", last_agent_msg: str = "",
+    ) -> dict:
         return {
             "source": "claude",
             "id": sid,
@@ -1405,10 +1409,11 @@ class AgentApiTests(unittest.TestCase):
             "native_title": None,
             "fallback_title": title,
             "status_tag": status,
-            "live": False,
+            "live": live,
+            "pid": pid,
             "first_user_msg": title,
-            "last_user_msg": "",
-            "last_agent_msg": "",
+            "last_user_msg": last_user_msg,
+            "last_agent_msg": last_agent_msg,
             "path": f"/tmp/{sid}.jsonl",
         }
 
@@ -1420,6 +1425,11 @@ class AgentApiTests(unittest.TestCase):
         runtime.load_conversation.return_value = messages or []
         runtime.build_resume_plan.side_effect = (
             lambda session: LaunchPlan(argv=("claude", "--resume", session["id"]), cwd=session.get("cwd"))
+        )
+        runtime.export_handoff.side_effect = lambda session, title: Handoff(
+            source_runtime_id="claude", source_runtime_name="Claude", title=title,
+            history_path=session.get("path") or "", original_cwd=session.get("cwd") or "",
+            history_reading_hint="hint",
         )
 
         class FakeRegistry:
@@ -1496,6 +1506,93 @@ class AgentApiTests(unittest.TestCase):
         self.assertTrue(saved["ok"])
         self.assertEqual(saved["data"]["message_count_shown"], 3)
         self.assertEqual(saved["data"]["messages"][2]["text"], "问题二")
+
+    def test_session_payload_exposes_live_pid_and_trims_summary(self) -> None:
+        # 管家 Agent 场景：list/search 默认要能看出「哪个 CodingAgent 在跑」（live/pid）
+        # 和「最近聊了什么」（last_user/last_agent，硬截断精简，不是全文）。
+        long_text = "问" * 200
+        session = self._session(
+            "live1234", "运行中的会话", 1, live=True, pid=12345,
+            last_user_msg=long_text, last_agent_msg="好的，正在处理",
+        )
+        payload = agent_api.session_payload(session, {}, runtime=None)
+
+        self.assertTrue(payload["live"])
+        self.assertEqual(payload["pid"], 12345)
+        self.assertEqual(payload["last_agent"], "好的，正在处理")
+        self.assertTrue(payload["last_user"].endswith("…"))
+        self.assertLessEqual(len(payload["last_user"]), agent_api._SUMMARY_TRIM_LEN + 1)
+
+        idle_session = self._session("idle5678", "已结束的会话", 1, live=False)
+        idle_payload = agent_api.session_payload(idle_session, {}, runtime=None)
+        self.assertFalse(idle_payload["live"])
+        self.assertIsNone(idle_payload["pid"])
+
+    def test_list_live_filter_keeps_only_running_sessions(self) -> None:
+        sessions = [
+            self._session("run11111", "跑着的", 20, live=True, pid=111),
+            self._session("done2222", "结束的", 10, live=False),
+        ]
+        registry, _ = self._registry(sessions)
+        args = mock.Mock(runtime=None, limit=10, top=None, compact=True, status=None, cwd=None, fields=None, live=True)
+
+        result = agent_api.cmd_list(args, registry)
+
+        self.assertEqual([s["id"] for s in result["data"]["sessions"]], ["run11111"])
+
+    def test_list_without_live_flag_still_returns_all_sessions(self) -> None:
+        # 回归：mock.Mock() 未显式设置的属性会自动生成一个真值 Mock，--live 判断必须
+        # 用 `is True` 而不是单纯 truthy，否则老调用方（未传 live 参数）会被误过滤。
+        sessions = [
+            self._session("run11111", "跑着的", 20, live=True, pid=111),
+            self._session("done2222", "结束的", 10, live=False),
+        ]
+        registry, _ = self._registry(sessions)
+        args = mock.Mock(runtime=None, limit=10, top=None, compact=True, status=None, cwd=None, fields=None)
+
+        result = agent_api.cmd_list(args, registry)
+
+        self.assertEqual(len(result["data"]["sessions"]), 2)
+
+    def test_search_live_filter_keeps_only_running_sessions(self) -> None:
+        sessions = [
+            self._session("run11111", "fable 跑着的", 20, live=True, pid=111),
+            self._session("done2222", "fable 结束的", 10, live=False),
+        ]
+        registry, _ = self._registry(sessions)
+        args = mock.Mock(
+            keywords=["fable"], deep=False, runtime=None, limit=10, top=None, compact=True, fields=None, live=True,
+        )
+
+        result = agent_api.cmd_search(args, registry)
+
+        self.assertEqual([s["id"] for s in result["data"]["sessions"]], ["run11111"])
+
+    def test_context_reports_live_and_pid(self) -> None:
+        session = self._session("ctxsess1", "上下文会话", 1, live=True, pid=999)
+        registry, _ = self._registry([session])
+        args = mock.Mock(session="claude:ctxsess1", limit=10)
+
+        result = agent_api.cmd_context(args, registry)
+
+        self.assertTrue(result["data"]["live"])
+        self.assertEqual(result["data"]["pid"], 999)
+
+    def test_describe_list_and_search_document_live_flag_and_new_fields(self) -> None:
+        # sc describe 的输出与实现同源，改完命令必须同步这里，防止参数/字段说明漂移。
+        args = mock.Mock(target="list")
+        result = agent_api.cmd_describe(args, registry=None)
+        list_flags = [flag for arg in result["data"]["args"] for flag in arg["flags"]]
+        self.assertIn("--live", list_flags)
+        self.assertIn("live", result["data"]["fields"])
+        self.assertIn("pid", result["data"]["fields"])
+        self.assertIn("last_user", result["data"]["fields"])
+        self.assertIn("last_agent", result["data"]["fields"])
+
+        args = mock.Mock(target="search")
+        result = agent_api.cmd_describe(args, registry=None)
+        search_flags = [flag for arg in result["data"]["args"] for flag in arg["flags"]]
+        self.assertIn("--live", search_flags)
 
 
 class StartupLatencyTests(unittest.TestCase):

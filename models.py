@@ -25,6 +25,7 @@ class SessionInfo(TypedDict):
     fallback_title: str
     status_tag: str
     live: bool
+    pid: int | None
     first_user_msg: str
     last_user_msg: str
     last_agent_msg: str

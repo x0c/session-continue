@@ -351,6 +351,7 @@ def _build_session_info(fpath: str, proj: str) -> dict:
         "fallback_title": fallback,
         "status_tag": status_tag,
         "live": False,  # scan_sessions 统一按 _live_session_ids() 回填
+        "pid": None,  # 同上，运行中会话的进程号
         "first_user_msg": (first_user_msg or "")[:300],
         "last_user_msg": (last_user_msg or "")[:300],
         "last_agent_msg": (last_agent_msg or "")[:300],
@@ -361,14 +362,15 @@ def _build_session_info(fpath: str, proj: str) -> dict:
 SESSIONS_DIR = os.path.expanduser("~/.claude/sessions/")
 
 
-def _live_session_ids() -> set[str]:
-    """扫描 ~/.claude/sessions/{pid}.json，返回进程仍存活的 sessionId 集合。
+def _live_session_ids() -> dict[str, int]:
+    """扫描 ~/.claude/sessions/{pid}.json，返回进程仍存活的 sessionId -> pid 映射。
 
     与 active-claude-sessions skill 同一判活思路：pid 文件是 Claude Code 自己
     维护的运行时状态，os.kill(pid, 0) 能确认进程是否还真实存在（而不是残留的
-    陈旧文件）。
+    陈旧文件）。文件名本身就是 pid，判活的同时顺手记下来，供 Agent 接口把
+    「哪个会话在跑」精确到进程号。
     """
-    live_ids: set[str] = set()
+    live_ids: dict[str, int] = {}
     if not os.path.isdir(SESSIONS_DIR):
         return live_ids
     for fname in os.listdir(SESSIONS_DIR):
@@ -389,7 +391,7 @@ def _live_session_ids() -> set[str]:
             continue
         session_id = data.get("sessionId")
         if session_id:
-            live_ids.add(session_id)
+            live_ids[session_id] = pid
     return live_ids
 
 
@@ -498,6 +500,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
             continue
         info["live"] = info["id"] in live_ids
+        info["pid"] = live_ids.get(info["id"])
         results.append(info)
 
     results.sort(key=lambda s: s["mtime"], reverse=True)

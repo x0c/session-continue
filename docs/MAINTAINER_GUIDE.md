@@ -100,6 +100,35 @@
   context/describe` 子命令分发写在 `main()` 顶部，早于旧版 `--json`/`--limit` 的 legacy parser；
   改 `main()` 时不要把两条路径的参数解析合并到同一个 `argparse.ArgumentParser`，legacy 路径的报错
   仍是给人看的文本，机器接口路径的报错必须是 JSON envelope，混用会破坏其中一边的调用方假设。
+- **`live`/`pid` 从扫描层到接口的传递**：`scan_claude._live_session_ids()`/`scan_codex._live_session_ids()`
+  返回 `{会话ID: pid}` 字典（不是纯 `set`），`scan_sessions` 里 `info["live"] = info["id"] in live_ids`
+  之后紧跟 `info["pid"] = live_ids.get(info["id"])`；两个运行时判活时手上本来就有 pid（Claude 是
+  `~/.claude/sessions/{pid}.json` 的文件名，Codex 是 `pgrep -x codex` 循环里的 pid），顺手带出，
+  不需要额外系统调用。`agent_api.session_payload` 直接透传这两个字段，不做二次判活。
+- **面向管家 Agent 的可见性 vs 只读边界**：为了让管家 Agent 能回答"现在哪个 CodingAgent 在跑"，
+  `list`/`search`/`context` 暴露了 `live`（进程真实存活）、`pid`（配合 `live` 使用）。这只是
+  **暴露可见性**，不是新增执行能力——`agent_api.py` 仍然是纯只读接口，不提供"向运行中进程发送
+  指令/接管会话"的命令；管家拿到 `pid` 之后想做什么是调用方自己的事，sc 不代劳，也不应该代劳
+  （只读边界详见文件头注释和 `AGENTS.md`）。
+- **`list`/`search` 默认带摘要**：`DEFAULT_LIST_FIELDS`/`DEFAULT_SEARCH_FIELDS` 默认含 `last_user`/
+  `last_agent`（`session_payload` 里用 `_trim()` 硬截断到 `_SUMMARY_TRIM_LEN`，约 120 字），让管家
+  一眼看懂"这条会话在聊什么"，不必为每条候选都多一次 `sc show` 往返。这两个字段本来就是扫描阶段
+  已经提取好的 `last_user_msg`/`last_agent_msg`（`search` 的 haystack 早就在用），只是之前没有
+  暴露给 Agent 接口；`pid` 因为多数场景是 `null`、只在 `live=true` 时有值，没有进 `--compact` 的
+  精简默认集，避免精简模式反而字段膨胀。
+
+## 会话管理与检索的 Agent 可用性设计取舍
+
+给管家 Agent（OpenConductor）设计 `sc` 的可用性时，明确讨论过并否决了两个方向，记录下来避免以后
+重复纠结：
+
+- **不做"下发指令给运行中会话"的执行命令**：管家想"指挥某个正在运行的 CodingAgent"，最直接的实现
+  是 sc 直接往目标进程注入输入或调用其 API。这会打破"`agent_api.py` 只读、无副作用"的硬架构约束，
+  让 sc 从数据接口变成执行器，责任边界和风险都会显著上升。最终选择只增可见性（`live`/`pid`），
+  接管逻辑留给管家自己基于这些数据去实现，sc 不跨这条线。
+- **检索不引入语义/向量搜索**：现有关键词子串匹配（标题权重最高，其次首尾消息、目录）已经够用，
+  上语义搜索要引入嵌入依赖、离线索引维护和额外算力/额度成本，与 sc"轻量、零依赖、离线可用"的
+  定位冲突，暂不做。
 
 ## 开源发布
 
