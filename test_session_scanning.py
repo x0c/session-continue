@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import curses
 import json
 import os
 import tempfile
@@ -1024,6 +1025,44 @@ class TuiLayoutTests(unittest.TestCase):
             result = sc._show_preview(screen, store, ui, session, "标题", False)
         self.assertEqual(result, sc.LaunchRequest(session, "claude", "标题"))
         screen.clear.assert_called_once_with()
+
+    def test_preview_mouse_scroll_delta_maps_wheel_direction(self) -> None:
+        with mock.patch.object(sc.curses, "getmouse", return_value=(0, 0, 0, 0, sc.curses.BUTTON4_PRESSED)):
+            self.assertEqual(sc._preview_mouse_scroll_delta(), -sc.PREVIEW_MOUSE_SCROLL_LINES)
+
+        with mock.patch.object(sc.curses, "getmouse", return_value=(0, 0, 0, 0, sc.curses.BUTTON5_PRESSED)):
+            self.assertEqual(sc._preview_mouse_scroll_delta(), sc.PREVIEW_MOUSE_SCROLL_LINES)
+
+        with mock.patch.object(sc.curses, "getmouse", return_value=(0, 0, 0, 0, 0)):
+            self.assertIsNone(sc._preview_mouse_scroll_delta())
+
+        with mock.patch.object(sc.curses, "getmouse", side_effect=sc.curses.error("no event")):
+            self.assertIsNone(sc._preview_mouse_scroll_delta())
+
+    def test_preview_scrolls_on_mouse_wheel_and_resets_mousemask_on_exit(self) -> None:
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        messages = [sc.ConversationMessage("user", "问题")]
+        store = mock.Mock()
+        store.get_conversation.return_value = messages
+        store.registry.get.return_value.display_name = "Claude"
+        session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
+        ui = sc.UIState(source="claude")
+
+        screen.getch.side_effect = [curses.KEY_MOUSE, ord("q")]
+        with (
+            mock.patch.object(sc, "_draw_preview", return_value=5) as draw,
+            mock.patch.object(sc.curses, "mousemask") as mousemask,
+            mock.patch.object(sc, "_preview_mouse_scroll_delta", return_value=sc.PREVIEW_MOUSE_SCROLL_LINES),
+        ):
+            sc._show_preview(screen, store, ui, session, "标题", False)
+
+        # 进入时开启鼠标上报、退出时必须关闭（含正常退出路径），否则终端原生的鼠标选中会失效。
+        mousemask.assert_any_call(curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+        mousemask.assert_called_with(0)
+        # 第二次绘制应该带着鼠标滚轮增量后的滚动位置。
+        second_call_scroll = draw.call_args_list[1].args[-1]
+        self.assertEqual(second_call_scroll, 5 + sc.PREVIEW_MOUSE_SCROLL_LINES)
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
         col_num, col_title, col_dir, col_time, col_size, col_status = sc._column_widths(120)

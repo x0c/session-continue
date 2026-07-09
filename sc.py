@@ -781,6 +781,22 @@ def _draw_preview(
     return scroll
 
 
+PREVIEW_MOUSE_SCROLL_LINES = 3  # 滚轮一格滚动的行数，参照 less/vim 等终端工具的常见默认值
+
+
+def _preview_mouse_scroll_delta() -> int | None:
+    """读取一次鼠标事件，返回滚轮方向对应的滚动行数增量；不是滚轮事件或读取失败时返回 None。"""
+    try:
+        _, _, _, _, bstate = curses.getmouse()
+    except curses.error:
+        return None
+    if bstate & curses.BUTTON4_PRESSED:
+        return -PREVIEW_MOUSE_SCROLL_LINES
+    if bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+        return PREVIEW_MOUSE_SCROLL_LINES
+    return None
+
+
 def _show_preview(
     stdscr,
     store: SessionStore,
@@ -789,42 +805,60 @@ def _show_preview(
     title: str,
     sidebar_visible: bool,
 ) -> LaunchRequest | NewSessionRequest | None:
-    """打开全屏聊天记录；回车原生恢复，空格或 q 关闭，`a`/`n` 等会话级快捷键与列表页一致。"""
+    """打开全屏聊天记录；回车原生恢复，空格或 q 关闭，`a`/`n` 等会话级快捷键与列表页一致。
+
+    进入预览页时临时开启鼠标滚轮上报，退出（含提前 return）时必须关闭——常驻开启会
+    让终端原生的鼠标选中/复制在主列表页也失效，所以只在预览页这个作用域内生效。
+    """
     messages = store.get_conversation(session)
     runtime_name = store.registry.get(str(session.get("source") or "")).display_name
     short_id = str(session.get("short_id") or "")
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
-    while True:
-        scroll = _draw_preview(stdscr, messages, title, runtime_name, short_id, scroll)
-        try:
-            ch = stdscr.getch()
-        except curses.error:
-            continue
-        if ch == -1:
-            continue
-        if ch in (ord(" "), ord("q")):
-            stdscr.clear()
-            return None
-        if ch in (10, 13, curses.KEY_ENTER):
-            stdscr.clear()
-            return LaunchRequest(session, ui.source, title)
-        if ch in (curses.KEY_UP, ord("k")):
-            scroll = max(0, scroll - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            scroll += 1
-        elif ch == curses.KEY_PPAGE:
-            scroll = max(0, scroll - 10)
-        elif ch == curses.KEY_NPAGE:
-            scroll += 10
-        elif ch == curses.KEY_HOME:
-            scroll = 0
-        elif ch == curses.KEY_END:
-            scroll = 10 ** 9
-        else:
-            result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
-            if result is not _ACTION_STAY and result is not _ACTION_PASS:
+    try:
+        curses.mousemask(curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+    except curses.error:
+        pass  # 终端或 curses 编译版本不支持鼠标上报时静默降级为纯键盘操作
+    try:
+        while True:
+            scroll = _draw_preview(stdscr, messages, title, runtime_name, short_id, scroll)
+            try:
+                ch = stdscr.getch()
+            except curses.error:
+                continue
+            if ch == -1:
+                continue
+            if ch in (ord(" "), ord("q")):
                 stdscr.clear()
-                return result
+                return None
+            if ch in (10, 13, curses.KEY_ENTER):
+                stdscr.clear()
+                return LaunchRequest(session, ui.source, title)
+            if ch in (curses.KEY_UP, ord("k")):
+                scroll = max(0, scroll - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                scroll += 1
+            elif ch == curses.KEY_PPAGE:
+                scroll = max(0, scroll - 10)
+            elif ch == curses.KEY_NPAGE:
+                scroll += 10
+            elif ch == curses.KEY_HOME:
+                scroll = 0
+            elif ch == curses.KEY_END:
+                scroll = 10 ** 9
+            elif ch == curses.KEY_MOUSE:
+                delta = _preview_mouse_scroll_delta()
+                if delta is not None:
+                    scroll = max(0, scroll + delta)
+            else:
+                result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
+                if result is not _ACTION_STAY and result is not _ACTION_PASS:
+                    stdscr.clear()
+                    return result
+    finally:
+        try:
+            curses.mousemask(0)
+        except curses.error:
+            pass
 
 
 def _draw_runtime_menu(stdscr, store: SessionStore, title: str, action_for, selected: int) -> None:
