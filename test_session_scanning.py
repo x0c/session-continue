@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -52,7 +53,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
             "@openconductor 页面输入框要支持文件上传和选择图片",
         )
 
-    def test_title_uses_last_prompt_and_time_uses_file_mtime(self) -> None:
+    def test_title_uses_last_prompt_and_time_falls_back_to_event_time_when_mtime_stale(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "abc.jsonl"
             rows = [
@@ -79,17 +80,20 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
                 ]
             )
             _write_jsonl(path, rows)
+            # 文件 mtime 远远新于会话内最后一条真实事件（如驻留会话被重新打开后
+            # 追加了 last-prompt/ai-title 等无时间戳元数据），应判定 mtime 不可信。
             os.utime(path, (1893456000, 1893456000))
 
             info = scan_claude._build_session_info(str(path), "demo")
 
             self.assertEqual(info["native_title"], "分析代码索引更新机制")
             self.assertEqual(info["fallback_title"], "最后一次问题")
-            self.assertEqual(info["display_time"], "01-01 08:00")
-            self.assertEqual(info["mtime"], info["file_mtime"])
-            self.assertEqual(scan_claude._format_display_time(info["event_time"]), "06-22 16:41")
+            self.assertEqual(info["display_time"], "06-22 16:41")
+            self.assertEqual(info["mtime"], info["event_time"])
+            self.assertEqual(info["time_source"], "event_time_stale_mtime")
+            self.assertEqual(scan_claude._format_display_time(info["file_mtime"]), "01-01 08:00")
 
-    def test_scan_sessions_sorts_by_file_mtime_not_event_time(self) -> None:
+    def test_scan_sessions_sorts_by_effective_time(self) -> None:
         old_projects_dir = scan_claude.PROJECTS_DIR
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -121,6 +125,13 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
                         }
                     ],
                 )
+                # old.jsonl 的 mtime 被顶到远未来（模拟被重新打开导致的假新），
+                # 应回退到其真实事件时间 2026-06-01；new.jsonl 的 mtime 落在
+                # 2000 年、比自己的事件时间 2026-06-25 还旧，不满足"mtime 比
+                # 事件时间新"的回退条件，保持 file_mtime 不变。修正后 old.jsonl
+                # 的有效时间（2026-06-01）仍晚于 new.jsonl 的有效时间（2000），
+                # 排序结果与改动前巧合一致，但含义已从"纯按文件 mtime 排序"
+                # 变为"按修正后的有效时间排序"。
                 os.utime(old_path, (1893456000, 1893456000))
                 os.utime(new_path, (946684800, 946684800))
 
@@ -130,7 +141,16 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         finally:
             scan_claude.PROJECTS_DIR = old_projects_dir
 
-    def test_scan_sessions_ignores_bulk_touched_file_mtime(self) -> None:
+    def test_scan_sessions_falls_back_to_event_time_for_bulk_touched_sessions(self) -> None:
+        """Syncthing/复制等批量元数据刷新会让一批历史会话同一时刻被 touch；
+
+        每个会话各自的 mtime 都远新于自己内部最后一条真实事件，单会话 gap
+        规则应逐个回退到 event_time，不需要额外的"同分钟桶聚簇"判污染。
+        """
+
+        def _iso(ts: float) -> str:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
         old_projects_dir = scan_claude.PROJECTS_DIR
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -147,7 +167,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
                             {
                                 "type": "user",
                                 "message": {"content": f"批量旧会话 {i}"},
-                                "timestamp": "2026-06-20T00:00:00.000Z",
+                                "timestamp": _iso(bulk_mtime - 10 * 86400),
                                 "cwd": str(cwd),
                             }
                         ],
@@ -160,18 +180,61 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
                         {
                             "type": "user",
                             "message": {"content": "真实新会话"},
-                            "timestamp": "2026-06-25T00:00:00.000Z",
+                            "timestamp": _iso(bulk_mtime - 60),
                             "cwd": str(cwd),
                         }
                     ],
                 )
-                os.utime(real_path, (bulk_mtime - 300, bulk_mtime - 300))
+                os.utime(real_path, (bulk_mtime - 60, bulk_mtime - 60))
 
                 sessions = scan_claude.scan_sessions(limit=7)
 
                 self.assertEqual(sessions[0]["fallback_title"], "真实新会话")
                 self.assertEqual(sessions[0]["time_source"], "file_mtime")
-                self.assertTrue(all(s["time_source"] == "event_time_bulk_mtime" for s in sessions[1:]))
+                self.assertTrue(all(s["time_source"] == "event_time_stale_mtime" for s in sessions[1:]))
+        finally:
+            scan_claude.PROJECTS_DIR = old_projects_dir
+
+    def test_scan_sessions_recovers_true_time_for_stale_resumed_session(self) -> None:
+        """复现真实故障：会话内容 9 天前就结束，但驻留进程重新打开它时追加了
+
+        没有时间戳的 last-prompt/ai-title/mode/permission-mode 元数据，把
+        文件 mtime 顶到"现在"。列表时间列必须显示真实的 9 天前，而不是"刚刚"。
+        """
+        old_projects_dir = scan_claude.PROJECTS_DIR
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                scan_claude.PROJECTS_DIR = td
+                project = Path(td) / "proj"
+                cwd = Path(td) / "demo"
+                cwd.mkdir()
+                now = time.time()
+                stale_event = now - 9 * 86400
+                path = project / "resumed.jsonl"
+                _write_jsonl(
+                    path,
+                    [
+                        {
+                            "type": "user",
+                            "message": {"content": "9天前的真实问题"},
+                            "timestamp": datetime.fromtimestamp(stale_event, tz=timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%S.000Z"
+                            ),
+                            "cwd": str(cwd),
+                        },
+                        {"type": "last-prompt", "lastPrompt": "9天前的真实问题"},
+                        {"type": "ai-title", "aiTitle": "旧任务"},
+                        {"type": "mode", "mode": "normal"},
+                        {"type": "permission-mode", "mode": "default"},
+                    ],
+                )
+                os.utime(path, (now, now))  # 驻留会话被重新打开，文件 mtime 顶到现在
+
+                sessions = scan_claude.scan_sessions(limit=1)
+
+                self.assertEqual(len(sessions), 1)
+                self.assertEqual(sessions[0]["time_source"], "event_time_stale_mtime")
+                self.assertAlmostEqual(sessions[0]["mtime"], stale_event, delta=2)
         finally:
             scan_claude.PROJECTS_DIR = old_projects_dir
 
@@ -628,6 +691,41 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
             self.assertEqual(info["first_user_msg"], "修复会话展示")
 
+    def test_recovers_true_time_when_stale_session_file_gets_touched(self) -> None:
+        """复现真实故障的 Codex 版本：会话内容 9 天前结束，文件之后被 touch
+
+        （如同步、复制）把 mtime 顶到"现在"；时间列必须回退到真实事件时间。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            uuid = "019efe42-6d51-7fb3-ad48-112a8eefa02c"
+            now = time.time()
+            stale_event = now - 9 * 86400
+            stale_dt = datetime.fromtimestamp(stale_event, tz=timezone.utc)
+            path = Path(td) / f"rollout-{stale_dt.strftime('%Y-%m-%dT%H-%M-%S')}-{uuid}.jsonl"
+            iso = stale_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            _write_jsonl(
+                path,
+                [
+                    {
+                        "timestamp": iso,
+                        "type": "session_meta",
+                        "payload": {"id": uuid, "timestamp": iso, "cwd": "/tmp/demo"},
+                    },
+                    {
+                        "timestamp": iso,
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "9天前的真实问题"},
+                    },
+                ],
+            )
+            os.utime(path, (now, now))
+
+            info = scan_codex._build_session_info(str(path), {})
+
+            self.assertIsNotNone(info)
+            self.assertEqual(info["time_source"], "event_time_stale_mtime")
+            self.assertAlmostEqual(info["mtime"], stale_event, delta=2)
+
     def test_scan_sessions_memoizes_cwd_isdir_check(self) -> None:
         # 首屏 ≤1s 回归防退化：多个会话共享同一个 cwd 时，os.path.isdir 只应
         # 被真正调用一次（记忆化），不随会话条数线性增长。
@@ -933,6 +1031,119 @@ class TuiLayoutTests(unittest.TestCase):
             sum((col_num, col_title, col_dir, col_time, col_size, col_status)) + len(sc.COL_GAP) * 5,
             119,
         )
+
+
+class ProjectSidebarTests(unittest.TestCase):
+    def test_normalize_cwd_trailing_slash_and_empty(self) -> None:
+        self.assertEqual(sc._normalize_cwd("/a/b/"), "/a/b")
+        self.assertEqual(sc._normalize_cwd(""), "")
+        self.assertEqual(sc._normalize_cwd(None), "")
+        self.assertEqual(sc._normalize_cwd("/"), "")
+
+    def test_project_groups_sorted_by_count_then_latest_mtime(self) -> None:
+        sessions_by_source = {
+            "claude": [
+                {"cwd": "/a/x", "mtime": 10},
+                {"cwd": "/a/x", "mtime": 5},
+                {"cwd": "/a/y", "mtime": 20},
+                {"cwd": "/a/z", "mtime": 1},
+            ],
+        }
+        groups = sc._project_groups(sessions_by_source)
+        keys = [g["cwd_key"] for g in groups]
+
+        # 会话数最多的项目排第一；会话数相同的项目按最近会话时间倒序。
+        self.assertEqual(keys, ["/a/x", "/a/y", "/a/z"])
+        self.assertEqual(groups[0]["count"], 2)
+        self.assertEqual(groups[0]["latest_mtime"], 10)
+
+    def test_project_groups_merges_all_sources(self) -> None:
+        sessions_by_source = {
+            "claude": [{"cwd": "/a/x", "mtime": 1}],
+            "codex": [{"cwd": "/a/x", "mtime": 2}],
+        }
+        groups = sc._project_groups(sessions_by_source)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["count"], 2)
+        self.assertEqual(groups[0]["latest_mtime"], 2)
+
+    def test_project_groups_labels_empty_and_root_cwd_as_unknown(self) -> None:
+        sessions_by_source = {"claude": [{"cwd": "", "mtime": 1}, {"cwd": "/", "mtime": 2}]}
+        groups = sc._project_groups(sessions_by_source)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["cwd_key"], "")
+        self.assertEqual(groups[0]["label"], sc.UNKNOWN_PROJECT_LABEL)
+        self.assertEqual(groups[0]["count"], 2)
+
+    def test_disambiguate_adds_parent_only_on_conflict(self) -> None:
+        labels = sc._disambiguate_labels(["/a/x/cli", "/b/y/app"])
+        self.assertEqual(labels["/a/x/cli"], "cli")
+        self.assertEqual(labels["/b/y/app"], "app")
+
+    def test_disambiguate_climbs_multiple_levels(self) -> None:
+        # 两个同名 cli 目录连上一级目录名也相同，需要继续向上爬升才能唯一区分。
+        labels = sc._disambiguate_labels(["/a/p/cli", "/b/p/cli"])
+        self.assertEqual(labels["/a/p/cli"], "a/p/cli")
+        self.assertEqual(labels["/b/p/cli"], "b/p/cli")
+        self.assertNotEqual(labels["/a/p/cli"], labels["/b/p/cli"])
+
+    def test_filter_sessions_uses_exact_cwd_not_basename(self) -> None:
+        sessions = [
+            {"cwd": "/a/x/cli", "mtime": 1},
+            {"cwd": "/b/y/cli", "mtime": 2},
+        ]
+        filtered = sc._filter_sessions(sessions, "/a/x/cli")
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["cwd"], "/a/x/cli")
+
+    def test_filter_sessions_none_key_returns_unfiltered(self) -> None:
+        sessions = [{"cwd": "/a/x", "mtime": 1}]
+        self.assertEqual(sc._filter_sessions(sessions, None), sessions)
+
+    def test_sidebar_width_hidden_below_threshold(self) -> None:
+        projects = [{"label": "cli", "count": 5}]
+        self.assertEqual(sc._sidebar_width(projects, sc.SIDEBAR_HIDE_THRESHOLD - 1), 0)
+        self.assertGreater(sc._sidebar_width(projects, sc.SIDEBAR_HIDE_THRESHOLD), 0)
+
+    def test_sidebar_width_adapts_and_clamps(self) -> None:
+        narrow_projects = [{"label": "cli", "count": 3}]
+        width = sc._sidebar_width(narrow_projects, 200)
+        self.assertGreaterEqual(width, sc.SIDEBAR_MIN_WIDTH)
+        self.assertLessEqual(width, sc.SIDEBAR_MAX_WIDTH)
+
+        # 超长（含中文全角）项目名不应把侧边栏撑破上限。
+        long_label_projects = [{"label": "一个非常非常长的中文项目名字用来测试截断上限", "count": 999}]
+        self.assertEqual(sc._sidebar_width(long_label_projects, 200), sc.SIDEBAR_MAX_WIDTH)
+
+    def test_truncate_left_keeps_tail_display_width(self) -> None:
+        text = "SessionContinue/cli"
+        truncated = sc._truncate_left(text, 10)
+
+        self.assertLessEqual(sc._text_width(truncated), 10)
+        self.assertTrue(truncated.endswith("cli"))
+        self.assertTrue(truncated.startswith("…"))
+        self.assertEqual(sc._truncate_left("cli", 10), "cli")  # 不超宽时原样返回
+
+    def test_visible_sessions_filters_by_selected_project(self) -> None:
+        sessions = [{"cwd": "/a/x"}, {"cwd": "/a/y"}]
+        store = mock.Mock()
+        store.sessions = {"claude": sessions}
+        store.projects.return_value = [
+            {"cwd_key": "/a/x", "label": "x", "count": 1, "latest_mtime": 1},
+            {"cwd_key": "/a/y", "label": "y", "count": 1, "latest_mtime": 1},
+        ]
+
+        filtered = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=1), sidebar_visible=True)
+        self.assertEqual(filtered, [sessions[0]])
+
+        unfiltered = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=0), sidebar_visible=True)
+        self.assertEqual(unfiltered, sessions)
+
+        hidden = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=1), sidebar_visible=False)
+        self.assertEqual(hidden, sessions)
 
 
 class AgentApiTests(unittest.TestCase):

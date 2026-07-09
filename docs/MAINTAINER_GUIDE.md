@@ -3,7 +3,7 @@
 ## 标题与排序
 
 - 最近会话排序优先使用历史文件更新时间。用户对“最近”的直觉是最近被续接或写入，而不是文件内部最后一条可解析消息。
-- 文件时间不是绝对可信。Syncthing、复制或批量元数据刷新可能让一批历史 Claude 会话拥有同一个时间；扫描侧要识别批量刷新簇，并在明显污染时回退到会话内部最后事件时间。
+- 文件时间不是绝对可信，且污染粒度可以细到单个文件，不一定成批出现：Claude Code 在会话驻留/被重新打开时会追加没有时间戳的元数据条目（`last-prompt`、`ai-title`、`mode`、`permission-mode`），把文件 mtime 顶到“现在”而不产生任何新对话内容；Syncthing、复制、批量元数据刷新是同一类问题的批量版本。修正逻辑统一收在 `models.py` 的 `effective_session_time(file_mtime, event_time)`：当 mtime 比会话内部最后一条真实事件新出 1 小时以上的 gap，就判定 mtime 不可信，逐会话回退到 event_time；两个扫描器的 `_build_session_info` 都在返回结果前调用它写回 `mtime`/`display_time`/`time_source`。曾经按“同一分钟桶 ≥5 个会话”识别批量污染簇的启发式已废弃——它只覆盖批量场景，漏过了本节描述的单文件被驻留进程 touch 的情形（真实故障：两个会话被 touch 到不同分钟，各自没能凑够聚簇阈值，在列表里显示成"20分钟前"，实际是 9-11 天前的会话）。
 - Claude Code 自带 `aiTitle` 不稳定，只能作为临时兜底的最后来源，不能绕过生成缓存直接展示。
 - 无缓存时必须先生成本地短标题，再交给后台模型优化。首屏不能依赖 `claude -p` 是否及时返回。
 - 后台标题生成可能留下新的 Claude 会话记录；扫描侧必须过滤自产标题 prompt 和只有低价值消息的记录，避免历史污染反过来进入列表。
@@ -26,8 +26,7 @@
 ## 扫描性能
 
 - **硬性指标：`sc` 首屏（进程启动到 TUI 首次渲染）延迟必须 ≤1s。** `main()` 里 `store.load()`（→ `registry.scan_all()`）是同步阻塞首屏的调用，扫描没跑完屏幕就是空的；这个指标和验证方式记在 `AGENTS.md`「验证要求」，`test_session_scanning.py` 的 `StartupLatencyTests` 是配套的回归闸门。
-- `scan_claude.py`/`scan_codex.py` 的 `scan_sessions()` 接受 `limit`，但早期实现会先对全部历史会话文件做完整的头尾 JSONL 解析，再 `results[:limit]` 截断——不管 `limit` 多小都要扫完全部历史（本机曾实测 796+1074 个文件耗时 ~5s，是 `sc` 启动慢的根因）。现在改为先用 `os.stat` 按真实文件 mtime 把候选文件排好序，只解析凑够 `limit` 条有效结果所需的那部分；新增或改写这两个扫描函数时不要退回“先建全量列表再截断”的写法。
-- Claude 侧的提前停止是按“文件 mtime 分钟桶”粒度的，不是攒够 `limit` 条立刻停：一旦达到 `limit`，要把当前跨越的那个分钟桶处理完再停，否则会让「标题与排序」一节说的批量 touch 污染检测看到不完整的簇，判断失真。
+- `scan_claude.py`/`scan_codex.py` 的 `scan_sessions()` 接受 `limit`，但早期实现会先对全部历史会话文件做完整的头尾 JSONL 解析，再 `results[:limit]` 截断——不管 `limit` 多小都要扫完全部历史（本机曾实测 796+1074 个文件耗时 ~5s，是 `sc` 启动慢的根因）。现在改为先用 `os.stat` 按真实文件 mtime 把候选文件排好序，凑够 `limit` 条有效结果就停止；新增或改写这两个扫描函数时不要退回“先建全量列表再截断”的写法。因为时间修正已经收敛成单会话 `effective_session_time` 判断（见「标题与排序」），提前停止不再需要按分钟桶粒度对齐。
 - Codex 侧提前停止前必须先按真实文件 mtime（`os.path.getmtime`）重新排序，不能直接用 `_find_all_session_files` 现成的按文件名（创建时间）排序去做提前停止——同一会话被续接时 mtime 会变但文件名不变，按创建时间提前停会漏掉“很久以前创建、但刚被续接”的会话。
 - `runtime/registry.py` 的 `scan_all()` 用 `ThreadPoolExecutor` 并发跑各运行时的扫描：各运行时读的是完全独立的目录、无共享状态，线程池只是为了重叠磁盘 I/O 等待。新增运行时时这个并发逻辑不用改，注册进去即可自动享受。
 - **cwd 判活必须按 cwd 记忆化，不能逐会话裸调 `os.path.isdir`。** 排查过一次首屏 >1.3s 的问题：`scan_sessions` 循环里对每条候选会话的 `cwd` 都单独调用 `os.path.isdir` 判断目录是否还在（用于过滤已删除工作目录、无法 resume 的会话），但实测本机一次扫描里几百条候选会话经常只对应十几个不同的 cwd（同一项目下反复续接）；这些 cwd 常年落在 Syncthing/网络同步目录上，单次 `isdir` 实测 ~5-10ms，去重前光这一项就吃掉 profile 里 0.6s+ 的裸开销。修法是在 `scan_sessions` 内建一个按 cwd 缓存结果的 `isdir` 闭包（单次扫描内 cwd 存在性稳定，用完即弃），两个扫描函数都要保留这个闭包，不要退回裸调用。
@@ -46,6 +45,15 @@
 - Codex 没有 pid 注册表，判活改用 `lsof`：活着的 `codex` 进程会以写模式持有自己的 rollout JSONL（实测 `lsof -p <pid>` 能看到形如 `codex … 45w … rollout-…-<uuid>.jsonl` 的记录），`scan_codex._live_session_ids` 用 `pgrep -x codex` 拿 pid 后逐个 `lsof -p` 解析文件名里的 UUID。`pgrep`/`lsof` 缺失或调用失败一律静默返回空集，退化为全部显示「已结束」，不抛异常、不阻塞扫描。
 - 聊天记录预览必须按需读取，不加入启动扫描；只展示真实用户消息和每轮最终答复，过滤工具调用、工具结果、思考过程、进度播报和内部提醒。
 - **弱化文字（分隔线/次要列/帮助文字）禁止用 `curses.COLOR_WHITE` 强制写死前景色，也不能只靠 `curses.A_DIM` 保证可读性。** 排查过一次用户在白色背景终端下反馈「弱化文字几乎看不清」的问题：老实现把 `PAIR_DIM`/`PAIR_TAB_INACTIVE` 的前景色写死成 `COLOR_WHITE` 再叠加 `A_DIM`，在深色终端上没问题，但在浅色/白色背景终端上等于「白底写白字再调暗」，对比度几乎为零。修法是在 `sc.py` 的 `_init_colors` 里判断 `curses.COLORS >= 256`：够 256 色时改用真正的中灰（256 色调色板第 244 号），不再叠加任何暗淡属性（灰色本身对比度已经够、再叠加会过淡）；退化到 8/16 色终端时才回退到「终端默认前景色（`use_default_colors()` 成功时的 `-1`）+ `A_DIM`」，靠终端自身配色跟随浅色/深色主题，而不是硬编码某个具体颜色。模块级 `DIM_EXTRA_ATTR` 由 `_init_colors` 按上述判断结果覆盖，所有需要弱化的文字必须用 `curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR` 这个组合，不要在别处再手写字面量 `curses.A_DIM`。新增弱化用途的颜色对时按同样思路处理，不要复用裸 `COLOR_WHITE`。
+
+### 项目侧边栏
+
+- 侧边栏展示的「项目」= 所有来源（Claude + Codex）会话 `cwd` 归一化后的完整路径分组统计，`sc._project_groups` 按会话数倒序、同数按最近会话时间倒序排序；显示名只取末级目录名，同名末级目录冲突时由 `sc._disambiguate_labels` 逐级向上补父级路径直到唯一（VS Code 标签页风格）。**过滤永远按完整归一化 cwd 精确匹配（`sc._filter_sessions`），绝不按末级目录名字符串比较**——否则去歧义拆开的两个同名目录会互相污染彼此的会话列表。
+- 宽度阈值：终端总宽 `< SIDEBAR_HIDE_THRESHOLD`（96 列）时 `sc._sidebar_width` 返回 0，整个侧边栏不绘制，界面完全退化为改动前的单栏布局；否则按最长项目名自适应，夹在 `SIDEBAR_MIN_WIDTH`(14) ~ `SIDEBAR_MAX_WIDTH`(26) 之间。宽度计算必须走 `_text_width`（中文全角占 2 列），不能用字符数。
+- 焦点通过 `UIState.focus`（`"sidebar"` | `"list"`）驱动，横向序列固定是「侧边栏 → 来源1 → 来源2 → …」：`←` 在第一个来源上再按才会进侧边栏，`→` 从侧边栏出来固定回到第一个来源；侧边栏可见时左右端点**停住不回绕**（`Tab` 仍可循环切来源，不受影响）。焦点视觉规则：反白光标条只出现在真正持有焦点的窗格，另一侧的当前项降级为 `PAIR_TAB_ACTIVE|A_BOLD`（青字不反白），不要两边同时反白。
+- 侧边栏内 `↑/↓` 是「移动即筛选」——不需要回车确认；`SessionStore.projects()` 是惰性缓存，唯一失效点在 `load()`，标题后台轮询（`poll_cache_updates`）不改变会话集，不会也不应该触发重算，否则违反首屏/每帧零 IO 的性能红线。
+- 会话列表侧的所有取数入口统一收敛到 `sc._visible_sessions(store, ui, sidebar_visible)`，新增依赖当前列表内容的逻辑（预览、恢复、高级操作）应该消费它的返回值，不要绕过它直接读 `store.sessions[source]`，否则会漏过滤。
+- 终端 resize 导致侧边栏被隐藏时，`ui.focus` 强制回 `"list"` 但 `ui.proj_idx` 保留、只是过滤旁路（`sidebar_visible=False` 时 `_visible_sessions` 直接返回未过滤列表）；拉宽后自动恢复原过滤状态，不需要用户重新选择项目。
 
 ## 运行时边界
 

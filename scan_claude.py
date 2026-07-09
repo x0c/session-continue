@@ -17,7 +17,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
-from models import ConversationMessage
+from models import ConversationMessage, effective_session_time
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects/")
 
@@ -77,46 +77,6 @@ def _entry_time(entry: dict) -> float | None:
 
 def _format_display_time(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
-
-
-def _apply_effective_times(sessions: list[dict]) -> None:
-    """修正批量 touch / 同步污染的 mtime。
-
-    正常情况下文件 mtime 最符合“最近被续接/写入”的直觉；但 Syncthing、复制或
-    批量元数据刷新会让一批历史会话落在同一分钟。检测到这种簇时，回退到会话
-    内部最后事件时间，避免列表前排全是同一个虚假的时间。
-    """
-    buckets: dict[int, list[dict]] = {}
-    for session in sessions:
-        buckets.setdefault(int(session["file_mtime"] // 60), []).append(session)
-
-    polluted_buckets: set[int] = set()
-    for bucket, bucket_sessions in buckets.items():
-        if len(bucket_sessions) < 5:
-            continue
-        near_ctime_count = sum(
-            1
-            for session in bucket_sessions
-            if abs(session.get("file_ctime", session["file_mtime"]) - session["file_mtime"]) <= 120
-        )
-        if near_ctime_count >= max(5, len(bucket_sessions) * 2 // 3):
-            polluted_buckets.add(bucket)
-
-    for session in sessions:
-        bucket = int(session["file_mtime"] // 60)
-        event_time = session.get("event_time")
-        effective_time = session["file_mtime"]
-        time_source = "file_mtime"
-        if (
-            bucket in polluted_buckets
-            and event_time is not None
-            and abs(session["file_mtime"] - event_time) > 3600
-        ):
-            effective_time = event_time
-            time_source = "event_time_bulk_mtime"
-        session["mtime"] = effective_time
-        session["display_time"] = _format_display_time(effective_time)
-        session["time_source"] = time_source
 
 
 def _read_head(path: str, max_lines: int = 300) -> list[dict]:
@@ -362,7 +322,7 @@ def _build_session_info(fpath: str, proj: str) -> dict:
         entry_time = _entry_time(e)
         if entry_time is not None and (event_time is None or entry_time > event_time):
             event_time = entry_time
-    session_time = stat.st_mtime
+    session_time, time_source = effective_session_time(stat.st_mtime, event_time)
     fallback = _choose_claude_fallback_title(title_candidates)
 
     if last_was_user == "aborted":
@@ -382,9 +342,9 @@ def _build_session_info(fpath: str, proj: str) -> dict:
         "cwd_display": _shorten_cwd(cwd or ""),
         "mtime": session_time,
         "display_time": _format_display_time(session_time),
+        "time_source": time_source,
         "event_time": event_time,
         "file_mtime": stat.st_mtime,
-        "file_ctime": stat.st_ctime,
         "size_bytes": stat.st_size,
         "size_kb": round(stat.st_size / 1024, 1),
         "native_title": ai_title,
@@ -474,10 +434,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
 
     历史会话可能有成百上千个，但调用方只要最近 limit 条。真正耗时的
     _build_session_info 会读取整个文件头尾并解析 JSONL，所以先用一次廉价的
-    os.stat 按文件 mtime 排好序，只对最可能入选的候选文件做完整解析；凑够
-    limit 条后，再看看当前 mtime 分钟桶是否已经跨完——跨完才停，避免批量
-    touch 造成的同分钟桶被从中间截断，影响 _apply_effective_times 的判污染
-    准确性。
+    os.stat 按文件 mtime 排好序，只对最可能入选的候选文件做完整解析，凑够
+    limit 条有效结果就停止。
 
     首屏必须 ≤1s（见 AGENTS.md 验证要求），这里做两项针对性优化，改动前后
     结果字节级一致（已用真实会话数据核验 id 顺序、兜底标题、原生标题）：
@@ -517,10 +475,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         return cached
 
     results: list[dict] = []
-    stop_after_bucket: int | None = None
     for mtime, fpath, proj in candidates:
-        bucket = int(mtime // 60)
-        if stop_after_bucket is not None and bucket != stop_after_bucket:
+        if len(results) >= limit:
             break
 
         peek_cwd, peek_first_user = _peek_head_meta(fpath)
@@ -543,10 +499,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue
         info["live"] = info["id"] in live_ids
         results.append(info)
-        if len(results) >= limit and stop_after_bucket is None:
-            stop_after_bucket = bucket
 
-    _apply_effective_times(results)
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results[:limit]
 

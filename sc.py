@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -237,6 +238,119 @@ def _column_widths(screen_width: int) -> tuple[int, int, int, int, int, int]:
     return col_num, col_title, col_dir, col_time, col_size, col_status
 
 
+# 侧边栏宽度上下限与隐藏阈值：终端总宽低于阈值时完全不画侧边栏，界面退化为单栏。
+SIDEBAR_MIN_WIDTH = 14
+SIDEBAR_MAX_WIDTH = 26
+SIDEBAR_HIDE_THRESHOLD = 96
+
+UNKNOWN_PROJECT_LABEL = "(未知目录)"
+
+
+def _normalize_cwd(cwd: object) -> str:
+    """把工作目录归一化为分组/过滤用的唯一键；空值或根目录归一为空字符串。"""
+    text = str(cwd or "").strip()
+    if not text:
+        return ""
+    normalized = os.path.normpath(text)
+    if normalized in (".", "/"):
+        return ""
+    return normalized
+
+
+def _disambiguate_labels(cwd_keys: list[str]) -> dict[str, str]:
+    """同名末级目录逐级向上补父级路径，直到唯一（VS Code 标签页风格）。"""
+    parts = {key: [p for p in key.split("/") if p] for key in cwd_keys}
+    depth = {key: 1 for key in cwd_keys}
+    labels: dict[str, str] = {}
+
+    while True:
+        labels = {}
+        for key in cwd_keys:
+            segments = parts[key]
+            d = min(depth[key], len(segments)) if segments else 0
+            labels[key] = "/".join(segments[-d:]) if d else key
+
+        groups: dict[str, list[str]] = {}
+        for key, label in labels.items():
+            groups.setdefault(label, []).append(key)
+
+        changed = False
+        for members in groups.values():
+            if len(members) <= 1:
+                continue
+            for key in members:
+                if depth[key] < len(parts[key]):
+                    depth[key] += 1
+                    changed = True
+        if not changed:
+            return labels
+
+
+def _truncate_left(text: str, width: int) -> str:
+    """显示宽度超限时从左侧截断，保留尾部信息（"…上级目录/名字"）。"""
+    if width <= 0:
+        return ""
+    if _text_width(text) <= width:
+        return text
+    avail = width - 1  # 留 1 列给省略号
+    kept: list[str] = []
+    used = 0
+    for ch in reversed(text):
+        ch_width = _char_width(ch)
+        if used + ch_width > avail:
+            break
+        kept.append(ch)
+        used += ch_width
+    return "…" + "".join(reversed(kept))
+
+
+def _project_groups(sessions_by_source: dict[str, list[dict]]) -> list[dict]:
+    """合并所有来源的会话，按工作目录分组统计，用于侧边栏展示。
+
+    每项：{"cwd_key": 完整归一化路径（过滤用，"" 表示未知目录）,
+           "label": 去歧义后的显示名, "count": 会话数, "latest_mtime": 最近会话时间}。
+    排序：会话数倒序 → 最近会话时间倒序 → 显示名字典序（稳定兜底）。
+    """
+    groups: dict[str, dict] = {}
+    for bucket in sessions_by_source.values():
+        for session in bucket:
+            key = _normalize_cwd(session.get("cwd"))
+            entry = groups.setdefault(key, {"cwd_key": key, "count": 0, "latest_mtime": 0.0})
+            entry["count"] += 1
+            mtime = session.get("mtime") or 0
+            if mtime > entry["latest_mtime"]:
+                entry["latest_mtime"] = mtime
+
+    named_keys = [key for key in groups if key]
+    labels = _disambiguate_labels(named_keys)
+    for key in named_keys:
+        groups[key]["label"] = labels[key]
+    if "" in groups:
+        groups[""]["label"] = UNKNOWN_PROJECT_LABEL
+
+    return sorted(groups.values(), key=lambda p: (-p["count"], -p["latest_mtime"], p["label"]))
+
+
+def _filter_sessions(sessions: list[dict], cwd_key: str | None) -> list[dict]:
+    """按归一化工作目录精确匹配过滤；cwd_key 为 None 时原样返回（不过滤）。"""
+    if cwd_key is None:
+        return sessions
+    return [s for s in sessions if _normalize_cwd(s.get("cwd")) == cwd_key]
+
+
+def _sidebar_width(projects: list[dict], screen_width: int) -> int:
+    """返回侧边栏内容宽度（不含竖直分隔线）；0 表示隐藏。"""
+    if screen_width < SIDEBAR_HIDE_THRESHOLD:
+        return 0
+    total_count = sum(p["count"] for p in projects)
+    max_count = max([p["count"] for p in projects] + [total_count, 0])
+    count_width = max(2, len(str(max_count)))
+    labels = [p["label"] for p in projects] + ["全部项目"]
+    max_label_width = max(_text_width(label) for label in labels)
+    needed = max_label_width + 2 + 1 + count_width  # 前缀"▸ "(2) + 间隔(1) + 计数徽标
+    return min(SIDEBAR_MAX_WIDTH, max(SIDEBAR_MIN_WIDTH, needed))
+
+
 class SessionStore:
     """持有所有已注册运行时的会话列表与标题缓存。
 
@@ -256,6 +370,7 @@ class SessionStore:
         self.generating: set[str] = set()  # 仍是临时兜底、等待后台进程产出的会话键（转圈圈）
         self.conversations: dict[str, list[ConversationMessage]] = {}
         self._cache_mtime: float = self._cache_file_mtime()
+        self._projects: list[dict] | None = None  # 项目聚合缓存，仅在 load() 时失效
 
     @staticmethod
     def _cache_file_mtime() -> float:
@@ -278,6 +393,14 @@ class SessionStore:
                     # 没有可用缓存标题（纯临时兜底）才打转圈圈，等待后台进程产出。
                     if not titles.has_usable_cached_title(session, self.cache):
                         self.generating.add(key)
+            self._projects = None
+
+    def projects(self) -> list[dict]:
+        """跨所有来源聚合的项目文件夹列表（侧边栏用），惰性计算并缓存。"""
+        with self.lock:
+            if self._projects is None:
+                self._projects = _project_groups(self.sessions)
+            return self._projects
 
     def poll_cache_updates(self) -> None:
         """缓存文件被后台生成进程更新时重读，把新标题刷到界面并停掉对应转圈圈。"""
@@ -324,7 +447,78 @@ class SessionStore:
         return messages
 
 
-def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: int = 0) -> None:
+@dataclass
+class UIState:
+    """TUI 主循环状态：当前来源、会话列表光标，以及侧边栏焦点与选中项。"""
+
+    source: str
+    idx: int = 0
+    top: int = 0
+    focus: str = "list"  # "sidebar" | "list"
+    proj_idx: int = 0    # 0 = 全部项目（不过滤）
+    sb_top: int = 0
+
+
+def _visible_sessions(store: SessionStore, ui: UIState, sidebar_visible: bool) -> list[dict]:
+    """当前来源下、经侧边栏项目过滤后的会话列表；侧边栏隐藏或选中"全部项目"时不过滤。"""
+    bucket = store.sessions[ui.source]
+    if not sidebar_visible or ui.proj_idx <= 0:
+        return bucket
+    projects = store.projects()
+    if ui.proj_idx - 1 >= len(projects):
+        return bucket
+    cwd_key = projects[ui.proj_idx - 1]["cwd_key"]
+    return _filter_sessions(bucket, cwd_key)
+
+
+def _draw_sidebar(
+    stdscr,
+    projects: list[dict],
+    proj_idx: int,
+    sb_top: int,
+    sb_w: int,
+    height: int,
+    focused: bool,
+) -> None:
+    """在左侧绘制项目文件夹列表：标题行、分隔线，然后按频率倒序的项目 + 计数徽标。"""
+    dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
+    title_attr = (curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD) if focused else dim
+    stdscr.addnstr(0, 0, _fit_cell(" 项目", sb_w), sb_w, title_attr)
+    stdscr.addnstr(1, 0, "─" * sb_w, sb_w, dim)
+
+    total_count = sum(p["count"] for p in projects)
+    entries = [{"label": "全部项目", "count": total_count}, *projects]
+
+    list_height = max(1, height - 4)
+    proj_idx = max(0, min(proj_idx, len(entries) - 1))
+    if proj_idx < sb_top:
+        sb_top = proj_idx
+    elif proj_idx >= sb_top + list_height:
+        sb_top = proj_idx - list_height + 1
+
+    count_width = max(2, len(str(max((e["count"] for e in entries), default=0))))
+    label_width = max(1, sb_w - count_width - 3)  # 前缀"▸ "(2) + 计数前 1 空格
+    selected_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
+    active_filter_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
+
+    for row, i in enumerate(range(sb_top, min(len(entries), sb_top + list_height))):
+        entry = entries[i]
+        is_current = i == proj_idx
+        prefix = "▸" if is_current else " "
+        label = _truncate_left(entry["label"], label_width)
+        line = (
+            _fit_cell(f"{prefix} {label}", sb_w - count_width - 1)
+            + " "
+            + _fit_cell_right(str(entry["count"]), count_width)
+        )
+        if is_current:
+            attr = selected_attr if focused else active_filter_attr
+        else:
+            attr = dim
+        stdscr.addnstr(2 + row, 0, line, sb_w, attr)
+
+
+def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
@@ -334,32 +528,49 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
 
     dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
 
+    projects = store.projects()
+    sb_w = _sidebar_width(projects, width)
+    sidebar_focused = sb_w > 0 and ui.focus == "sidebar"
+    list_focused = not sidebar_focused
+    x0 = sb_w + 1 if sb_w else 0
+    main_w = width - x0
+
+    if sb_w:
+        _draw_sidebar(stdscr, projects, ui.proj_idx, ui.sb_top, sb_w, height, sidebar_focused)
+        for y in range(0, height - 2):
+            stdscr.addnstr(y, sb_w, "│", 1, dim)
+
     # 顶部来源切换条由注册表动态生成，新增运行时无需修改界面逻辑
     active_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
     inactive_attr = curses.color_pair(PAIR_TAB_INACTIVE) | DIM_EXTRA_ATTR
-    x = 0
+    x = x0
     runtimes = list(store.registry)
     for position, runtime in enumerate(runtimes):
         text = f" {runtime.display_name} ({len(store.sessions[runtime.id])}) "
-        attr = active_attr if runtime.id == source else inactive_attr
+        attr = active_attr if runtime.id == ui.source else inactive_attr
         stdscr.addnstr(0, x, text, max(0, width - 1 - x), attr)
         x += _text_width(text)
         if position < len(runtimes) - 1 and x < width - 1:
             stdscr.addnstr(0, x, "│", max(0, width - 1 - x), dim)
             x += 1
 
-    hint = "←/→ 切换来源"
+    if sidebar_focused:
+        hint = "↑↓ 选项目  → 回列表"
+    elif sb_w:
+        hint = "←→ 切换来源/侧边栏"
+    else:
+        hint = "←/→ 切换来源"
     hint_x = max(x + 2, width - 1 - _text_width(hint))
     if hint_x < width - 1:
         stdscr.addnstr(0, hint_x, hint, max(0, width - 1 - hint_x), dim)
-    stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
+    stdscr.addnstr(1, x0, "─" * main_w, main_w, dim)
 
-    sessions = store.sessions[source]
+    sessions = _visible_sessions(store, ui, sb_w > 0)
     display_titles, generating = store.snapshot()
     spin = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
 
     # 列宽分配：# / 标题 / 目录 / 时间 / 大小 / 状态
-    col_num, col_title, col_dir, col_time, col_size, col_status = _column_widths(width)
+    col_num, col_title, col_dir, col_time, col_size, col_status = _column_widths(main_w)
 
     header = COL_GAP.join((
         _fit_cell("#", col_num),
@@ -369,12 +580,14 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
         _fit_cell_right("大小", col_size),
         _fit_cell("状态", col_status),
     ))
-    stdscr.addnstr(2, 0, header, width - 1, dim | curses.A_BOLD)
-    stdscr.addnstr(3, 0, "─" * (width - 1), width - 1, dim)
+    stdscr.addnstr(2, x0, header, main_w, dim | curses.A_BOLD)
+    stdscr.addnstr(3, x0, "─" * main_w, main_w, dim)
 
     list_height = height - 6  # 顶部4行 + 底部分隔1行 + 帮助1行
+    idx, top = ui.idx, ui.top
     if not sessions:
-        stdscr.addnstr(4, 2, "(无会话)", width - 3, dim)
+        message = "(该项目在当前来源没有会话，Tab 切换来源查看)" if sb_w and ui.proj_idx > 0 else "(无会话)"
+        stdscr.addnstr(4, x0 + 2, message, max(0, main_w - 3), dim)
     else:
         if idx < top:
             top = idx
@@ -387,27 +600,33 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
             s = sessions[i]
             key = session_key(s)
             title = display_titles.get(key, s["fallback_title"])
-            selected = i == idx
+            current = i == idx
+            selected = current and list_focused  # 只有列表持有焦点时才用反白
             is_gen = key in generating
-            prefix = "▸" if selected else " "
+            prefix = "▸" if current else " "
             num = _fit_cell(f"{prefix}{i + 1}", col_num)
             dir_col = _fit_cell(s["cwd_display"], col_dir)
             time_col = _fit_cell(_format_relative_time(s["mtime"]), col_time)
             size_col = _fit_cell_right(_format_size(s["size_kb"]), col_size)
             status_col = _fit_cell("进行中" if s["live"] else "已结束", col_status)
 
-            base_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD if selected else curses.A_NORMAL
-            status_attr = base_attr if selected else _status_attr(s["live"])
+            if selected:
+                base_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
+            elif current:
+                base_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
+            else:
+                base_attr = curses.A_NORMAL
+            status_attr = base_attr if current else _status_attr(s["live"])
 
             y = 4 + row
-            x = 0
+            x = x0
 
             # 标题列：生成中时拆成「转圈圈(2列宽) + 暗色临时标题」
             if is_gen:
                 spin_cell = _fit_cell(spin, 2)  # 转圈圈字符 + 1 空格
                 title_cell = _fit_cell(title, col_title - 2)
-                spin_render_attr = base_attr if selected else spinner_attr
-                title_render_attr = base_attr if selected else dim
+                spin_render_attr = base_attr if current else spinner_attr
+                title_render_attr = base_attr if current else dim
                 title_segments: list[tuple[str, int]] = [
                     (num, base_attr),
                     (COL_GAP, base_attr),
@@ -425,11 +644,11 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
             for cell, attr in (
                 *title_segments,
                 (COL_GAP, base_attr),
-                (dir_col, base_attr if selected else dim),
+                (dir_col, base_attr if current else dim),
                 (COL_GAP, base_attr),
-                (time_col, base_attr if selected else dim),
+                (time_col, base_attr if current else dim),
                 (COL_GAP, base_attr),
-                (size_col, base_attr if selected else dim),
+                (size_col, base_attr if current else dim),
                 (COL_GAP, base_attr),
                 (status_col, status_attr),
             ):
@@ -445,14 +664,33 @@ def _draw(stdscr, store: SessionStore, source: str, idx: int, top: int, frame: i
         stdscr.addnstr(height - 2, 0, "─" * (width - 1), width - 1, dim)
         key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
         x = 0
-        for keys, label in (
-            ("↑↓", " 选择   "),
-            ("←→/Tab", " 切换来源   "),
-            ("Space", " 预览   "),
-            ("Enter", " 原生恢复   "),
-            ("a", " 高级操作   "),
-            ("q", " 退出"),
-        ):
+        if sidebar_focused:
+            help_entries = (
+                ("↑↓", " 选项目   "),
+                ("→", " 回列表   "),
+                ("Tab", " 切来源   "),
+                ("q", " 退出"),
+            )
+        elif sb_w:
+            help_entries = (
+                ("↑↓", " 选择   "),
+                ("←→", " 切换来源/侧边栏   "),
+                ("Tab", " 切来源   "),
+                ("Space", " 预览   "),
+                ("Enter", " 原生恢复   "),
+                ("a", " 高级操作   "),
+                ("q", " 退出"),
+            )
+        else:
+            help_entries = (
+                ("↑↓", " 选择   "),
+                ("←→/Tab", " 切换来源   "),
+                ("Space", " 预览   "),
+                ("Enter", " 原生恢复   "),
+                ("a", " 高级操作   "),
+                ("q", " 退出"),
+            )
+        for keys, label in help_entries:
             cell_width = max(0, width - 2 - x)
             if cell_width <= 0:
                 break
@@ -630,18 +868,25 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
 
     runtime_ids = store.registry.ids
     source = next((runtime_id for runtime_id in runtime_ids if store.sessions[runtime_id]), runtime_ids[0])
-    idx = 0
-    top = 0
+    ui = UIState(source=source)
 
     def _sync_top() -> None:
-        """更新 top 与可见区对齐，保持 _run 的 top 和实际渲染同步。"""
-        nonlocal top
+        """更新 ui.top 与可见区对齐，保持会话列表状态和实际渲染同步。"""
         height, _ = stdscr.getmaxyx()
         list_height = max(1, height - 6)
-        if idx < top:
-            top = idx
-        elif idx >= top + list_height:
-            top = idx - list_height + 1
+        if ui.idx < ui.top:
+            ui.top = ui.idx
+        elif ui.idx >= ui.top + list_height:
+            ui.top = ui.idx - list_height + 1
+
+    def _sync_sidebar_top() -> None:
+        """更新 ui.sb_top 与侧边栏可见区对齐，与 _sync_top 对称。"""
+        height, _ = stdscr.getmaxyx()
+        list_height = max(1, height - 4)
+        if ui.proj_idx < ui.sb_top:
+            ui.sb_top = ui.proj_idx
+        elif ui.proj_idx >= ui.sb_top + list_height:
+            ui.sb_top = ui.proj_idx - list_height + 1
 
     frame = 0
     # getch 超时为 200ms，每 5 帧（约 1 秒）轮询一次缓存文件，拾取后台进程产出的新标题。
@@ -652,7 +897,14 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
             store.poll_cache_updates()
         if store.dirty.is_set():
             store.dirty.clear()
-        _draw(stdscr, store, source, idx, top, frame)
+
+        _, width = stdscr.getmaxyx()
+        sidebar_visible = _sidebar_width(store.projects(), width) > 0
+        if not sidebar_visible and ui.focus == "sidebar":
+            # 终端被拖窄导致侧边栏隐藏：焦点强制回列表；proj_idx 保留但过滤旁路，拉宽后自动恢复
+            ui.focus = "list"
+
+        _draw(stdscr, store, ui, frame)
         frame += 1
 
         try:
@@ -663,7 +915,9 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
         if ch == -1:
             continue  # timeout，回去重绘以便标题刷新生效
 
-        sessions = store.sessions[source]
+        sessions = _visible_sessions(store, ui, sidebar_visible)
+        ui.idx = max(0, min(ui.idx, len(sessions) - 1)) if sessions else 0
+        ui.proj_idx = max(0, min(ui.proj_idx, len(store.projects())))
 
         # 注意：不能把裸 ESC(27) 也绑定为退出键。stdscr.timeout(200) 让 getch
         # 处于非阻塞模式，这种模式下 ncurses 无法安全等待去判断"单独的 ESC"和
@@ -671,38 +925,68 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | None:
         # 导致方向键失灵。所以退出键只留 q。
         if ch == ord("q"):
             return None
-        elif ch in (curses.KEY_UP, ord("k")):
-            if sessions:
-                idx = max(0, idx - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            if sessions:
-                idx = min(len(sessions) - 1, idx + 1)
-        elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("\t")):
-            current = runtime_ids.index(source)
-            step = -1 if ch == curses.KEY_LEFT else 1
-            source = runtime_ids[(current + step) % len(runtime_ids)]
-            idx = 0
-            top = 0
-        elif ch == ord(" "):
-            if sessions:
-                session = sessions[idx]
-                title = store.get_title(session)
-                if _show_preview(stdscr, store, session, title):
-                    return LaunchRequest(session, source, title)
-        elif ch in (10, 13, curses.KEY_ENTER):
-            if sessions:
-                session = sessions[idx]
-                return LaunchRequest(session, source, store.get_title(session))
-        elif ch == ord("a"):
-            if sessions:
-                target = _choose_target_runtime(stdscr, store, source)
-                if target is not None:
-                    session = sessions[idx]
-                    return LaunchRequest(session, target, store.get_title(session))
+        elif ch == ord("\t"):
+            current = runtime_ids.index(ui.source)
+            ui.source = runtime_ids[(current + 1) % len(runtime_ids)]
+            ui.focus = "list"
+            ui.idx = 0
+            ui.top = 0
+        elif ui.focus == "sidebar":
+            if ch in (curses.KEY_UP, ord("k")):
+                ui.proj_idx = max(0, ui.proj_idx - 1)
+                ui.idx = 0
+                ui.top = 0
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                ui.proj_idx = min(len(store.projects()), ui.proj_idx + 1)
+                ui.idx = 0
+                ui.top = 0
+            elif ch == curses.KEY_RIGHT:
+                ui.focus = "list"
+            elif ch in (10, 13, curses.KEY_ENTER):
+                ui.focus = "list"
+            # KEY_LEFT：已经是侧边栏端点，停住不动（Tab 仍可循环切换来源）
+        else:  # ui.focus == "list"
+            if ch in (curses.KEY_UP, ord("k")):
+                if sessions:
+                    ui.idx = max(0, ui.idx - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                if sessions:
+                    ui.idx = min(len(sessions) - 1, ui.idx + 1)
+            elif ch == curses.KEY_LEFT:
+                current = runtime_ids.index(ui.source)
+                if sidebar_visible and current == 0:
+                    ui.focus = "sidebar"
+                else:
+                    ui.source = runtime_ids[(current - 1) % len(runtime_ids)]
+                    ui.idx = 0
+                    ui.top = 0
+            elif ch == curses.KEY_RIGHT:
+                current = runtime_ids.index(ui.source)
+                if not (sidebar_visible and current == len(runtime_ids) - 1):
+                    ui.source = runtime_ids[(current + 1) % len(runtime_ids)]
+                    ui.idx = 0
+                    ui.top = 0
+                # 侧边栏可见且已在最后一个来源：端点停住不回绕（Tab 仍可循环切换）
+            elif ch == ord(" "):
+                if sessions:
+                    session = sessions[ui.idx]
+                    title = store.get_title(session)
+                    if _show_preview(stdscr, store, session, title):
+                        return LaunchRequest(session, ui.source, title)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                if sessions:
+                    session = sessions[ui.idx]
+                    return LaunchRequest(session, ui.source, store.get_title(session))
+            elif ch == ord("a"):
+                if sessions:
+                    target = _choose_target_runtime(stdscr, store, ui.source)
+                    if target is not None:
+                        session = sessions[ui.idx]
+                        return LaunchRequest(session, target, store.get_title(session))
 
-        # 光标移动或切换来源可能改变可见区，重新对齐 top 与渲染保持一致
-        if ch in (curses.KEY_UP, ord("k"), curses.KEY_DOWN, ord("j")):
-            _sync_top()
+        # 光标移动、切换来源或切换项目都可能改变可见区，统一在这里对齐渲染滚动位置
+        _sync_top()
+        _sync_sidebar_top()
 
 
 def _launch(request: LaunchRequest, registry: RuntimeRegistry) -> None:

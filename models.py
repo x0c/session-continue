@@ -16,6 +16,9 @@ class SessionInfo(TypedDict):
     cwd_display: str
     mtime: float
     display_time: str
+    time_source: str
+    event_time: float | None
+    file_mtime: float
     size_bytes: int
     size_kb: float
     native_title: str | None
@@ -26,6 +29,25 @@ class SessionInfo(TypedDict):
     last_user_msg: str
     last_agent_msg: str
     path: str
+
+
+_STALE_MTIME_GAP_SECONDS = 3600
+
+
+def effective_session_time(file_mtime: float, event_time: float | None) -> tuple[float, str]:
+    """修正与真实对话内容脱节的文件 mtime，供各运行时扫描器共用。
+
+    文件 mtime 最符合“最近被续接/写入”的直觉，正常续接必然写入带时间戳的
+    对话条目，二者基本一致。但运行时会在会话驻留/被重新打开时追加没有时间
+    戳的元数据条目（如 Claude Code 的 last-prompt、ai-title、mode、
+    permission-mode），把文件 mtime 顶到“现在”而不产生任何新对话内容；
+    Syncthing、复制、批量元数据刷新也有同样效果。当 mtime 比会话内部最后
+    一条真实事件的时间新出一个多小时以上的 gap 时，判定 mtime 不可信，回退
+    到事件时间。
+    """
+    if event_time is not None and file_mtime - event_time > _STALE_MTIME_GAP_SECONDS:
+        return event_time, "event_time_stale_mtime"
+    return file_mtime, "file_mtime"
 
 
 def session_key(session: SessionInfo | dict) -> str:

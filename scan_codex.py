@@ -16,7 +16,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
-from models import ConversationMessage
+from models import ConversationMessage, effective_session_time
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 SESSION_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
@@ -231,9 +231,10 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
                 last_event_type = "turn_aborted"
 
     mtime = os.path.getmtime(path)
+    resolved_event_time = event_time or (dt.timestamp() if dt else None)
+    session_time, time_source = effective_session_time(mtime, resolved_event_time)
     size_bytes = os.path.getsize(path)
     size_kb = size_bytes / 1024
-    session_time = mtime
     fallback = (first_user_msg or "").split("\n")[0].strip()
     if len(fallback) > 60:
         fallback = fallback[:60] + "…"
@@ -248,7 +249,8 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         "cwd_display": _shorten_cwd(cwd or ""),
         "mtime": session_time,
         "display_time": _format_display_time(session_time),
-        "event_time": event_time or (dt.timestamp() if dt else None),
+        "time_source": time_source,
+        "event_time": resolved_event_time,
         "file_mtime": mtime,
         "size_bytes": size_bytes,
         "size_kb": round(size_kb, 1),
