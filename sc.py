@@ -731,6 +731,7 @@ def _draw_preview(
     messages: list[ConversationMessage],
     title: str,
     runtime_name: str,
+    short_id: str,
     scroll: int,
 ) -> int:
     """全屏绘制聊天记录，返回修正后的滚动位置。"""
@@ -752,6 +753,10 @@ def _draw_preview(
 
     header = f" 对话预览 · {title} "
     stdscr.addnstr(0, 0, header, width - 1, user_attr)
+    if short_id:
+        id_label = f" ID {short_id} "
+        id_x = max(0, width - 1 - _text_width(id_label))
+        stdscr.addnstr(0, id_x, id_label, width - 1 - id_x, dim)
     stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
     for row, (kind, line) in enumerate(lines[scroll:scroll + visible_height]):
         if kind == "user":
@@ -787,9 +792,10 @@ def _show_preview(
     """打开全屏聊天记录；回车原生恢复，空格或 q 关闭，`a`/`n` 等会话级快捷键与列表页一致。"""
     messages = store.get_conversation(session)
     runtime_name = store.registry.get(str(session.get("source") or "")).display_name
+    short_id = str(session.get("short_id") or "")
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
     while True:
-        scroll = _draw_preview(stdscr, messages, title, runtime_name, scroll)
+        scroll = _draw_preview(stdscr, messages, title, runtime_name, short_id, scroll)
         try:
             ch = stdscr.getch()
         except curses.error:

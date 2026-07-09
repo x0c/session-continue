@@ -997,21 +997,24 @@ class TuiLayoutTests(unittest.TestCase):
         messages = [sc.ConversationMessage("user", "问题")]
 
         with mock.patch.object(sc.curses, "color_pair", return_value=0):
-            sc._draw_preview(screen, messages, "标题", "Claude", 0)
+            sc._draw_preview(screen, messages, "标题", "Claude", "abc12345", 0)
 
         screen.erase.assert_called_once_with()
         positions = {(call.args[0], call.args[1]) for call in screen.addnstr.call_args_list}
         self.assertIn((0, 0), positions)
         self.assertIn((23, 0), positions)
+        header_row_texts = [call.args[2] for call in screen.addnstr.call_args_list if call.args[0] == 0]
+        self.assertTrue(any("abc12345" in text for text in header_row_texts))
 
         store = mock.Mock()
         store.get_conversation.return_value = messages
         store.registry.get.return_value.display_name = "Claude"
-        session = {"source": "claude", "id": "abc"}
+        session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = sc.UIState(source="claude")
         screen.getch.return_value = ord("q")
-        with mock.patch.object(sc, "_draw_preview", return_value=0):
+        with mock.patch.object(sc, "_draw_preview", return_value=0) as draw:
             result = sc._show_preview(screen, store, ui, session, "标题", False)
+        draw.assert_called_once_with(screen, messages, "标题", "Claude", "abc12345", 10 ** 9)
         self.assertIsNone(result)
         screen.clear.assert_called_once_with()
 
