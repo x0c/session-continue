@@ -362,7 +362,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
 
 
 def load_conversation(path: str) -> list[ConversationMessage]:
-    """按时间顺序读取真实用户消息和 Codex 每轮最终答复。"""
+    """按时间顺序读取真实用户消息和 Codex 的助手消息（含任务执行中的过程叙述 commentary 和最终答复 final_answer）。"""
     messages: list[ConversationMessage] = []
     try:
         with open(path, encoding="utf-8", errors="replace") as file:
@@ -385,7 +385,7 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     text = str(payload.get("message") or "").strip()
                     if text:
                         messages.append(ConversationMessage("user", text))
-                elif payload_type == "agent_message" and payload.get("phase") in (None, "final_answer"):
+                elif payload_type == "agent_message" and payload.get("phase") in (None, "final_answer", "commentary"):
                     text = str(payload.get("message") or "").strip()
                     if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
                         messages.append(ConversationMessage("assistant", text))

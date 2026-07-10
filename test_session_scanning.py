@@ -890,7 +890,7 @@ class ConversationPreviewTests(unittest.TestCase):
             ],
         )
 
-    def test_codex_conversation_uses_final_answer_and_removes_task_complete_duplicate(self) -> None:
+    def test_codex_conversation_keeps_commentary_and_removes_task_complete_duplicate(self) -> None:
         entries = [
             {"type": "event_msg", "payload": {"type": "user_message", "message": "用户问题"}},
             {
@@ -911,7 +911,7 @@ class ConversationPreviewTests(unittest.TestCase):
 
         self.assertEqual(
             [(message.role, message.text) for message in messages],
-            [("user", "用户问题"), ("assistant", "最终答复")],
+            [("user", "用户问题"), ("assistant", "处理中间状态"), ("assistant", "最终答复")],
         )
 
     def test_codex_conversation_ignores_null_message_instead_of_literal_none(self) -> None:
