@@ -117,6 +117,15 @@
   context/describe` 子命令分发写在 `main()` 顶部，早于旧版 `--json`/`--limit` 的 legacy parser；
   改 `main()` 时不要把两条路径的参数解析合并到同一个 `argparse.ArgumentParser`，legacy 路径的报错
   仍是给人看的文本，机器接口路径的报错必须是 JSON envelope，混用会破坏其中一边的调用方假设。
+- **`AgentApiTests` 里给 `store_true` 参数写测试的坑**：`_registry`/各测试方法构造 `args` 大多是裸
+  `mock.Mock(...)`，只显式传了用到的关键字；访问没传的属性时 Mock 会自动生成一个新的、truthy 的
+  Mock 实例，不会抛 `AttributeError`，也不会落回 `getattr(args, name, default)` 的 `default`。
+  所以 `cmd_list`/`cmd_search` 里判断 `--live` 用的是 `getattr(args, "live", None) is True`，不是
+  常见的 truthy 写法——用 `is True` 才能让"老测试没传 `live` 参数"正确落到"未开启"，而不是被
+  自动生成的 Mock 误判成"已开启，过滤到只剩 live 会话"。新增任何 `store_true` 参数、且要在
+  `cmd_*` 里按它做条件分支时，同样用 `is True` 这个模式；纯读值转发（如 `compact`/`out`）目前
+  所有测试都显式传了值，暂时安全，但新写测试时也建议养成显式传 `live=False` 等布尔关键字的习惯，
+  别依赖 Mock 的默认行为。
 - **`live`/`pid` 从扫描层到接口的传递**：`scan_claude._live_session_ids()`/`scan_codex._live_session_ids()`
   返回 `{会话ID: pid}` 字典（不是纯 `set`），`scan_sessions` 里 `info["live"] = info["id"] in live_ids`
   之后紧跟 `info["pid"] = live_ids.get(info["id"])`；两个运行时判活时手上本来就有 pid（Claude 是

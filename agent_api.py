@@ -275,6 +275,9 @@ def cmd_list(args, registry) -> dict:
                 continue
             if args.cwd and args.cwd.lower() not in str(session.get("cwd") or "").lower():
                 continue
+            # 用 `is True` 而不是 truthy：AgentApiTests 里的 args 常是裸 mock.Mock()，
+            # 没显式设置的属性会自动生成一个真值 Mock（不是抛异常/落回默认值），
+            # truthy 判断会让老测试静默被过滤成"只剩 live 会话"。
             if getattr(args, "live", None) is True and not session.get("live"):
                 continue
             candidates.append((runtime, session))
@@ -302,6 +305,9 @@ def cmd_search(args, registry) -> dict:
     results = []
     for runtime in runtimes:
         for session in runtime.scan_sessions(args.limit):
+            # 用 `is True` 而不是 truthy：AgentApiTests 里的 args 常是裸 mock.Mock()，
+            # 没显式设置的属性会自动生成一个真值 Mock（不是抛异常/落回默认值），
+            # truthy 判断会让老测试静默被过滤成"只剩 live 会话"。
             if getattr(args, "live", None) is True and not session.get("live"):
                 continue
             title, _ = titles.resolve_initial_title(session, cache)
