@@ -16,6 +16,9 @@ import sc
 import agent_api
 import titles
 from models import ConversationMessage, Handoff, LaunchPlan
+from runtime.base import BaseRuntime
+from runtime.claude import ClaudeRuntime
+from runtime.codex import CodexRuntime
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -1389,6 +1392,120 @@ class SessionActionTests(unittest.TestCase):
         ):
             result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
         self.assertIs(result, sc._ACTION_STAY)
+
+
+class HandoffDigestTests(unittest.TestCase):
+    """跨运行时接手提示词里的对话摘录：标题只有十几个字，摘录是目标 agent 的任务锚点。"""
+
+    class _StubRuntime(BaseRuntime):
+        id = "claude"
+        display_name = "Claude"
+        executable = "claude"
+        history_reading_hint = "格式提示"
+
+        def __init__(self, messages) -> None:
+            self._messages = messages
+
+        def scan_sessions(self, limit):
+            return []
+
+        def load_conversation(self, session):
+            if isinstance(self._messages, Exception):
+                raise self._messages
+            return self._messages
+
+        def build_resume_plan(self, session):
+            raise NotImplementedError
+
+        def build_new_plan(self, handoff):
+            raise NotImplementedError
+
+        def build_new_session_plan(self, cwd):
+            raise NotImplementedError
+
+    def _export(self, messages, **session_extra):
+        with tempfile.NamedTemporaryFile(suffix=".jsonl") as history:
+            session = {
+                "path": history.name,
+                "cwd": "/tmp",
+                "status_tag": titles.STATUS_PENDING,
+                "first_user_msg": "",
+                "last_user_msg": "",
+                "last_agent_msg": "",
+            }
+            session.update(session_extra)
+            return self._StubRuntime(messages).export_handoff(session, "标题")
+
+    def test_digest_keeps_first_need_and_last_eight_messages_with_llm_facing_roles(self) -> None:
+        # 角色必须标"用户"而不是"你"：摘录是给接手的大模型看的，"你"会被误解为指它自己。
+        messages = [ConversationMessage("user", "最初的需求说明")]
+        for i in range(10):
+            role = "assistant" if i % 2 == 0 else "user"
+            messages.append(ConversationMessage(role, f"消息{i}" + ("长" * 500 if i == 9 else "")))
+
+        handoff = self._export(messages)
+
+        lines = handoff.conversation_digest.splitlines()
+        self.assertEqual(lines[0], "【原始需求】最初的需求说明")
+        self.assertEqual(lines[1], "【最近对话】")
+        self.assertEqual(len(lines), 2 + 8)  # 最近 8 条
+        self.assertTrue(lines[2].startswith(("用户: ", "助手: ")))
+        self.assertNotIn("你:", handoff.conversation_digest)
+        self.assertTrue(lines[-1].endswith("…"))  # 超长消息被截断
+
+    def test_digest_skips_first_need_when_already_in_recent_window(self) -> None:
+        messages = [
+            ConversationMessage("user", "问题"),
+            ConversationMessage("assistant", "答复"),
+        ]
+        handoff = self._export(messages)
+        self.assertNotIn("【原始需求】", handoff.conversation_digest)
+        self.assertEqual(
+            handoff.conversation_digest, "【最近对话】\n用户: 问题\n助手: 答复"
+        )
+
+    def test_digest_falls_back_to_scan_fields_when_conversation_unavailable(self) -> None:
+        # 对话提取失败（异常）时静默降级到扫描层首尾消息，不阻断接力。
+        handoff = self._export(
+            OSError("boom"),
+            first_user_msg="最初需求",
+            last_user_msg="最后追问",
+            last_agent_msg="最后答复",
+        )
+        self.assertEqual(
+            handoff.conversation_digest,
+            "【原始需求】最初需求\n【最近对话】\n用户: 最后追问\n助手: 最后答复",
+        )
+
+    def test_prompt_without_digest_or_status_matches_legacy_shape(self) -> None:
+        handoff = self._export([], status_tag="")
+        self.assertEqual(handoff.conversation_digest, "")
+        prompt = handoff.render_prompt()
+        self.assertNotIn("对话摘录", prompt)
+        self.assertNotIn("会话状态", prompt)
+        self.assertIn("请先读取上述 JSONL 会话历史", prompt)
+
+    def test_prompt_with_digest_includes_status_and_authority_note(self) -> None:
+        messages = [
+            ConversationMessage("user", "问题"),
+            ConversationMessage("assistant", "答复"),
+        ]
+        prompt = self._export(messages).render_prompt()
+        self.assertIn(f"会话状态：{titles.STATUS_PENDING}", prompt)
+        self.assertIn("以下是从原会话自动提取的对话摘录", prompt)
+        self.assertIn("摘录与文件不一致时以文件为准", prompt)
+        self.assertIn("请以上述摘录为线索读取原 JSONL 会话历史", prompt)
+        self.assertIn("用户: 问题", prompt)
+
+    def test_build_new_plan_prompt_carries_digest_for_both_runtimes(self) -> None:
+        handoff = Handoff(
+            source_runtime_id="claude", source_runtime_name="Claude", title="标题",
+            history_path="/tmp/h.jsonl", original_cwd="/tmp", history_reading_hint="hint",
+            status_note=titles.STATUS_PENDING, conversation_digest="【最近对话】\n用户: 独特摘录内容",
+        )
+        for runtime in (ClaudeRuntime(), CodexRuntime()):
+            plan = runtime.build_new_plan(handoff)
+            self.assertIn("独特摘录内容", plan.argv[-1])
 
 
 class AgentApiTests(unittest.TestCase):

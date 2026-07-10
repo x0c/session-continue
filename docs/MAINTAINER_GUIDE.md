@@ -74,6 +74,23 @@
 - 运行时私有扫描格式、恢复参数和新会话参数必须留在对应适配器中。
 - 公共流程只依赖注册表和统一接力模型。
 
+### 接手提示词的对话摘录（`Handoff.conversation_digest`）
+
+- 摘录在 `BaseRuntime.export_handoff` 统一构建（调用 `self.load_conversation`，运行时无关），
+  不在各适配器里各写一份；`render_prompt` 只负责渲染。为什么要有摘录：标题最长十几个字，
+  作为任务说明极度有损；原始 JSONL 尾部常是工具结果/系统注入事件等噪音，冷启动的目标 agent
+  首次解析容易定位错重点。`load_conversation` 已踩平真实格式坑（过滤系统事件、None 兜底），
+  用它提取的摘录给目标 agent 一个可靠锚点。
+- **原始历史文件仍是权威来源**：摘录在提示词里明确标注"截断版、以历史文件为准"，阅读指令
+  改为"以摘录为线索核对补全"，不能让目标 agent 只信摘录不读文件。
+- **摘录构建失败必须静默降级**：`load_conversation` 异常/为空时回退扫描层的
+  `first_user_msg`/`last_user_msg`/`last_agent_msg`，再空则 digest 留空串、提示词退回无摘录
+  形态——任何情况下不允许因摘录失败阻断接力。
+- 摘录里的角色标签是"用户"/"助手"，**不能用"你"**——摘录是给接手的大模型看的，"你"会被
+  它误解为指自己（用户明确纠正过）。消息压平成单行再截断（`_clip`），多行原文会破坏逐行结构。
+- `sc context` 的 `suggested_prompt` 与 TUI `a` 接力共用同一个 `render_prompt`，改摘录格式时
+  两边同时生效，同步检查 `docs/SKILL.md` 的描述。
+
 ## 机器接口维护（agent_api.py）
 
 - `list`/`search`/`show`/`context`/`describe` 的 JSON envelope 结构（`{ok, data, error, meta}`）、

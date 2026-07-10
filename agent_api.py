@@ -548,7 +548,7 @@ COMMANDS = [
             "cwd_exists": "该目录在当前机器上是否仍然存在",
             "history_path": "历史 JSONL 文件绝对路径",
             "history_reading_hint": "如何解读该运行时历史格式的提示",
-            "suggested_prompt": "跨运行时接力时建议使用的首条提示词（人类或 Agent 可直接复用）",
+            "suggested_prompt": "跨运行时接力时建议使用的首条提示词（人类或 Agent 可直接复用）；内含会话状态和从原会话自动提取的对话摘录，原始历史文件仍是权威来源",
             "resume_command": "同运行时原生恢复该会话的 shell 命令（可能为 null）",
         },
     },

@@ -18,6 +18,19 @@ def usable_cwd(cwd: str | None) -> str | None:
     return cwd if cwd and os.path.isdir(cwd) else None
 
 
+_DIGEST_FIRST_LEN = 300  # 摘录里【原始需求】的截断长度
+_DIGEST_MSG_LEN = 200  # 摘录里每条最近消息的截断长度
+_DIGEST_RECENT_COUNT = 8  # 摘录保留的最近消息条数
+
+
+def _clip(text: str | None, limit: int) -> str:
+    """压平换行成单行并截断；摘录逐行列消息，多行原文会破坏行结构。"""
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit] + "…"
+
+
 class BaseRuntime(ABC):
     """每个命令行 Agent 运行时需要实现的最小能力集合。"""
 
@@ -64,4 +77,48 @@ class BaseRuntime(ABC):
             history_path=history_path,
             original_cwd=str(session.get("cwd") or ""),
             history_reading_hint=self.history_reading_hint,
+            status_note=str(session.get("status_tag") or ""),
+            conversation_digest=self._conversation_digest(session),
         )
+
+    def _conversation_digest(self, session: SessionInfo) -> str:
+        """构建接力提示词里的对话摘录；任何失败都降级为空串，不阻断接力。
+
+        标题最长十几个字，作为任务说明极度有损；原始 JSONL 尾部又常是工具结果、
+        系统注入事件等噪音，冷启动的目标 agent 首次解析容易定位错重点。这里用
+        预览同款 load_conversation（已过滤系统事件、None 兜底）提取一段干净摘录
+        做锚点。角色标"用户"而不是"你"——摘录是给接手的大模型看的，"你"会被
+        误解为指它自己。
+        """
+        try:
+            messages = self.load_conversation(session)
+        except Exception:
+            messages = []
+
+        lines: list[str] = []
+        if messages:
+            recent = messages[-_DIGEST_RECENT_COUNT:]
+            first_user = next((m for m in messages if m.role == "user"), None)
+            if first_user is not None and first_user not in recent:
+                lines.append("【原始需求】" + _clip(first_user.text, _DIGEST_FIRST_LEN))
+            lines.append("【最近对话】")
+            for message in recent:
+                role = "用户" if message.role == "user" else "助手"
+                lines.append(f"{role}: {_clip(message.text, _DIGEST_MSG_LEN)}")
+            return "\n".join(lines)
+
+        # 对话提取失败/为空时，回退扫描层已截好的首尾消息，尽量给出锚点。
+        first = _clip(session.get("first_user_msg"), _DIGEST_FIRST_LEN)
+        last_user = _clip(session.get("last_user_msg"), _DIGEST_MSG_LEN)
+        last_agent = _clip(session.get("last_agent_msg"), _DIGEST_MSG_LEN)
+        if first:
+            lines.append("【原始需求】" + first)
+        recent_lines = []
+        if last_user and last_user != first:
+            recent_lines.append(f"用户: {last_user}")
+        if last_agent:
+            recent_lines.append(f"助手: {last_agent}")
+        if recent_lines:
+            lines.append("【最近对话】")
+            lines.extend(recent_lines)
+        return "\n".join(lines)
