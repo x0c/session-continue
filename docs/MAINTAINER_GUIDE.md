@@ -26,6 +26,10 @@
 - **Monitor/task-notification 等系统注入事件在原始 JSONL 里也挂在 `type: "user"` 轮次下，`load_conversation` 必须整条丢弃，不能当成真人输入。** 区分信号是顶层 `origin.kind` 字段：真人手动输入是 `"human"`（或字段缺失，如老格式/`/plan` 等本地命令包装出的用户轮次），系统事件（Monitor 到点触发、task 通知）是 `"task-notification"`。消息历史只保留 Agent 和真人的对话，系统事件价值很低——最初的实现把它标成 `ConversationMessage("system", ...)` 单独渲染成"◇ 系统事件"展示出来，被用户否决（"什么系统消息都不要显示出来"），改成命中 `origin.kind not in (None, "human")` 就直接 `continue` 跳过，不进入返回结果。`ConversationMessage.role` 因此保持只有 `user`/`assistant` 两种，不要再引入第三种 role。新增其它 `origin.kind` 取值（目前本机全量历史只出现过 `human`/`task-notification` 两种）时按同一分类原则处理，不要默认归到 `user`。
 - **Codex 的 `event_msg.payload` 里字段值可能是 JSON `null`（key 存在但值为 null），`payload.get(key, "")` 的默认值只在 key 缺失时生效，取不到 null 场景，会拿到 `None` 再被 `str()` 变成字面量 `"None"` 混进正文。** 实测 `task_complete.last_agent_message` 为 null 很常见（任务结束但没有最终文本输出，比如被打断/答案已在更早轮次说完），预览页因此显示过多轮" ◆ Codex\nNone"。三处取值（`user_message.message`、`agent_message.message`、`task_complete.last_agent_message`）统一改成 `payload.get(key) or ""`，`or` 会把 `None` 也兜成空字符串再被后续的 `if text:` 过滤掉。改 `scan_codex.py` 任何从 payload 取文本的地方都要用这个写法，不要用 `.get(key, "")`。
 
+## Codex 扫描
+
+- **Codex 自身的多智能体（swarm/subagent）任务会把每个子代理线程各自写成一份独立的 `rollout-*.jsonl` 文件，扫描时必须过滤掉，不能当作用户发起的顶层会话列出。** 真实故障：一个真实会话（`session_meta.payload.thread_source` 缺失或为 `"user"`）执行多智能体任务时，会派生出好几个子代理线程（`thread_source: "subagent"`，`forked_from_id`/`parent_thread_id` 指向父会话，`agent_nickname` 是 Codex 随机取的代号），这些子代理线程 fork 时继承了父会话开头的历史，因此它们文件里"第一条用户消息"（也就是列表兜底标题的来源）和父会话完全相同。`_find_all_session_files` 对 `~/.codex/sessions/` 下所有 `.jsonl` 一视同仁地扫描，没读 `thread_source` 字段时，这些子代理文件会和父会话一起出现在列表里，表现为同一段任务描述反复出现好几条、目录和时间都很接近，用户会误以为是"同一个会话被重复列出"的 bug，实际是把 Codex 内部子任务线程误当成了独立会话。修法是在 `_build_session_info` 读 `session_meta` 时顺带取 `payload.get("thread_source")`，`scan_sessions` 里 `thread_source == "subagent"` 直接 `continue` 跳过，和过滤空会话、死 cwd 会话放在同一批前置检查里。
+
 ## 扫描性能
 
 - **硬性指标：`sc` 首屏（进程启动到 TUI 首次渲染）延迟必须 ≤1s。** `main()` 里 `store.load()`（→ `registry.scan_all()`）是同步阻塞首屏的调用，扫描没跑完屏幕就是空的；这个指标和验证方式记在 `AGENTS.md`「验证要求」，`test_session_scanning.py` 的 `StartupLatencyTests` 是配套的回归闸门。

@@ -780,6 +780,68 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
         self.assertEqual(len(sessions), 5)
         self.assertEqual(isdir_calls.count(str(real_cwd)), 1)
 
+    def test_scan_sessions_filters_out_subagent_thread_spawns(self) -> None:
+        # 复现真实故障：Codex 多智能体任务会把每个子代理线程写成独立的
+        # rollout 文件，且 fork 时继承父会话开头的历史，导致同一段用户消息
+        # 在列表里重复出现好几条。session_meta.payload.thread_source
+        # == "subagent" 的文件不是用户发起的顶层会话，必须被过滤掉。
+        old_sessions_dir = scan_codex.SESSIONS_DIR
+        old_session_index = scan_codex.SESSION_INDEX
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                scan_codex.SESSIONS_DIR = td
+                scan_codex.SESSION_INDEX = os.path.join(td, "session_index.jsonl")
+
+                root_uuid = "019f4b05-4930-7c31-9920-86c9f7a7570d"
+                root_path = Path(td) / f"rollout-2026-07-10T15-54-25-{root_uuid}.jsonl"
+                _write_jsonl(
+                    root_path,
+                    [
+                        {
+                            "timestamp": "2026-07-10T07:54:25.456Z",
+                            "type": "session_meta",
+                            "payload": {"id": root_uuid, "cwd": str(Path(td))},
+                        },
+                        {
+                            "timestamp": "2026-07-10T07:54:26.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "user_message", "message": "原始需求"},
+                        },
+                    ],
+                )
+                os.utime(root_path, (1_800_000_000, 1_800_000_000))
+
+                subagent_uuid = "019f4b30-fba4-75d1-abd1-d086ddd1699c"
+                subagent_path = Path(td) / f"rollout-2026-07-10T16-42-09-{subagent_uuid}.jsonl"
+                _write_jsonl(
+                    subagent_path,
+                    [
+                        {
+                            "timestamp": "2026-07-10T08:42:09.349Z",
+                            "type": "session_meta",
+                            "payload": {
+                                "id": subagent_uuid,
+                                "forked_from_id": root_uuid,
+                                "cwd": str(Path(td)),
+                                "thread_source": "subagent",
+                                "agent_nickname": "Parfit",
+                            },
+                        },
+                        {
+                            "timestamp": "2026-07-10T08:42:09.400Z",
+                            "type": "event_msg",
+                            "payload": {"type": "user_message", "message": "原始需求"},
+                        },
+                    ],
+                )
+                os.utime(subagent_path, (1_800_000_120, 1_800_000_120))
+
+                sessions = scan_codex.scan_sessions(limit=10)
+            self.assertEqual([s["id"] for s in sessions], [root_uuid])
+        finally:
+            scan_codex.SESSIONS_DIR = old_sessions_dir
+            scan_codex.SESSION_INDEX = old_session_index
+
     def test_live_session_ids_parses_uuid_from_lsof_rollout_line(self) -> None:
         # 状态列判活：codex 进程持有自己的 rollout jsonl（写模式），从 lsof
         # 输出的文件名里抽出会话 UUID 即视为存活。

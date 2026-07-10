@@ -190,6 +190,7 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
     tail_entries = _read_session_tail(path)
 
     cwd = None
+    thread_source = None
     first_user_msg = None
     last_user_msg = None
     last_agent_msg = None
@@ -205,6 +206,7 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         pt = payload.get("type", "")
         if t == "session_meta" and cwd is None:
             cwd = payload.get("cwd")
+            thread_source = payload.get("thread_source")
         if t == "event_msg" and pt == "user_message" and first_user_msg is None:
             first_user_msg = payload.get("message", "")
 
@@ -245,6 +247,7 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         "source": "codex",
         "id": uuid,
         "short_id": uuid[:8],
+        "thread_source": thread_source,
         "cwd": cwd or "",
         "cwd_display": _shorten_cwd(cwd or ""),
         "mtime": session_time,
@@ -345,6 +348,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue
         if info is None:
             continue
+        if info["thread_source"] == "subagent":
+            continue  # Codex 自身多智能体拆出的子代理线程，不是用户发起的顶层会话，会与父会话共享同一段历史开头造成列表重复
         if not info["first_user_msg"] or info["fallback_title"] == "(无消息)":
             continue  # 无用户消息的空会话
         if info["cwd"] and not cached_isdir(info["cwd"]):
