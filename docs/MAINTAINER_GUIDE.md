@@ -93,13 +93,30 @@
 
 ## 机器接口维护（agent_api.py）
 
-- `list`/`search`/`show`/`context`/`describe` 的 JSON envelope 结构（`{ok, data, error, meta}`）、
+- `list`/`search`/`show`/`context`/`plan continue`/`describe` 的 JSON envelope 结构（`{ok, data, error, meta}`）、
   退出码分配（0/1/2/3/5）和已发布字段名是对外契约，一旦发布过版本就按“只加不改不删”演进；
   确需破坏性变更时同步提升 `agent_api.AGENT_API_VERSION` 并在 `docs/SKILL.md` 标注。
 - 新增子命令或参数只在 `agent_api.py` 的 `COMMANDS` 列表里加一份定义——`sc describe` 的输出、
   `argparse` 的参数解析共用同一份数据，不要为 `describe` 另写一套文案，否则会和真实行为漂移。
+- **`--compact` 精简字段集是「给人看」的默认值，不是「给机器控制逻辑」的默认值**：`list`/`show`
+  单独传 `--compact` 时只返回 `DEFAULT_LIST_FIELDS`/`DEFAULT_SHOW_FIELDS`，两者都不含 `cwd`/`pid`。
+  这曾在 OpenConductor 接入时造成真实故障：`internal/agentcontrol.SCClient` 只传了 `--compact`，
+  拿到的每条会话 `cwd`/`pid` 恒为空——不是报错，是静默拿到零值，导致停止动作因缺 pid 直接判定
+  「进程无效」、项目归属判断因缺 cwd 退化为「无归属，仅机器主人可见」，两者都不会在日志里报错，
+  只会表现为功能悄悄不工作。`show` 因此在这次修复中补上了 `--fields`（此前只有 `list`/`search`
+  支持）：任何需要 `cwd`/`pid` 等非默认字段的调用方，必须显式 `--fields id,runtime,cwd,pid,...`
+  指名，`--compact` 只负责 JSON 排版（不缩进），不能假设它顺带给出全部字段。
 - `title` 字段只读 `titles.load_cache()`，不得在 `agent_api.py` 里触发 `refresh_titles`；机器接口
   不消耗 Claude 额度是硬约束，触发生成的入口只能是 `_spawn_title_daemon` 拉起的后台进程。
+- **续接计划仍是只读数据**：`sc plan continue <runtime:id> --instruction <文本>` 只验证目标会话、
+  读取 runtime 能力并返回统一 envelope 中的会话事实、能力列表与执行计划；它不得启动进程、发送信号、
+  写入历史或改变终端。真正执行计划的是调用方（例如 OpenConductor），不是 sc。
+- **执行计划禁止 Shell 拼接**：计划必须以 `argv` 数组与 `cwd` 表达，调用方使用无 Shell 的进程启动
+  API 逐项传入参数；不要返回或消费可交给 `sh -c`、`eval` 等解释的命令字符串。这样含空格、引号或
+  用户需求文本的参数不会被二次解释，也不会把只读计划接口变成命令注入入口。
+- **第三方 runtime 的续接扩展点**：新增 runtime 时，在 adapter 实现 `build_continue_plan`，由它把已
+  扫描到的原生会话转换为统一的 `argv`/`cwd` 计划；不在 `agent_api.py` 添加按 runtime 分支。不能原生
+  续接的 runtime 应明确返回不可续接能力，而不是伪造计划；实时下发指令同样不属于此扩展点。
 - `status` 是给程序判断用的英文枚举（`STATUS_LABELS`），`status_tag` 是给人看的中文 + emoji；
   新增状态时两边要同步更新，不能只加一边。
 - `list`/`search` 的 `--limit` 是每个运行时的扫描深度，`--top` 才是最终结果数量上限；不要为了省事

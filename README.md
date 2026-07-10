@@ -98,8 +98,9 @@ JSON output includes runtime, session ID, title, working directory, update time,
 ## Agent / Automation
 
 `sc` also exposes read-only, structured subcommands meant for AI agents to query local session
-history — list, search, inspect, and build a handoff context package. None of them launch or
-resume anything; what to do with the data is left to the caller.
+history — list, search, inspect, build a handoff context package, and produce a native continuation
+plan. None of them launch or resume anything; what to do with the data and plan is left to the
+caller.
 
 ```bash
 sc list --cwd my-app --status pending --top 5 --compact # compact, capped session list
@@ -108,6 +109,7 @@ sc search weather app --deep                            # include full conversat
 sc show <session-id-prefix> --messages 10 --compact     # session detail + recent conversation
 sc show <session-id-prefix> --full --out /tmp/sc.json    # write large full output to a file
 sc context <session-id-prefix>          # handoff package: history path, suggested prompt, resume command
+sc plan continue <runtime:id> --instruction "Continue the remaining work" # argv/cwd plan; does not start it
 sc describe [command]                   # machine-readable command/argument/field reference
 ```
 
@@ -119,7 +121,8 @@ JSON session list instead of trying to start the curses TUI.
 For `list` and `search`, `--limit` is scan depth per runtime and `--top` is the returned result
 count cap. `search` returns `score`, `matched_via`, and `matched_fields`; `list`/`search` rows
 include `resumable` and `resume_command` so automation can decide whether to resume in place or
-start fresh.
+start fresh. `sc plan continue` turns that decision into a structured, read-only execution plan
+(`argv` and `cwd`), never a shell command string and never a launched process.
 
 See [docs/SKILL.md](docs/SKILL.md) for the full command reference, field semantics, and typical
 agent workflows.

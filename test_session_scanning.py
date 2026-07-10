@@ -1611,7 +1611,8 @@ class AgentApiTests(unittest.TestCase):
         registry, _ = self._registry([session], messages)
         with tempfile.TemporaryDirectory() as td:
             out_path = os.path.join(td, "show.json")
-            args = mock.Mock(session="claude:show1234", limit=10, full=True, messages=None, out=out_path, compact=True)
+            args = mock.Mock(session="claude:show1234", limit=10, full=True, messages=None, out=out_path,
+                              compact=True, fields=None)
 
             result = agent_api.cmd_show(args, registry)
 

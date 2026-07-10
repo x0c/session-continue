@@ -6,8 +6,8 @@
 
 注意：默认启动交互式终端 TUI（curses），需要真实终端，不能被自动化脚本或
 大模型直接调用。非真实终端环境（管道、脚本、Agent 调用）会自动退化为 JSON
-会话列表。大模型 Agent 需要结构化查询（列表/搜索/详情/接续上下文）时，使用
-`sc list` / `sc search` / `sc show` / `sc context` / `sc describe` 子命令，
+会话列表。大模型 Agent 需要结构化查询（列表/搜索/详情/接续上下文/续接计划）时，使用
+`sc list` / `sc search` / `sc show` / `sc context` / `sc plan continue` / `sc describe` 子命令，
 详见 agent_api.py 和 docs/SKILL.md。
 
 用法：
@@ -19,6 +19,7 @@
     sc search 天气 app    # 按关键词搜会话
     sc show <会话ID前缀>  # 查看会话详情和对话内容
     sc context <会话ID前缀>  # 生成接续该会话所需的上下文数据包
+    sc plan continue <会话ID前缀> --instruction "继续完成剩余工作"  # 只生成后台续接计划
     sc describe          # 查看全部子命令的参数与输出字段说明
 """
 
@@ -1244,9 +1245,9 @@ def _spawn_title_daemon(limit: int) -> None:
 
 
 def main() -> None:
-    # list/search/show/context/describe 是面向 Agent 的机器可读子命令，整体转发给
+    # list/search/show/context/plan/describe 是面向 Agent 的机器可读子命令，整体转发给
     # agent_api，不与下面的 TUI/--json 旧参数共用同一个 parser。
-    if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_NAMES:
+    if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_ROOT_NAMES:
         sys.exit(agent_api.dispatch(sys.argv[1:]))
 
     parser = argparse.ArgumentParser(

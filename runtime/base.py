@@ -54,6 +54,14 @@ class BaseRuntime(ABC):
     def build_resume_plan(self, session: SessionInfo) -> LaunchPlan:
         """构造原运行时原生恢复计划。"""
 
+    def build_continue_plan(self, session: SessionInfo, instruction: str) -> LaunchPlan:
+        """构造携带新指令的非交互式原生续接计划，但不执行。
+
+        保留默认实现，避免既有第三方适配器因新增可选能力无法实例化；调用方会把
+        此异常转为结构化的“不支持续接计划”结果。
+        """
+        raise LaunchError(f"运行时 {self.id} 尚未支持携带新指令的续接计划")
+
     @abstractmethod
     def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
         """构造读取其他运行时历史的新会话计划。"""

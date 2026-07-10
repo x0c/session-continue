@@ -363,7 +363,7 @@ def cmd_show(args, registry) -> dict:
     runtime = registry.get(str(session.get("source") or ""))
     compact = getattr(args, "compact", False)
     out = getattr(args, "out", None)
-    fields = _parse_fields(None, DEFAULT_SHOW_FIELDS if compact else None)
+    fields = _parse_fields(getattr(args, "fields", None), DEFAULT_SHOW_FIELDS if compact else None)
     payload = session_payload(session, cache, runtime)
     messages = runtime.load_conversation(session)
     total_messages = len(messages)
@@ -434,12 +434,53 @@ def cmd_context(args, registry) -> dict:
     })
 
 
+def cmd_plan_continue(args, registry) -> dict:
+    """生成外部执行器可用的续接计划；本函数只构造数据，绝不启动进程。"""
+    instruction = args.instruction
+    if not instruction or not instruction.strip():
+        raise ApiError("usage_error", "续接指令不能为空", EXIT_USAGE)
+
+    session = resolve_ref(registry, args.session, args.limit)
+    runtime = registry.get(str(session.get("source") or ""))
+    try:
+        plan = runtime.build_continue_plan(session, instruction)
+    except LaunchError as exc:
+        raise ApiError(
+            "not_resumable", f"该会话无法生成续接计划：{exc}", EXIT_ERROR,
+            hint="确认会话所属运行时支持带新指令的原生续接",
+            next_commands=[f"sc context {session_key(session)}"],
+        ) from exc
+    except Exception as exc:
+        raise ApiError(
+            "not_resumable", f"该会话无法生成续接计划：{exc}", EXIT_ERROR,
+            hint="确认会话所属运行时支持带新指令的原生续接",
+            next_commands=[f"sc context {session_key(session)}"],
+        ) from exc
+
+    return _ok({
+        "session_ref": session_key(session),
+        "runtime": runtime.id,
+        "id": session.get("id"),
+        "cwd": session.get("cwd") or "",
+        "capabilities": {
+            "resume": True,
+            "continue_with_instruction": True,
+            "execution": "external_only",
+        },
+        "launch": {
+            "argv": list(plan.argv),
+            "cwd": plan.cwd,
+        },
+    })
+
+
 def cmd_describe(args, registry) -> dict:
     if args.target:
-        spec = next((c for c in COMMANDS if c["name"] == args.target), None)
+        target = args.target if isinstance(args.target, str) else " ".join(args.target)
+        spec = next((c for c in COMMANDS if c["name"] == target), None)
         if spec is None:
             raise ApiError(
-                "not_found", f"未知命令：{args.target}", EXIT_NOT_FOUND,
+                "not_found", f"未知命令：{target}", EXIT_NOT_FOUND,
                 hint="运行 sc describe 查看全部命令",
             )
         return _ok(_describe_command(spec, full=True))
@@ -526,6 +567,7 @@ COMMANDS = [
             {"flags": ["--out"], "kwargs": {"help": "把 show 结果写入指定 JSON 文件，stdout 只返回文件引用摘要"}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON，并默认只返回常用字段"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 200, "help": "定位会话时的扫描深度"}},
+            {"flags": ["--fields"], "kwargs": {"help": "逗号分隔的字段名，只返回这些字段（覆盖 --compact 的默认字段集）"}},
         ],
         "fields": {
             "...": "与 list 命令的字段相同",
@@ -559,10 +601,28 @@ COMMANDS = [
         },
     },
     {
+        "name": "plan continue",
+        "help": "生成携带新指令的非交互式原生续接计划（只返回数据，不执行）",
+        "args": [
+            {"flags": ["session"], "kwargs": {"help": "会话标识：完整 ID / ID 前缀 / runtime:id"}},
+            {"flags": ["--instruction"], "kwargs": {"required": True, "help": "续接时发送给原会话的新指令"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": 200, "help": "定位会话时的扫描深度"}},
+        ],
+        "fields": {
+            "session_ref": "带运行时的唯一会话标识 runtime:id",
+            "runtime": "运行时标识",
+            "id": "原会话完整 ID",
+            "cwd": "原会话工作目录；可能已不存在",
+            "capabilities": "该计划的能力与边界；execution 为 external_only，sc 不会执行计划",
+            "launch.argv": "不经 shell 解释的启动参数数组；新指令是其中独立的一项",
+            "launch.cwd": "外部执行器启动进程时应使用的工作目录；目录不可用时为 null",
+        },
+    },
+    {
         "name": "describe",
         "help": "查看命令列表或某个命令的完整参数 / 输出字段说明",
         "args": [
-            {"flags": ["target"], "kwargs": {"nargs": "?", "help": "命令名；省略则列出全部命令"}},
+            {"flags": ["target"], "kwargs": {"nargs": "*", "help": "命令名；省略则列出全部命令，可使用 plan continue"}},
         ],
         "fields": {},
     },
@@ -573,10 +633,12 @@ HANDLERS = {
     "search": cmd_search,
     "show": cmd_show,
     "context": cmd_context,
+    "plan continue": cmd_plan_continue,
     "describe": cmd_describe,
 }
 
 COMMAND_NAMES = tuple(spec["name"] for spec in COMMANDS)
+COMMAND_ROOT_NAMES = tuple(dict.fromkeys(spec["name"].split()[0] for spec in COMMANDS))
 
 
 def build_parser() -> JSONArgumentParser:
@@ -585,8 +647,27 @@ def build_parser() -> JSONArgumentParser:
         description="sc 的机器可读数据接口：只读，供大模型 Agent 查询本地会话。",
     )
     sub = parser.add_subparsers(dest="command")
+    parents = {}
     for spec in COMMANDS:
-        sp = sub.add_parser(spec["name"], help=spec["help"])
+        parts = spec["name"].split()
+        current_sub = sub
+        path = []
+        for part in parts:
+            path.append(part)
+            key = tuple(path)
+            sp = parents.get(key)
+            if sp is None:
+                sp = current_sub.add_parser(part, help=spec["help"] if len(path) == len(parts) else None)
+                parents[key] = sp
+                if len(path) < len(parts):
+                    sp.set_defaults(command=" ".join(path))
+                    current_sub = sp.add_subparsers(dest=f"command_part_{len(path)}")
+                else:
+                    sp.set_defaults(command=spec["name"])
+            elif len(path) < len(parts):
+                current_sub = sp.add_subparsers(dest=f"command_part_{len(path)}")
+            else:
+                sp.set_defaults(command=spec["name"])
         for arg in spec.get("args", []):
             sp.add_argument(*arg["flags"], **arg["kwargs"])
     return parser
@@ -597,6 +678,10 @@ def dispatch(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if not args.command:
         parser.error("缺少子命令，请使用 sc describe 查看可用命令")
+        return EXIT_USAGE  # pragma: no cover — parser.error 内部已 sys.exit
+
+    if args.command not in HANDLERS:
+        parser.error(f"子命令不完整，请使用 sc describe {args.command} 查看用法")
         return EXIT_USAGE  # pragma: no cover — parser.error 内部已 sys.exit
 
     registry = default_registry()

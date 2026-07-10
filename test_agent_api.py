@@ -13,8 +13,10 @@ from unittest import mock
 import agent_api
 import titles
 from models import ConversationMessage, Handoff, LaunchPlan
+from runtime.claude import ClaudeRuntime
+from runtime.codex import CodexRuntime
 from runtime import RuntimeRegistry
-from runtime.base import BaseRuntime
+from runtime.base import BaseRuntime, LaunchError
 
 
 class FakeRuntime(BaseRuntime):
@@ -35,6 +37,9 @@ class FakeRuntime(BaseRuntime):
 
     def build_resume_plan(self, session: dict) -> LaunchPlan:
         return LaunchPlan((self.executable, "resume", str(session["id"])), None)
+
+    def build_continue_plan(self, session: dict, instruction: str) -> LaunchPlan:
+        return LaunchPlan((self.executable, "resume", str(session["id"]), instruction), None)
 
     def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
         return LaunchPlan((self.executable, handoff.render_prompt()), None)
@@ -158,6 +163,16 @@ class AgentApiTests(unittest.TestCase):
         result = agent_api.cmd_show(args, self.registry)
         self.assertEqual(result["data"]["message_count_shown"], 4)  # --full 忽略 --messages
 
+    def test_cmd_show_fields_overrides_compact_default(self) -> None:
+        # oc agents（OpenConductor 控制面）依赖 --fields 显式取回 cwd/pid：
+        # --compact 单独使用时默认字段集（DEFAULT_SHOW_FIELDS）不含这两个字段，
+        # 曾导致停止/续接判断拿到空 cwd 和空 pid。
+        args = argparse_namespace(session="aaaa1111", messages=None, full=False, limit=200,
+                                   out=None, compact=True, fields="id,cwd,pid,live")
+        result = agent_api.cmd_show(args, self.registry)
+        self.assertEqual(set(result["data"]), {"id", "cwd", "pid", "live"})
+        self.assertEqual(result["data"]["cwd"], "/tmp/weather-app")
+
     # ---- context ----
 
     def test_cmd_context_returns_handoff_and_resume_command(self) -> None:
@@ -178,6 +193,44 @@ class AgentApiTests(unittest.TestCase):
         with self.assertRaises(agent_api.ApiError) as cm:
             agent_api.cmd_context(args, registry)
         self.assertEqual(cm.exception.code, "history_unavailable")
+
+    # ---- plan continue ----
+
+    def test_cmd_plan_continue_returns_structured_safe_argv(self) -> None:
+        instruction = '继续完成任务；不要解释 $HOME 或 "引号"'
+        args = argparse_namespace(session="fake:aaaa1111", instruction=instruction, limit=200)
+        result = agent_api.cmd_plan_continue(args, self.registry)
+        data = result["data"]
+
+        self.assertEqual(data["session_ref"], f"fake:{self.session['id']}")
+        self.assertEqual(data["runtime"], "fake")
+        self.assertEqual(data["cwd"], "/tmp/weather-app")
+        self.assertEqual(data["capabilities"]["execution"], "external_only")
+        self.assertIsInstance(data["launch"]["argv"], list)
+        self.assertEqual(data["launch"]["argv"][-1], instruction)
+        self.assertNotIsInstance(data["launch"]["argv"], str)
+
+    def test_cmd_plan_continue_has_no_execution_side_effect(self) -> None:
+        args = argparse_namespace(session="aaaa1111", instruction="继续处理", limit=200)
+        with mock.patch("os.execvp") as execvp, mock.patch("os.chdir") as chdir:
+            result = agent_api.cmd_plan_continue(args, self.registry)
+        self.assertTrue(result["ok"])
+        execvp.assert_not_called()
+        chdir.assert_not_called()
+
+    def test_cmd_plan_continue_rejects_unresumable_session(self) -> None:
+        with mock.patch.object(self.runtime, "build_continue_plan", side_effect=LaunchError("运行时不支持")):
+            args = argparse_namespace(session="aaaa1111", instruction="继续处理", limit=200)
+            with self.assertRaises(agent_api.ApiError) as cm:
+                agent_api.cmd_plan_continue(args, self.registry)
+        self.assertEqual(cm.exception.code, "not_resumable")
+        self.assertEqual(cm.exception.exit_code, agent_api.EXIT_ERROR)
+
+    def test_cmd_plan_continue_rejects_blank_instruction(self) -> None:
+        args = argparse_namespace(session="aaaa1111", instruction="  ", limit=200)
+        with self.assertRaises(agent_api.ApiError) as cm:
+            agent_api.cmd_plan_continue(args, self.registry)
+        self.assertEqual(cm.exception.code, "usage_error")
 
     # ---- resolve_ref ----
 
@@ -220,6 +273,17 @@ class AgentApiTests(unittest.TestCase):
             agent_api.cmd_describe(args, self.registry)
         self.assertEqual(cm.exception.exit_code, agent_api.EXIT_NOT_FOUND)
 
+    def test_describe_plan_continue_uses_commands_spec(self) -> None:
+        args = argparse_namespace(target=["plan", "continue"])
+        result = agent_api.cmd_describe(args, self.registry)
+        self.assertEqual(result["data"]["name"], "plan continue")
+        self.assertEqual(
+            result["data"]["help"],
+            next(spec["help"] for spec in agent_api.COMMANDS if spec["name"] == "plan continue"),
+        )
+        flags = [arg["flags"] for arg in result["data"]["args"]]
+        self.assertIn(["--instruction"], flags)
+
     def test_commands_spec_and_handlers_are_in_sync(self) -> None:
         self.assertEqual(set(agent_api.COMMAND_NAMES), set(agent_api.HANDLERS))
 
@@ -261,6 +325,49 @@ class AgentApiTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 agent_api.dispatch(["list", "--status", "bogus"])
         self.assertEqual(cm.exception.code, agent_api.EXIT_USAGE)
+
+    def test_dispatch_plan_continue_returns_envelope(self) -> None:
+        with mock.patch.object(agent_api, "default_registry", return_value=self.registry):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = agent_api.dispatch([
+                    "plan", "continue", "fake:aaaa1111", "--instruction", "继续完成天气 App",
+                ])
+        self.assertEqual(exit_code, agent_api.EXIT_OK)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertIsInstance(payload["data"]["launch"]["argv"], list)
+
+    def test_dispatch_unknown_plan_session_returns_not_found(self) -> None:
+        with mock.patch.object(agent_api, "default_registry", return_value=self.registry):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = agent_api.dispatch([
+                    "plan", "continue", "fake:missing", "--instruction", "继续",
+                ])
+        self.assertEqual(exit_code, agent_api.EXIT_NOT_FOUND)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["error"]["code"], "not_found")
+
+
+class RuntimeContinuationPlanTests(unittest.TestCase):
+    """验证内置运行时都能构造带指令的非交互续接计划。"""
+
+    def test_claude_plan_is_non_interactive_and_keeps_instruction_as_one_arg(self) -> None:
+        instruction = '继续处理 $HOME；保留 "原样"'
+        plan = ClaudeRuntime().build_continue_plan({"id": "claude-id", "cwd": "/no/such/cwd"}, instruction)
+        self.assertEqual(plan.argv[0], "claude")
+        self.assertIn("--resume", plan.argv)
+        self.assertIn("--print", plan.argv)
+        self.assertEqual(plan.argv[-1], instruction)
+        self.assertIsNone(plan.cwd)
+
+    def test_codex_plan_is_non_interactive_and_keeps_instruction_as_one_arg(self) -> None:
+        instruction = '继续处理 $HOME；保留 "原样"'
+        plan = CodexRuntime().build_continue_plan({"id": "codex-id", "cwd": "/no/such/cwd"}, instruction)
+        self.assertEqual(plan.argv[:3], ("codex", "exec", "resume"))
+        self.assertEqual(plan.argv[-1], instruction)
+        self.assertIsNone(plan.cwd)
 
 
 class SubprocessIntegrationTests(unittest.TestCase):

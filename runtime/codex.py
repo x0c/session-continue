@@ -37,6 +37,22 @@ class CodexRuntime(BaseRuntime):
             cwd=usable_cwd(str(session.get("cwd") or "")),
         )
 
+    def build_continue_plan(self, session: SessionInfo, instruction: str) -> LaunchPlan:
+        """构造供外部执行器使用的非交互式 Codex 原生续接计划。"""
+        return LaunchPlan(
+            argv=(
+                self.executable,
+                "exec",
+                "resume",
+                "-c",
+                'model_reasoning_effort="high"',
+                "--dangerously-bypass-approvals-and-sandbox",
+                str(session["id"]),
+                instruction,
+            ),
+            cwd=usable_cwd(str(session.get("cwd") or "")),
+        )
+
     def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
         history_dir = os.path.dirname(handoff.history_path)
         return LaunchPlan(
