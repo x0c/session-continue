@@ -15,6 +15,7 @@ import json
 import os
 import sys
 
+import keepalive
 import titles
 from models import session_key
 from runtime import LaunchError, default_registry
@@ -38,10 +39,11 @@ STATUS_LABELS = {
 _RESOLVE_SCAN_LIMIT = 200  # show/context 按标识定位会话时的扫描深度，独立于 list/search 的展示条数
 
 # --compact 模式下 list 的精简默认字段集（省 token）；需要更多字段用 --fields 显式指定
-# live/last_user/last_agent 默认就带上：管家 Agent 一眼看懂"这条会话在跑没跑、最近聊了什么"，
-# 不必为此再多一次 show 往返。pid 体积小但多数为 null，不进精简集，需要时用 --fields 或 --live 取。
+# live/keepalive/last_user/last_agent 默认就带上：管家 Agent 一眼看懂"这条会话在跑没跑、
+# 有没有在后台保活、最近聊了什么"，不必为此再多一次 show 往返。pid 体积小但多数为 null，
+# 不进精简集，需要时用 --fields 或 --live 取。
 DEFAULT_LIST_FIELDS = (
-    "id", "short_id", "runtime", "title", "status", "live", "mtime", "cwd_display",
+    "id", "short_id", "runtime", "title", "status", "live", "keepalive", "mtime", "cwd_display",
     "resumable", "resume_command", "last_user", "last_agent",
 )
 # search 的精简字段集在 list 基础上额外保留命中方式、命中字段和相关性得分，方便调用方理解排序
@@ -161,6 +163,7 @@ def session_payload(session: dict, cache: dict, runtime=None, fields: list[str] 
         "resumable": bool(resume_command),
         "resume_command": resume_command,
         "live": bool(session.get("live")),
+        "keepalive": bool(session.get("keepalive_name")),
         "pid": session.get("pid"),
         "last_user": _trim(session.get("last_user_msg")),
         "last_agent": _trim(session.get("last_agent_msg")),
@@ -198,6 +201,7 @@ def resolve_ref(registry, ref: str, limit: int) -> dict:
             hint="确认会话 ID 或前缀是否正确，可先用 sc search 或 sc list 查看",
             next_commands=[f"sc search {ref}", "sc list"],
         )
+    keepalive.annotate(matches)
 
     exact = [s for s in matches if s.get("id") == ref or session_key(s) == ref]
     if len(exact) == 1:
@@ -268,9 +272,12 @@ def cmd_list(args, registry) -> dict:
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
     cache = titles.load_cache()
 
+    scanned = {runtime.id: runtime.scan_sessions(args.limit) for runtime in runtimes}
+    keepalive.annotate([session for bucket in scanned.values() for session in bucket])
+
     candidates = []
     for runtime in runtimes:
-        for session in runtime.scan_sessions(args.limit):
+        for session in scanned[runtime.id]:
             if args.status and STATUS_LABELS.get(session.get("status_tag") or "", "unknown") != args.status:
                 continue
             if args.cwd and args.cwd.lower() not in str(session.get("cwd") or "").lower():
@@ -302,9 +309,12 @@ def cmd_search(args, registry) -> dict:
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
     cache = titles.load_cache()
 
+    scanned = {runtime.id: runtime.scan_sessions(args.limit) for runtime in runtimes}
+    keepalive.annotate([session for bucket in scanned.values() for session in bucket])
+
     results = []
     for runtime in runtimes:
-        for session in runtime.scan_sessions(args.limit):
+        for session in scanned[runtime.id]:
             # 用 `is True` 而不是 truthy：AgentApiTests 里的 args 常是裸 mock.Mock()，
             # 没显式设置的属性会自动生成一个真值 Mock（不是抛异常/落回默认值），
             # truthy 判断会让老测试静默被过滤成"只剩 live 会话"。
@@ -528,6 +538,7 @@ COMMANDS = [
             "status": "英文状态枚举：done / pending / aborted / unknown",
             "status_tag": "中文状态标签（含图标），供人类展示用",
             "live": "进程是否真实运行中（true/false），不是文件时间推断",
+            "keepalive": "是否正挂在 sc 的后台保活（tmux）里；为 true 时 resume_command 会另起一个竞争同一份会话文件的新进程，应改用 sc 的 Enter/接回操作而不是 resume_command",
             "pid": "运行中会话的进程号；非运行中为 null，可用于定位/发信号给该进程",
             "last_user": "最后一条真人消息，硬截断精简，一眼看懂最近在聊什么",
             "last_agent": "助手最后一轮回复片段，硬截断精简",
@@ -550,7 +561,7 @@ COMMANDS = [
             {"flags": ["--fields"], "kwargs": {"help": "逗号分隔的字段名，只返回这些字段"}},
         ],
         "fields": {
-            "...": "与 list 命令的字段相同（含 live / pid / last_user / last_agent）",
+            "...": "与 list 命令的字段相同（含 live / keepalive / pid / last_user / last_agent）",
             "score": "相关性分数；分数越高排序越靠前，同分按 mtime 倒序",
             "matched_via": "quick（元数据命中）或 deep（全文命中），兼容旧调用方",
             "matched_fields": "命中的字段列表，如 title / first_user_msg / conversation",

@@ -40,6 +40,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_api
+import keepalive
 import titles
 from models import ConversationMessage, LaunchRequest, NewSessionRequest, session_key
 from runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch, usable_cwd
@@ -383,6 +384,7 @@ class SessionStore:
     def load(self) -> None:
         scanned = self.registry.scan_all(self.limit)
         # 每个适配器负责按时间倒序返回，无需在界面层二次排序
+        keepalive.annotate([session for bucket in scanned.values() for session in bucket])
 
         with self.lock:
             self.sessions.update(scanned)
@@ -626,7 +628,9 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
             dir_col = _fit_cell(s["cwd_display"], col_dir)
             time_col = _fit_cell(_format_relative_time(s["mtime"]), col_time)
             size_col = _fit_cell_right(_format_size(s["size_kb"]), col_size)
-            status_col = _fit_cell("进行中" if s["live"] else "已结束", col_status)
+            is_keepalive = bool(s.get("keepalive_name"))
+            status_text = "后台运行中" if is_keepalive else ("进行中" if s["live"] else "已结束")
+            status_col = _fit_cell(status_text, col_status)
 
             if selected:
                 base_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
@@ -634,7 +638,7 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 base_attr = curses.color_pair(PAIR_TAB_ACTIVE) | curses.A_BOLD
             else:
                 base_attr = curses.A_NORMAL
-            status_attr = base_attr if current else _status_attr(s["live"])
+            status_attr = base_attr if current else _status_attr(s["live"] or is_keepalive)
 
             y = 4 + row
             x = x0
@@ -682,6 +686,8 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
         stdscr.addnstr(height - 2, 0, "─" * (width - 1), width - 1, dim)
         key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
         x = 0
+        current_keepalive = bool(sessions) and 0 <= idx < len(sessions) and bool(sessions[idx].get("keepalive_name"))
+        enter_label = " 接回   " if current_keepalive else " 原生恢复   "
         if sidebar_focused:
             help_entries = (
                 ("↑↓", " 选项目   "),
@@ -696,9 +702,10 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 ("←→", " 切换来源/侧边栏   "),
                 ("Tab", " 切来源   "),
                 ("Space", " 预览   "),
-                ("Enter", " 原生恢复   "),
+                ("Enter", enter_label),
                 ("a", " 高级操作   "),
                 ("n", " 新建   "),
+                *((("x", " 关闭后台   "),) if current_keepalive else ()),
                 ("q", " 退出"),
             )
         else:
@@ -706,9 +713,10 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 ("↑↓", " 选择   "),
                 ("←→/Tab", " 切换来源   "),
                 ("Space", " 预览   "),
-                ("Enter", " 原生恢复   "),
+                ("Enter", enter_label),
                 ("a", " 高级操作   "),
                 ("n", " 新建   "),
+                *((("x", " 关闭后台   "),) if current_keepalive else ()),
                 ("q", " 退出"),
             )
         for keys, label in help_entries:
@@ -972,6 +980,34 @@ _ACTION_STAY = object()  # 按键已被处理（弹窗被取消 / beep 拒绝）
 _ACTION_PASS = object()  # 不是会话级动作键，调用方自行处理（导航、滚动等）
 
 
+def _confirm_kill_keepalive(stdscr, label: str) -> bool:
+    """关闭后台保活进程前的一次性确认；按 y 确认，其余任意键取消。"""
+    height, width = stdscr.getmaxyx()
+    message = f"关闭后台进程「{label}」？未保存的当前任务进度将丢失"
+    box_width = min(width - 4, max(30, _text_width(message) + 6))
+    if height < 6 or box_width < 20:
+        return False
+    box_height = 4
+    left = (width - box_width) // 2
+    top = (height - box_height) // 2
+    normal = curses.color_pair(PAIR_DIM) | curses.A_BOLD
+    dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
+
+    stdscr.addnstr(top, left, "┌" + "─" * (box_width - 2) + "┐", box_width, normal)
+    stdscr.addnstr(top + 1, left, "│" + " " * (box_width - 2) + "│", box_width, normal)
+    stdscr.addnstr(top + 1, left + 2, _fit_cell(message, box_width - 4), box_width - 4, normal)
+    stdscr.addnstr(top + 2, left, "│" + " " * (box_width - 2) + "│", box_width, normal)
+    stdscr.addnstr(top + 2, left + 2, "y 确认关闭   其他键取消", box_width - 4, dim)
+    stdscr.addnstr(top + 3, left, "└" + "─" * (box_width - 2) + "┘", box_width, normal)
+    stdscr.refresh()
+
+    try:
+        ch = stdscr.getch()
+    except curses.error:
+        ch = -1
+    return ch in (ord("y"), ord("Y"))
+
+
 def _session_action(
     ch: int,
     stdscr,
@@ -980,7 +1016,7 @@ def _session_action(
     session: dict | None,
     sidebar_visible: bool,
 ):
-    """处理列表页与预览页共用的会话级快捷键：`a` 接力、`n` 新建会话。
+    """处理列表页与预览页共用的会话级快捷键：`a` 接力、`n` 新建会话、`x` 关闭后台保活。
 
     列表页和预览页的按键循环都要经过这里，保证同一个键在两处行为一致；
     未来新增会话级快捷键只需要在这里加一个分支，两处会自动同时支持。
@@ -993,6 +1029,16 @@ def _session_action(
         if target is None:
             return _ACTION_STAY
         return LaunchRequest(session, target, store.get_title(session))
+    if ch == ord("x"):
+        keepalive_name = session.get("keepalive_name") if session else None
+        if not keepalive_name:
+            curses.beep()
+            return _ACTION_STAY
+        if _confirm_kill_keepalive(stdscr, store.get_title(session)):
+            keepalive.kill(keepalive_name)
+            session.pop("keepalive_name", None)
+        stdscr.clear()
+        return _ACTION_STAY
     if ch == ord("n"):
         cwd = usable_cwd(_new_session_cwd(store, ui, session, sidebar_visible))
         if cwd is None:
@@ -1143,12 +1189,26 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
         _sync_sidebar_top()
 
 
-def _launch(request: LaunchRequest | NewSessionRequest, registry: RuntimeRegistry) -> None:
-    """生成启动计划并让目标运行时接管当前终端。"""
-    if isinstance(request, NewSessionRequest):
-        plan = registry.build_new_session_plan(request)
-    else:
+def _launch(request: LaunchRequest | NewSessionRequest, registry: RuntimeRegistry, keepalive_on: bool) -> None:
+    """生成启动计划并让目标运行时接管当前终端。
+
+    会话已经在后台保活时直接接回现场，不重新拉起一个和它竞争同一份会话文件的
+    新进程；否则按 keepalive_on 开关决定新启动的进程要不要包进保活层。
+    """
+    if isinstance(request, LaunchRequest):
+        attach = keepalive.attach_plan(request.session)
+        if attach is not None:
+            execute_launch(attach)
+            return
         plan = registry.build_launch_plan(request)
+        same_runtime = request.session.get("source") == request.target_runtime_id
+        ident = request.session["id"] if same_runtime else keepalive.new_session_ident()
+    else:
+        plan = registry.build_new_session_plan(request)
+        ident = keepalive.new_session_ident()
+
+    if keepalive_on:
+        plan = keepalive.wrap_plan(plan, request.target_runtime_id, ident)
     execute_launch(plan)
 
 
@@ -1281,6 +1341,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=50, help="每个来源最多列出多少条")
     parser.add_argument("--json", action="store_true", dest="json_mode",
                         help="以 JSON 格式输出会话列表后退出，不启动 TUI")
+    parser.add_argument("--no-keepalive", action="store_true", dest="no_keepalive",
+                        help="本次启动不把会话包进后台保活（tmux），SSH 断开会话会跟着中断")
     parser.add_argument("--generate-titles", action="store_true", dest="generate_titles",
                         help=argparse.SUPPRESS)  # 内部用途：TUI 拉起的后台标题生成进程
     args = parser.parse_args()
@@ -1301,6 +1363,10 @@ def main() -> None:
         _output_json(registry, args.limit)
         return
 
+    keepalive_on = keepalive.enabled(args.no_keepalive)
+    if keepalive_on:
+        keepalive.reap_idle()  # 顺带回收空闲太久没人管的后台保活会话，不常驻额外进程
+
     store = SessionStore(limit=args.limit, registry=registry)
     store.load()
 
@@ -1318,7 +1384,7 @@ def main() -> None:
         return
 
     try:
-        _launch(chosen, store.registry)
+        _launch(chosen, store.registry, keepalive_on)
     except LaunchError as exc:
         print(f"启动失败：{exc}", file=sys.stderr)
         sys.exit(1)

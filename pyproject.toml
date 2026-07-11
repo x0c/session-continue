@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "session-continue"
-version = "0.9.0"
+version = "0.10.0"
 description = "Terminal session picker and handoff tool for Claude Code and Codex CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,5 +41,5 @@ Issues = "https://github.com/x0c/session-continue/issues"
 sc = "sc:main"
 
 [tool.setuptools]
-py-modules = ["models", "sc", "agent_api", "scan_claude", "scan_codex", "titles"]
+py-modules = ["models", "sc", "agent_api", "scan_claude", "scan_codex", "titles", "keepalive"]
 packages = ["runtime"]

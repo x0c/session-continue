@@ -25,6 +25,25 @@ Optional title generation launches your local `claude` command. That command may
 
 When you resume or hand off a session, the selected runtime process takes over the terminal. From that point on, Claude Code or Codex CLI behaves according to its own configuration.
 
+## Keep-Alive (Background tmux)
+
+By default, sessions started or resumed from the TUI are wrapped in a dedicated background `tmux`
+server (socket name `sc-keepalive`) so the underlying process survives an SSH disconnect. This changes
+what stays running after `sc` exits:
+
+- The wrapped runtime process (and everything it does) keeps running in the background until it exits
+  on its own, is manually closed (`x` in the TUI), or is auto-reaped after being idle (default 24h, see
+  `SC_KEEPALIVE_IDLE_HOURS`).
+- To detect which sessions are already backgrounded, `sc` reads the local process table (`ps -eo
+  pid,ppid`) and lists the tmux server's own sessions (`tmux -L sc-keepalive list-sessions`). This is
+  local process metadata, not file content, and is not written anywhere.
+- On a machine shared with other local users, anyone able to run commands as your OS user (or root) can
+  attach to `tmux -L sc-keepalive` and see the live terminal content of a backgrounded session — the
+  same exposure any tmux session already has under your account; `sc` does not add encryption or
+  access control on top of it.
+- Disable entirely with `sc --no-keepalive` for one run, or `SC_KEEPALIVE=0` permanently. Skipped
+  automatically when `tmux` is not installed or `sc` is already running inside `tmux`/`screen`.
+
 ## Cross-Runtime Handoff
 
 For handoff between runtimes, the tool passes the original history file path and a short format hint to the target runtime. It does not copy the full conversation into command-line arguments and does not modify the source session.

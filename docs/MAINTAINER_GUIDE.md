@@ -95,6 +95,19 @@
 - `sc context` 的 `suggested_prompt` 与 TUI `a` 接力共用同一个 `render_prompt`，改摘录格式时
   两边同时生效，同步检查 `docs/SKILL.md` 的描述。
 
+## 会话保活（keepalive.py）
+
+- **定位**：运行时无关的启动包装层，地位类似 `titles.py`——不属于任何 `runtime/` 适配器，`registry.py` 只管生成 `LaunchPlan`，`keepalive.py` 负责在执行前后包一层 tmux。新增运行时不需要碰这个模块。
+- **专用 socket 隔离**：全部操作走 `tmux -L sc-keepalive`（独立 server），配套专属配置（`-f` 显式指定），完全不读、不写用户自己的 `~/.tmux.conf` 或默认 socket。目的是让保活会话“无感”（隐藏状态栏、真彩色、`window-size latest`），同时绝不影响用户手动开的 tmux 会话。
+- **tmux 配置内容内联在 `keepalive.py` 的 `_TMUX_CONFIG` 字符串常量里，不是仓库里一个独立的 `.conf` 文件**——这是踩过坑之后改的：项目用 setuptools `py_modules`（扁平模块列表，不是 package）分发，只声明 `.py` 文件会被装进去，同目录放一个 `keepalive.tmux.conf` 完全不会随 `pip install`/Homebrew 安装进最终环境（实测 `pip install --target <dir> .` 之后目标目录里只有 `keepalive.py`，配置文件确实缺失）。改成 `_ensure_config_file()` 在每次 `wrap_plan` 时把内联字符串落盘到 `~/.cache/session-continue/keepalive.tmux.conf`（内容变了才重写，同 `titles.py` 缓存目录），从根源避免"源码目录能跑、真实安装后启动就找不到 `-f` 文件"这类只有装包验证才能发现的问题。改配置内容只改 `_TMUX_CONFIG` 常量，不要再新建独立文件；改完最好实际走一次 `pip install --target <临时目录> .` 确认没有引入新的非 `.py` 依赖。
+- **匹配保活会话不能只靠 tmux 会话名，必须走 pid 祖先链**：`wrap_plan` 生成的 tmux 会话名只在创建时用某个 `runtime_id + ident` 拼一次，之后原生恢复（如 `claude --resume`）可能在内部 fork/重新注册进程，导致 pane 里的顶层 pid（`#{pane_pid}`）不一定等于运行时自己事后记录的“活跃 pid”（如 `~/.claude/sessions/{pid}.json` 里的 pid）。`annotate()` 因此不比较 pid 是否相等，而是一次 `ps -eo pid,ppid` 建出整机父子关系表，对每个候选活跃 pid 向上追祖先链，只要能追到某个 tmux pane 顶层 pid 就算命中——对是否发生过 fork 免疫。`ps` 而非 `/proc`：项目要求同时支持 macOS/Linux（见 `README.md` Requirements），`/proc` 在 macOS 上不存在，`ps -eo pid,ppid` 两边通用。
+- **`annotate()` 的调用点分散在三处，故意不做成单一收敛点**：`sc.py` 的 `SessionStore.load()`（TUI 列表）、`agent_api.py` 的 `cmd_list`/`cmd_search`（直接 `runtime.scan_sessions` 拼列表）、`resolve_ref`（`show`/`context`/`plan continue` 共用的会话定位）。三处各自扫描各自的会话集合，注册表层的 `scan_all()` 只被 TUI 用到，`agent_api.py` 走的是另一条按 runtime 单独扫描的路径，没有单一choke point；`annotate()` 本身只读（一次 `tmux list-sessions` + 一次 `ps`），开销可忽略（有活跃 pid 候选才会真的发子进程，见下一条），所以选择在每个"即将构建 session payload/渲染列表"的地方各调一次，而不是硬凑一个共享入口增加耦合。
+- **`annotate()` 内部先判断有没有带 pid 的候选会话，再决定要不要真的发 `tmux`/`ps` 子进程**：完全空闲、没有任何 `live` 会话时（`sc --json` 场景之外的多数命令行调用），这一步直接短路返回，不产生子进程开销；只有存在候选活跃 pid 时才值得为此打两次子进程。这个判断顺序（先查候选、后发子进程，不是反过来）是刻意的性能取舍，不要为了"代码更直觉"而颠倒。
+- **`_launch` 里先无条件尝试 `attach_plan`，`keepalive_on` 开关只管要不要包装新启动的进程，不管是否要接回已有的**：如果某个历史会话已经被标注了 `keepalive_name`（意味着它当前正跑在某个 tmux pane 里），即使这次调用带了 `--no-keepalive`，也必须走 `attach-session` 接回去，不能假装没看见、重新拉起一个 `claude --resume` 去抢同一份会话文件——那会导致两个进程同时写同一个 JSONL，状态错乱。`--no-keepalive`/`SC_KEEPALIVE=0` 只影响"这次新启动的进程要不要被包进保活层"，对"识别到的已有保活会话该不该接回"没有否决权。改这段逻辑前想清楚这个区分，不要把两件事合并成一个开关。
+- **回收（`reap_idle`）**：按 tmux 自己维护的 `#{session_activity}`（该会话最后一次有任何活动的时间戳）判断空闲时长，超过 `SC_KEEPALIVE_IDLE_HOURS`（默认 24，`0` 禁用）就 `kill-session`。不常驻额外的守护进程/定时器——`main()` 在进 TUI 前顺带跑一次，随 `sc` 的启动节奏自然触发，足够覆盖"长期没人用 sc 就不会占着内存"的诉求；会话历史本身在磁盘上，回收只是关掉后台进程，不丢数据。
+- **无前缀脱离键 `Ctrl-\`**：`keepalive.tmux.conf` 里 `bind-key -n C-\\ detach-client`（`-n` 表示不需要 prefix 就能触发）。选它是因为 tmux 接管终端后处于 raw 模式，`Ctrl-\` 不会像普通终端那样触发本地 `SIGQUIT`；标准 `Ctrl-b d` 始终保留作为备用。新增/改绑定前确认没有和目标运行时 CLI 自身的快捷键冲突。
+- **已知边缘案例**：`attach-session` 发起瞬间目标会话恰好自然退出（tmux 报错退出），`sc` 不做特殊重试，用户重新打开一次 `sc` 即可（这时该会话已经不再显示"后台运行中"，回车会走正常原生恢复路径）。
+
 ## 机器接口维护（agent_api.py）
 
 - `list`/`search`/`show`/`context`/`plan continue`/`describe` 的 JSON envelope 结构（`{ok, data, error, meta}`）、
@@ -201,7 +214,7 @@
 改标题、排序或列宽后，除编译和单测外，还要做真实路径验证：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 

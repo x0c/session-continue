@@ -1708,6 +1708,40 @@ class AgentApiTests(unittest.TestCase):
         self.assertFalse(idle_payload["live"])
         self.assertIsNone(idle_payload["pid"])
 
+    def test_session_payload_exposes_keepalive_flag(self) -> None:
+        session = self._session("keep1234", "保活中的会话", 1, live=True, pid=12345)
+        session["keepalive_name"] = "sc-claude-keep1234"
+        payload = agent_api.session_payload(session, {}, runtime=None)
+        self.assertTrue(payload["keepalive"])
+
+        no_keepalive_session = self._session("plain1234", "普通会话", 1)
+        plain_payload = agent_api.session_payload(no_keepalive_session, {}, runtime=None)
+        self.assertFalse(plain_payload["keepalive"])
+
+    def test_list_and_search_annotate_scanned_sessions_before_building_payload(self) -> None:
+        # cmd_list/cmd_search 必须先对本次扫描出的会话跑一次 keepalive.annotate，
+        # 才能把「是否在后台保活」正确反映进输出字段，不能让调用方自己再查一遍。
+        sessions = [self._session("live1234", "在跑的会话", 1, live=True, pid=555)]
+        registry, _ = self._registry(sessions)
+
+        def _fake_annotate(scanned_sessions):
+            for item in scanned_sessions:
+                if item.get("pid") == 555:
+                    item["keepalive_name"] = "sc-claude-live1234"
+
+        with mock.patch.object(agent_api.keepalive, "annotate", side_effect=_fake_annotate) as mocked:
+            list_args = mock.Mock(runtime=None, limit=10, top=None, compact=True, status=None, cwd=None,
+                                   fields=None, live=None)
+            list_result = agent_api.cmd_list(list_args, registry)
+            self.assertTrue(mocked.called)
+            self.assertTrue(list_result["data"]["sessions"][0]["keepalive"])
+
+        with mock.patch.object(agent_api.keepalive, "annotate", side_effect=_fake_annotate):
+            search_args = mock.Mock(keywords=["在跑"], deep=False, runtime=None, limit=10, top=None,
+                                     compact=True, fields=None)
+            search_result = agent_api.cmd_search(search_args, registry)
+            self.assertTrue(search_result["data"]["sessions"][0]["keepalive"])
+
     def test_list_live_filter_keeps_only_running_sessions(self) -> None:
         sessions = [
             self._session("run11111", "跑着的", 20, live=True, pid=111),
@@ -1765,6 +1799,7 @@ class AgentApiTests(unittest.TestCase):
         list_flags = [flag for arg in result["data"]["args"] for flag in arg["flags"]]
         self.assertIn("--live", list_flags)
         self.assertIn("live", result["data"]["fields"])
+        self.assertIn("keepalive", result["data"]["fields"])
         self.assertIn("pid", result["data"]["fields"])
         self.assertIn("last_user", result["data"]["fields"])
         self.assertIn("last_agent", result["data"]["fields"])

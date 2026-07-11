@@ -95,6 +95,24 @@ sc --json --limit 5 # script-friendly small result set
 
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
 
+## Keep-Alive (survive SSH disconnects)
+
+Sessions started or resumed from the TUI are, by default, wrapped in a dedicated background `tmux`
+server (`tmux -L sc-keepalive`, using a bundled config — never your own `~/.tmux.conf`). If your SSH
+connection drops or you close your laptop, the underlying `claude`/`codex` process keeps running on
+the remote machine. Reopen `sc` and the session shows `后台运行中` (running in background); pressing
+`Enter` reattaches instead of starting a competing second process.
+
+- Press `Ctrl-\` (no prefix needed) to detach and return to your shell while the session keeps running;
+  the standard `Ctrl-b d` also works.
+- Press `x` on a backgrounded session to kill it manually (with a confirmation prompt).
+- Idle sessions (no tmux activity) are auto-reaped after 24h by default; tune with
+  `SC_KEEPALIVE_IDLE_HOURS` (`0` disables reaping) or set `SC_KEEPALIVE_IDLE_HOURS=0` to keep sessions
+  forever. Reaping only closes the background tmux session — history stays on disk.
+- Disable keep-alive for a single run with `sc --no-keepalive`, or permanently with `SC_KEEPALIVE=0`.
+- Automatically skipped when `tmux` isn't installed, or when `sc` is already running inside a
+  `tmux`/`screen` session (no nesting).
+
 ## Agent / Automation
 
 `sc` also exposes read-only, structured subcommands meant for AI agents to query local session
@@ -135,11 +153,13 @@ agent workflows.
 | `Left` / `Right` / `Tab` | Switch runtime column |
 | `Space` | Open full-screen conversation preview |
 | `Home` / `End` | Jump in preview |
-| `Enter` | Resume selected session with the native runtime |
+| `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background) |
 | `a` | Open advanced handoff actions |
+| `x` | Close a backgrounded (keep-alive) session, with confirmation |
 | `q` | Close preview/dialog or quit |
 
 `Esc` is intentionally not used as the quit key because terminals also use escape sequences for arrow keys.
+Inside a keep-alive session, `Ctrl-\` detaches back to `sc` without ending the process (see [Keep-Alive](#keep-alive-survive-ssh-disconnects)).
 
 ## Cross-Runtime Handoff
 
@@ -173,6 +193,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 | --- | --- |
 | `sc.py` | curses TUI, preview screen, JSON output, and process handoff |
 | `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
+| `keepalive.py` | tmux-backed launch wrapper: keep-alive on/off detection, wrap/attach launch plans, idle reaping (config for the dedicated tmux server is inlined here, not a separate file — see maintainer notes) |
 | `models.py` | shared session, handoff, and launch-plan data models |
 | `runtime/` | runtime adapters for scanning, native resume, and new-session launch |
 | `scan_claude.py` | Claude Code history scanner |
@@ -186,7 +207,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 Run the same checks used by CI:
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 

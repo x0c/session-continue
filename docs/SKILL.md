@@ -104,6 +104,11 @@ sc list --live --status pending --compact # 更进一步：正在跑、且已在
 拉起一个进程，不能"接管"——sc 不提供向运行中进程注入输入的能力（本文档开头即说明：sc 只读、无
 副作用,拿到数据后要做什么由调用方决定）。
 
+`keepalive=true` 的会话额外要注意：它的进程挂在 sc 的后台保活层里，`live` 通常也是 `true`，但
+`resume_command` 此时不安全——执行它会另起一个和保活进程抢同一份会话文件的新进程。这种会话只能
+由人类回到 `sc` TUI 按 Enter 接回现场，管家 Agent 判断"能不能直接下指令"时应把 `keepalive=true`
+当作"这条会话已经有人在管，只能提示人类去接，不要建议或代为执行 resume_command"的信号。
+
 `list`/`search` 默认输出已经带 `last_user`/`last_agent`（最近一轮真人消息和助手回复，硬截断精简），
 多数情况下看这两个字段就够判断"这条会话在干嘛"，不必为每条候选都跑一次 `sc show`。
 
@@ -113,6 +118,10 @@ sc list --live --status pending --compact # 更进一步：正在跑、且已在
 - `live` / `pid`：`live` 是运行中会话的进程是否真实存活（Claude 用 pid 注册表 + `os.kill`，Codex
   用 `pgrep`+`lsof` 探测持有对应会话文件的进程），不是根据文件时间猜的。`pid` 只在 `live=true`
   时非空，供调用方定位/给该进程发信号；sc 本身不提供拉起/接管等副作用命令，`pid` 只是可见性。
+- `keepalive`：会话是否正挂在 sc 自己的后台保活（tmux）里（人类在 `sc` TUI 里用 Enter/`a` 启动会话时
+  默认会经过这层，SSH 断开也不中断）。为 `true` 时该会话的进程实际跑在保活层里，`resume_command`
+  会另起一个直接抢同一份会话文件的新进程，不应该在这种情况下使用；sc 不提供从命令行直接"接管"
+  保活会话的能力（这属于交互式 TUI 的 Enter 键行为），调用方需要接管时只能提示人类回到 `sc` TUI 操作。
 - `last_user` / `last_agent`：最后一条真人消息和助手最后一轮回复的硬截断摘要（约 120 字），用于
   快速判断会话在干嘛；需要完整对话仍然用 `sc show`。
 - `status`：英文枚举 `done` / `pending` / `aborted` / `unknown`，程序判断用这个字段，不要解析
