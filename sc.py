@@ -809,7 +809,13 @@ def _draw_preview(
     stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
     mouse_hint = "m 关闭鼠标滚轮" if mouse_enabled else "m 开启鼠标滚轮（当前可框选复制）"
     hint = f"↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  {mouse_hint}  Enter 恢复  a 接力  n 新建  Space/q 关闭"
-    stdscr.addnstr(footer_y + 1, 0, hint, width - 1, key_attr)
+    # hint 的真实显示宽度（含中文，约 100 列）常年超过终端宽度；addnstr 的第四个参数按字符数
+    # 截断而不是按显示列数，宽字符会让实际写入列数超过 n。footer 又是屏幕最后一行，一旦写到
+    # 最后一列会触发 ncurses 的“右下角写入”保护性异常（addnwstr() returned ERR）直接崩掉整个
+    # TUI（真实终端 <100 列时必现）。这里用 _fit_cell 按显示宽度截断（留 2 列安全边界），
+    # 保证实际写入列数永远算得出来、不会撞到最后一列。
+    hint_fitted = _fit_cell(hint, max(0, width - 2)).rstrip()
+    stdscr.addnstr(footer_y + 1, 0, hint_fitted, len(hint_fitted), key_attr)
     if max_scroll:
         progress = f"{scroll + 1}/{max_scroll + 1}"
         progress_x = max(0, width - 1 - _text_width(progress))
