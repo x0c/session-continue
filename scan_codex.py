@@ -16,7 +16,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
-from models import ConversationMessage, effective_session_time
+from models import ConversationMessage, effective_session_time, format_message_time
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 SESSION_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
@@ -101,8 +101,7 @@ def _entry_time(entry: dict) -> float | None:
     return _parse_timestamp(entry.get("timestamp")) or _parse_timestamp(payload.get("timestamp"))
 
 
-def _format_display_time(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+_format_display_time = format_message_time
 
 
 def _read_session_head(path: str, max_lines: int = 30) -> list[dict]:
@@ -389,15 +388,15 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                 if payload_type == "user_message":
                     text = str(payload.get("message") or "").strip()
                     if text:
-                        messages.append(ConversationMessage("user", text))
+                        messages.append(ConversationMessage("user", text, _entry_time(entry)))
                 elif payload_type == "agent_message" and payload.get("phase") in (None, "final_answer", "commentary"):
                     text = str(payload.get("message") or "").strip()
                     if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
-                        messages.append(ConversationMessage("assistant", text))
+                        messages.append(ConversationMessage("assistant", text, _entry_time(entry)))
                 elif payload_type == "task_complete":
                     text = str(payload.get("last_agent_message") or "").strip()
                     if text and (not messages or messages[-1].role != "assistant" or messages[-1].text != text):
-                        messages.append(ConversationMessage("assistant", text))
+                        messages.append(ConversationMessage("assistant", text, _entry_time(entry)))
     except OSError:
         return []
     return messages

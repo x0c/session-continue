@@ -143,6 +143,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(plan.argv, ("gemini",))
         self.assertEqual(plan.cwd, td)
 
+    def test_passthrough_plan_prepends_auto_approve_args(self) -> None:
+        plan = default_registry().build_passthrough_plan("claude", ["把测试修到全绿"])
+
+        self.assertEqual(plan.argv, ("claude", "--dangerously-skip-permissions", "把测试修到全绿"))
+        self.assertIsNone(plan.cwd)
+
+    def test_passthrough_plan_does_not_duplicate_user_supplied_auto_approve_arg(self) -> None:
+        plan = default_registry().build_passthrough_plan(
+            "codex", ["--dangerously-bypass-approvals-and-sandbox", "resume"]
+        )
+
+        self.assertEqual(
+            plan.argv,
+            ("codex", "--dangerously-bypass-approvals-and-sandbox", "resume"),
+        )
+
+    def test_passthrough_plan_dispatches_to_registered_runtime(self) -> None:
+        registry = RuntimeRegistry((*default_registry(), FakeRuntime()))
+
+        plan = registry.build_passthrough_plan("gemini", ["--foo"])
+
+        self.assertEqual(plan.argv, ("gemini", "--foo"))
+        self.assertIsNone(plan.cwd)
+
     def test_session_key_is_runtime_scoped(self) -> None:
         claude = {"source": "claude", "id": "same"}
         codex = {"source": "codex", "id": "same"}

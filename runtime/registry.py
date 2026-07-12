@@ -59,6 +59,16 @@ class RuntimeRegistry:
         """构造不关联任何已有会话历史的空白新会话计划。"""
         return self.get(request.target_runtime_id).build_new_session_plan(request.cwd)
 
+    def build_passthrough_plan(self, runtime_id: str, user_args: Iterable[str]) -> LaunchPlan:
+        """构造直启透传计划：`sc <runtime> [参数…]`，参数原样交给运行时，只垫上默认全自动放行参数。
+
+        用户已经在 user_args 里显式带了该运行时的放行参数时不重复添加，尊重用户的显式选择。
+        """
+        runtime = self.get(runtime_id)
+        user_args = tuple(user_args)
+        extra = tuple(arg for arg in runtime.auto_approve_args if arg not in user_args)
+        return LaunchPlan(argv=(runtime.executable, *extra, *user_args), cwd=None)
+
 
 def default_registry() -> RuntimeRegistry:
     """创建默认运行时注册表；新增运行时只需在这里注册一次。"""

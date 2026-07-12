@@ -38,6 +38,7 @@ class BaseRuntime(ABC):
     display_name: str
     executable: str
     history_reading_hint: str
+    auto_approve_args: tuple[str, ...] = ()  # 全自动放行参数（跳过权限审批），供直启子命令复用
 
     def is_available(self) -> bool:
         return shutil.which(self.executable) is not None

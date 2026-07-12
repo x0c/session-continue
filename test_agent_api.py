@@ -163,6 +163,24 @@ class AgentApiTests(unittest.TestCase):
         result = agent_api.cmd_show(args, self.registry)
         self.assertEqual(result["data"]["message_count_shown"], 4)  # --full 忽略 --messages
 
+    def test_cmd_show_messages_expose_readonly_time_fields(self) -> None:
+        session = _session(self.history_path, id="bbbb2222-0000-0000-0000-000000000000", short_id="bbbb2222")
+        messages = [
+            ConversationMessage("user", "有时间戳的消息", 1_700_000_000.0),
+            ConversationMessage("assistant", "老格式没有时间戳的消息"),
+        ]
+        runtime = FakeRuntime([session], {session["id"]: messages})
+        registry = RuntimeRegistry((runtime,))
+
+        args = argparse_namespace(session="bbbb2222", messages=None, full=False, limit=200)
+        result = agent_api.cmd_show(args, registry)
+
+        first, second = result["data"]["messages"]
+        self.assertEqual(first["time"], agent_api.format_message_time(1_700_000_000.0))
+        self.assertEqual(first["mtime"], 1_700_000_000.0)
+        self.assertIsNone(second["time"])
+        self.assertIsNone(second["mtime"])
+
     def test_cmd_show_fields_overrides_compact_default(self) -> None:
         # oc agents（OpenConductor 控制面）依赖 --fields 显式取回 cwd/pid：
         # --compact 单独使用时默认字段集（DEFAULT_SHOW_FIELDS）不含这两个字段，

@@ -21,6 +21,9 @@
     sc context <会话ID前缀>  # 生成接续该会话所需的上下文数据包
     sc plan continue <会话ID前缀> --instruction "继续完成剩余工作"  # 只生成后台续接计划
     sc describe          # 查看全部子命令的参数与输出字段说明
+    sc claude [参数…]     # 直启：新建 Claude 会话，参数原样透传，默认全自动放行+后台保活
+    sc codex [参数…]      # 直启：新建 Codex 会话，同上
+    sc --no-keepalive claude [参数…]  # 直启但不包后台保活
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_api
 import keepalive
 import titles
-from models import ConversationMessage, LaunchRequest, NewSessionRequest, session_key
+from models import ConversationMessage, LaunchRequest, NewSessionRequest, format_message_time, session_key
 from runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch, usable_cwd
 
 
@@ -140,22 +143,27 @@ def _wrap_preview_text(text: str, width: int) -> list[str]:
 
 def _preview_lines(
     messages: list[ConversationMessage], runtime_name: str, width: int,
-) -> list[tuple[str, str]]:
-    """把真实会话消息整理为带角色样式的聊天记录行。"""
+) -> list[tuple[str, str, str]]:
+    """把真实会话消息整理为带角色样式的聊天记录行。
+
+    每行是 (kind, text, dim_suffix) 三元组：角色行的 dim_suffix 携带发送时间（用淡色
+    单独叠绘，不和角色名共用同一个高亮色），消息缺时间戳（老格式历史）或其余行留空。
+    """
     content_width = max(1, width - 2)
     if not messages:
-        return [("dim", "没有可预览的用户消息或最终答复")]
+        return [("dim", "没有可预览的用户消息或最终答复", "")]
 
-    lines: list[tuple[str, str]] = []
+    lines: list[tuple[str, str, str]] = []
     for message in messages:
         if lines:
-            lines.append(("blank", ""))
+            lines.append(("blank", "", ""))
+        time_suffix = f"  · {format_message_time(message.timestamp)}" if message.timestamp else ""
         if message.role == "user":
-            lines.append(("user", "● 你"))
+            lines.append(("user", "● 你", time_suffix))
         else:
-            lines.append(("assistant", f"◆ {runtime_name}"))
+            lines.append(("assistant", f"◆ {runtime_name}", time_suffix))
         lines.extend(
-            ("body", f"  {line}")
+            ("body", f"  {line}", "")
             for line in _wrap_preview_text(message.text.strip(), content_width)
         )
     return lines
@@ -370,7 +378,9 @@ class SessionStore:
         self.dirty = threading.Event()
         self.cache = titles.load_cache()
         self.generating: set[str] = set()  # 仍是临时兜底、等待后台进程产出的会话键（转圈圈）
-        self.conversations: dict[str, list[ConversationMessage]] = {}
+        # 值是 (读取时的历史文件 mtime, 消息列表)；文件 mtime 变化就重读，
+        # 修掉"同一次 sc 内 / 关闭预览重开还是旧内容"的问题。
+        self.conversations: dict[str, tuple[float | None, list[ConversationMessage]]] = {}
         self._cache_mtime: float = self._cache_file_mtime()
         self._projects: list[dict] | None = None  # 项目聚合缓存，仅在 load() 时失效
 
@@ -438,15 +448,22 @@ class SessionStore:
             return self.display_titles.get(session_key(session), session["fallback_title"])
 
     def get_conversation(self, session: dict) -> list[ConversationMessage]:
-        """按需读取并缓存选中会话的真实聊天记录。"""
+        """按需读取并缓存选中会话的真实聊天记录；历史文件 mtime 变化（有新写入）时自动
+        重读，供预览页关闭重开和停留期间的轮询刷新使用。"""
         key = session_key(session)
+        path = str(session.get("path") or "")
+        try:
+            mtime = os.stat(path).st_mtime if path else None
+        except OSError:
+            mtime = None
         with self.lock:
-            if key in self.conversations:
-                return list(self.conversations[key])
+            cached = self.conversations.get(key)
+            if cached is not None and cached[0] == mtime:
+                return list(cached[1])
         runtime = self.registry.get(str(session.get("source") or ""))
         messages = runtime.load_conversation(session)
         with self.lock:
-            self.conversations[key] = list(messages)
+            self.conversations[key] = (mtime, list(messages))
         return messages
 
 
@@ -743,13 +760,16 @@ def _draw_preview(
     session_id: str,
     mouse_enabled: bool,
     scroll: int,
-) -> int:
-    """全屏绘制聊天记录，返回修正后的滚动位置。"""
+) -> tuple[int, int]:
+    """全屏绘制聊天记录，返回 (修正后的滚动位置, 当前最大滚动值)。
+
+    调用方需要 max_scroll 判断"是否停在最底部"，以便新消息到达时决定要不要自动跟随。
+    """
     stdscr.erase()
     height, width = stdscr.getmaxyx()
     if height < 5 or width < 20:
         stdscr.refresh()
-        return 0
+        return 0, 0
 
     dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
     key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
@@ -769,7 +789,7 @@ def _draw_preview(
         id_x = max(0, width - 1 - _text_width(id_label))
         stdscr.addnstr(0, id_x, id_label, width - 1 - id_x, dim)
     stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
-    for row, (kind, line) in enumerate(lines[scroll:scroll + visible_height]):
+    for row, (kind, line, suffix) in enumerate(lines[scroll:scroll + visible_height]):
         if kind == "user":
             attr = user_attr
         elif kind == "assistant":
@@ -779,6 +799,11 @@ def _draw_preview(
         else:
             attr = curses.A_NORMAL
         stdscr.addnstr(2 + row, 1, line, inner_width, attr)
+        if suffix:
+            suffix_x = 1 + _text_width(line)
+            remaining = inner_width - _text_width(line)
+            if remaining > 0:
+                stdscr.addnstr(2 + row, suffix_x, suffix, remaining, dim)
 
     footer_y = height - 2
     stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
@@ -790,7 +815,7 @@ def _draw_preview(
         progress_x = max(0, width - 1 - _text_width(progress))
         stdscr.addnstr(footer_y + 1, progress_x, progress, len(progress), dim)
     stdscr.refresh()
-    return scroll
+    return scroll, max_scroll
 
 
 PREVIEW_MOUSE_SCROLL_LINES = 3  # 滚轮一格滚动的行数，参照 less/vim 等终端工具的常见默认值
@@ -832,21 +857,37 @@ def _show_preview(
     上报期间，终端会把所有鼠标事件——包括拖拽选中——都发给本程序，原生框选会失效，
     这是终端鼠标协议的固有限制，不是可以只订阅滚轮事件就绕开的）。退出预览页（含所有
     提前 return 路径）必须关闭鼠标上报，否则会连带影响主列表页/侧边栏的鼠标选中。
+
+    实时刷新：`_run` 已把 stdscr 设为 200ms 超时非阻塞 getch，这里复用同一节奏——每约
+    1 秒检查一次会话历史文件是否有新写入（`store.get_conversation` 内部按 mtime 判断，
+    没变化就是一次 os.stat，开销可忽略）。只有停留在最底部（正在追最新进展）才自动
+    跟随新消息滚到底部；已经往上翻阅历史时保持当前位置不动，不打扰阅读。
     """
     messages = store.get_conversation(session)
     runtime_name = store.registry.get(str(session.get("source") or "")).display_name
     session_id = str(session.get("id") or "")
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
+    max_scroll = 0
     mouse_enabled = True
     _apply_preview_mousemask(mouse_enabled)
+    frame = 0
+    POLL_EVERY = 5  # 200ms * 5 ≈ 1s，与主列表页的标题缓存轮询同频
     try:
         while True:
-            scroll = _draw_preview(stdscr, messages, title, runtime_name, session_id, mouse_enabled, scroll)
+            scroll, max_scroll = _draw_preview(
+                stdscr, messages, title, runtime_name, session_id, mouse_enabled, scroll,
+            )
             try:
                 ch = stdscr.getch()
             except curses.error:
                 continue
             if ch == -1:
+                frame += 1
+                if frame % POLL_EVERY == 0:
+                    at_bottom = scroll >= max_scroll
+                    messages = store.get_conversation(session)
+                    if at_bottom:
+                        scroll = 10 ** 9  # 停在底部时自动跟随新消息
                 continue
             if ch in (ord(" "), ord("q")):
                 stdscr.clear()
@@ -1304,11 +1345,40 @@ def _spawn_title_daemon(limit: int) -> None:
         pass  # 拉起失败仅退化为「只显示临时兜底标题」，不影响主流程
 
 
+def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
+    """处理 `sc [--no-keepalive] <runtime> [参数…]` 直启透传子命令。
+
+    参数原样交给底层运行时（`registry.build_passthrough_plan` 只垫上默认全自动放行参数，
+    用户已显式带了就不重复），默认包进后台保活，`--no-keepalive` 可临时关闭。
+    """
+    no_keepalive = argv and argv[0] == "--no-keepalive"
+    rest = argv[1:] if no_keepalive else argv
+    runtime_id, user_args = rest[0], rest[1:]
+    plan = registry.build_passthrough_plan(runtime_id, user_args)
+    if keepalive.enabled(no_keepalive):
+        plan = keepalive.wrap_plan(plan, runtime_id, keepalive.new_session_ident())
+    try:
+        execute_launch(plan)
+    except LaunchError as exc:
+        print(f"启动失败：{exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     # list/search/show/context/plan/describe 是面向 Agent 的机器可读子命令，整体转发给
     # agent_api，不与下面的 TUI/--json 旧参数共用同一个 parser。
     if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_ROOT_NAMES:
         sys.exit(agent_api.dispatch(sys.argv[1:]))
+
+    # `sc claude …` / `sc codex …`（可选前置 --no-keepalive）是直启透传子命令，同样整体
+    # 绕开下面的 TUI/--json 旧参数 parser，此处只需运行时 ID 集合，不做真实扫描。
+    _direct_launch_argv = sys.argv[1:]
+    _direct_launch_probe = (
+        _direct_launch_argv[1:] if _direct_launch_argv[:1] == ["--no-keepalive"] else _direct_launch_argv
+    )
+    if _direct_launch_probe and _direct_launch_probe[0] in default_registry().ids:
+        _dispatch_direct_launch(_direct_launch_argv, default_registry())
+        return
 
     parser = argparse.ArgumentParser(
         description=(

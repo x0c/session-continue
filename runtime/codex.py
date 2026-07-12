@@ -17,6 +17,7 @@ class CodexRuntime(BaseRuntime):
         "Codex rollout JSONL；重点关注 session_meta、event_msg、response_item，"
         "以及 user_message、agent_message、task_complete、工具调用与结果。"
     )
+    auto_approve_args = ("--dangerously-bypass-approvals-and-sandbox",)
 
     def scan_sessions(self, limit: int) -> list[SessionInfo]:
         return scan_codex.scan_sessions(limit=limit)
@@ -31,7 +32,7 @@ class CodexRuntime(BaseRuntime):
                 "resume",
                 "-c",
                 'model_reasoning_effort="high"',
-                "--dangerously-bypass-approvals-and-sandbox",
+                *self.auto_approve_args,
                 str(session["id"]),
             ),
             cwd=usable_cwd(str(session.get("cwd") or "")),
@@ -46,7 +47,7 @@ class CodexRuntime(BaseRuntime):
                 "resume",
                 "-c",
                 'model_reasoning_effort="high"',
-                "--dangerously-bypass-approvals-and-sandbox",
+                *self.auto_approve_args,
                 str(session["id"]),
                 instruction,
             ),
@@ -60,7 +61,7 @@ class CodexRuntime(BaseRuntime):
                 self.executable,
                 "-c",
                 'model_reasoning_effort="high"',
-                "--dangerously-bypass-approvals-and-sandbox",
+                *self.auto_approve_args,
                 "--add-dir",
                 history_dir,
                 handoff.render_prompt(),
@@ -74,7 +75,7 @@ class CodexRuntime(BaseRuntime):
                 self.executable,
                 "-c",
                 'model_reasoning_effort="high"',
-                "--dangerously-bypass-approvals-and-sandbox",
+                *self.auto_approve_args,
             ),
             cwd=usable_cwd(cwd),
         )

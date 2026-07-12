@@ -996,6 +996,68 @@ class ConversationPreviewTests(unittest.TestCase):
 
         self.assertEqual([(message.role, message.text) for message in messages], [("user", "问题")])
 
+    def test_claude_conversation_carries_message_timestamp(self) -> None:
+        entries = [
+            {"type": "user", "timestamp": "2026-07-01T10:00:00Z", "message": {"content": "第一个问题"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:05Z",
+                "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "第一个答复"}]},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_claude.load_conversation(str(path))
+
+        self.assertEqual([message.timestamp for message in messages],
+                          [scan_claude._parse_timestamp("2026-07-01T10:00:00Z"),
+                           scan_claude._parse_timestamp("2026-07-01T10:00:05Z")])
+
+    def test_claude_legacy_answer_keeps_timestamp_of_original_entry(self) -> None:
+        """stop_reason 为 None 的历史遗留格式答复要等下一条用户消息（或文件末尾）才会被
+        flush 进 messages，时间戳必须是这条 assistant 记录自己的时间，不是 flush 发生时的时间。"""
+        entries = [
+            {"type": "user", "timestamp": "2026-07-01T10:00:00Z", "message": {"content": "问题"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:05Z",
+                "message": {"stop_reason": None, "content": [{"type": "text", "text": "遗留格式答复"}]},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_claude.load_conversation(str(path))
+
+        self.assertEqual(messages[-1].role, "assistant")
+        self.assertEqual(messages[-1].timestamp, scan_claude._parse_timestamp("2026-07-01T10:00:05Z"))
+
+    def test_codex_conversation_carries_message_timestamp(self) -> None:
+        entries = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-01T10:00:00Z",
+                "payload": {"type": "user_message", "message": "用户问题"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-01T10:00:03Z",
+                "payload": {"type": "agent_message", "phase": "final_answer", "message": "最终答复"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_codex.load_conversation(str(path))
+
+        self.assertEqual([message.timestamp for message in messages],
+                          [scan_codex._parse_timestamp("2026-07-01T10:00:00Z"),
+                           scan_codex._parse_timestamp("2026-07-01T10:00:03Z")])
+
 
 class TuiLayoutTests(unittest.TestCase):
     def test_session_store_uses_compact_title_before_background_generation(self) -> None:
@@ -1084,6 +1146,48 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(store.get_conversation(session), [sc.ConversationMessage("user", "问题")])
         runtime.load_conversation.assert_called_once_with(session)
 
+    def test_conversation_cache_invalidates_when_history_file_mtime_changes(self) -> None:
+        """预览实时刷新和"关闭重开还是旧内容"两个诉求的根因是同一处：缓存必须按历史文件
+        mtime 失效，而不是按会话键永久缓存到进程退出。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("{}\n", encoding="utf-8")
+            session = {
+                "source": "claude",
+                "id": "abc",
+                "short_id": "abc",
+                "path": str(path),
+                "mtime": 1,
+                "size_bytes": 1,
+                "size_kb": 1,
+                "native_title": None,
+                "fallback_title": "测试会话",
+            }
+            runtime = mock.Mock()
+            runtime.id = "claude"
+            runtime.display_name = "Claude"
+            runtime.scan_sessions.return_value = [session]
+            runtime.load_conversation.side_effect = [
+                [sc.ConversationMessage("assistant", "旧内容")],
+                [sc.ConversationMessage("assistant", "新内容")],
+            ]
+            registry = sc.RuntimeRegistry((runtime,))
+
+            with mock.patch.object(sc.titles, "load_cache", return_value={}):
+                store = sc.SessionStore(limit=20, registry=registry)
+                store.load()
+
+            self.assertEqual(store.get_conversation(session)[0].text, "旧内容")
+            self.assertEqual(store.get_conversation(session)[0].text, "旧内容")
+            runtime.load_conversation.assert_called_once_with(session)
+
+            # 模拟历史文件被追加写入：mtime 前进，下一次 get_conversation 必须重读，不能沿用旧缓存。
+            future = os.stat(path).st_mtime + 5
+            os.utime(path, (future, future))
+
+            self.assertEqual(store.get_conversation(session)[0].text, "新内容")
+            self.assertEqual(runtime.load_conversation.call_count, 2)
+
     def test_format_relative_time_thresholds(self) -> None:
         now = 1_000_000.0
         self.assertEqual(sc._format_relative_time(now - 5, now), "刚刚")
@@ -1112,13 +1216,28 @@ class TuiLayoutTests(unittest.TestCase):
         ]
 
         lines = sc._preview_lines(messages, "Codex", 16)
-        text_lines = [line for _, line in lines]
+        text_lines = [line for _, line, _ in lines]
 
         self.assertEqual(text_lines[0], "● 你")
         self.assertIn("◆ Codex", text_lines)
         self.assertEqual(text_lines.count("● 你"), 2)
         self.assertEqual(text_lines.count("◆ Codex"), 2)
         self.assertTrue(all(sc._text_width(line) <= 16 for line in text_lines))
+
+    def test_preview_lines_show_timestamp_suffix_only_when_available(self) -> None:
+        ts = 1_780_000_000.0
+        messages = [
+            sc.ConversationMessage("user", "带时间戳的消息", ts),
+            sc.ConversationMessage("assistant", "老格式缺时间戳的消息"),
+        ]
+
+        lines = sc._preview_lines(messages, "Claude", 40)
+        role_lines = [(kind, line, suffix) for kind, line, suffix in lines if kind in ("user", "assistant")]
+
+        self.assertEqual(role_lines[0][1], "● 你")
+        self.assertIn(sc.format_message_time(ts), role_lines[0][2])
+        self.assertEqual(role_lines[1][1], "◆ Claude")
+        self.assertEqual(role_lines[1][2], "")
 
     def test_preview_uses_full_terminal_and_clears_before_returning(self) -> None:
         screen = mock.Mock()
@@ -1143,7 +1262,7 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": full_id, "short_id": "abc12345"}
         ui = sc.UIState(source="claude")
         screen.getch.return_value = ord("q")
-        with mock.patch.object(sc, "_draw_preview", return_value=0) as draw:
+        with mock.patch.object(sc, "_draw_preview", return_value=(0, 0)) as draw:
             result = sc._show_preview(screen, store, ui, session, "标题", False)
         draw.assert_called_once_with(screen, messages, "标题", "Claude", full_id, True, 10 ** 9)
         self.assertIsNone(result)
@@ -1151,7 +1270,7 @@ class TuiLayoutTests(unittest.TestCase):
 
         screen.clear.reset_mock()
         screen.getch.return_value = 10
-        with mock.patch.object(sc, "_draw_preview", return_value=0):
+        with mock.patch.object(sc, "_draw_preview", return_value=(0, 0)):
             result = sc._show_preview(screen, store, ui, session, "标题", False)
         self.assertEqual(result, sc.LaunchRequest(session, "claude", "标题"))
         screen.clear.assert_called_once_with()
@@ -1181,7 +1300,7 @@ class TuiLayoutTests(unittest.TestCase):
 
         screen.getch.side_effect = [curses.KEY_MOUSE, ord("q")]
         with (
-            mock.patch.object(sc, "_draw_preview", return_value=5) as draw,
+            mock.patch.object(sc, "_draw_preview", return_value=(5, 10)) as draw,
             mock.patch.object(sc.curses, "mousemask") as mousemask,
             mock.patch.object(sc, "_preview_mouse_scroll_delta", return_value=sc.PREVIEW_MOUSE_SCROLL_LINES),
         ):
@@ -1206,7 +1325,7 @@ class TuiLayoutTests(unittest.TestCase):
 
         screen.getch.side_effect = [ord("m"), ord("m"), ord("q")]
         with (
-            mock.patch.object(sc, "_draw_preview", return_value=0) as draw,
+            mock.patch.object(sc, "_draw_preview", return_value=(0, 0)) as draw,
             mock.patch.object(sc.curses, "mousemask") as mousemask,
         ):
             sc._show_preview(screen, store, ui, session, "标题", False)
@@ -1454,6 +1573,67 @@ class SessionActionTests(unittest.TestCase):
         ):
             result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
         self.assertIs(result, sc._ACTION_STAY)
+
+
+class DirectLaunchTests(unittest.TestCase):
+    """`sc claude [参数…]` / `sc codex [参数…]` 直启透传子命令的分发逻辑。"""
+
+    def _registry_returning(self, plan: LaunchPlan) -> mock.Mock:
+        registry = mock.Mock()
+        registry.build_passthrough_plan.return_value = plan
+        return registry
+
+    def test_passes_through_args_and_wraps_with_keepalive_by_default(self) -> None:
+        plan = LaunchPlan(("claude", "--dangerously-skip-permissions", "把测试修到全绿"), None)
+        wrapped = LaunchPlan(("tmux", "-L", "sc-keepalive", "new-session", "-A", "-s", "sc-claude-xxxx"), None)
+        registry = self._registry_returning(plan)
+
+        with (
+            mock.patch.object(sc, "keepalive") as keepalive_mock,
+            mock.patch.object(sc, "execute_launch") as execute_launch,
+        ):
+            keepalive_mock.enabled.return_value = True
+            keepalive_mock.new_session_ident.return_value = "xxxx"
+            keepalive_mock.wrap_plan.return_value = wrapped
+
+            sc._dispatch_direct_launch(["claude", "把测试修到全绿"], registry)
+
+        registry.build_passthrough_plan.assert_called_once_with("claude", ["把测试修到全绿"])
+        keepalive_mock.enabled.assert_called_once_with(False)
+        keepalive_mock.wrap_plan.assert_called_once_with(plan, "claude", "xxxx")
+        execute_launch.assert_called_once_with(wrapped)
+
+    def test_no_keepalive_prefix_strips_flag_and_skips_wrap(self) -> None:
+        plan = LaunchPlan(("codex", "--dangerously-bypass-approvals-and-sandbox", "resume"), None)
+        registry = self._registry_returning(plan)
+
+        with (
+            mock.patch.object(sc, "keepalive") as keepalive_mock,
+            mock.patch.object(sc, "execute_launch") as execute_launch,
+        ):
+            keepalive_mock.enabled.return_value = False
+
+            sc._dispatch_direct_launch(["--no-keepalive", "codex", "resume"], registry)
+
+        registry.build_passthrough_plan.assert_called_once_with("codex", ["resume"])
+        keepalive_mock.enabled.assert_called_once_with(True)
+        keepalive_mock.wrap_plan.assert_not_called()
+        execute_launch.assert_called_once_with(plan)
+
+    def test_launch_error_prints_message_and_exits_nonzero(self) -> None:
+        plan = LaunchPlan(("claude",), None)
+        registry = self._registry_returning(plan)
+
+        with (
+            mock.patch.object(sc, "keepalive") as keepalive_mock,
+            mock.patch.object(sc, "execute_launch", side_effect=sc.LaunchError("未找到 claude 命令")),
+        ):
+            keepalive_mock.enabled.return_value = False
+
+            with self.assertRaises(SystemExit) as ctx:
+                sc._dispatch_direct_launch(["claude"], registry)
+
+        self.assertEqual(ctx.exception.code, 1)
 
 
 class HandoffDigestTests(unittest.TestCase):

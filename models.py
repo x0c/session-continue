@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, TypedDict
 
 
@@ -51,6 +52,11 @@ def effective_session_time(file_mtime: float, event_time: float | None) -> tuple
     return file_mtime, "file_mtime"
 
 
+def format_message_time(timestamp: float) -> str:
+    """格式化单条消息的发送时间，供预览页使用；与列表页时间格式保持一致。"""
+    return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+
+
 def session_key(session: SessionInfo | dict) -> str:
     """返回跨运行时唯一的会话键，避免不同运行时的 ID 相互覆盖。"""
     runtime_id = str(session.get("source") or "unknown")
@@ -67,6 +73,7 @@ class ConversationMessage:
 
     role: Literal["user", "assistant"]
     text: str
+    timestamp: float | None = None  # 该条消息的原始发送时间；老格式历史解析不出时留空，预览不标注
 
 
 @dataclass(frozen=True)

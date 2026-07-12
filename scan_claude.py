@@ -17,7 +17,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
-from models import ConversationMessage, effective_session_time
+from models import ConversationMessage, effective_session_time, format_message_time
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects/")
 
@@ -75,8 +75,7 @@ def _entry_time(entry: dict) -> float | None:
     return _parse_timestamp(entry.get("timestamp")) or _parse_timestamp(entry.get("snapshot", {}).get("timestamp"))
 
 
-def _format_display_time(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+_format_display_time = format_message_time
 
 
 def _read_head(path: str, max_lines: int = 300) -> list[dict]:
@@ -518,14 +517,16 @@ def load_conversation(path: str) -> list[ConversationMessage]:
     """
     messages: list[ConversationMessage] = []
     pending_legacy_answer: str | None = None
+    pending_legacy_ts: float | None = None
 
     def flush_legacy_answer() -> None:
-        nonlocal pending_legacy_answer
+        nonlocal pending_legacy_answer, pending_legacy_ts
         if pending_legacy_answer and (
             not messages or messages[-1].role != "assistant" or messages[-1].text != pending_legacy_answer
         ):
-            messages.append(ConversationMessage("assistant", pending_legacy_answer))
+            messages.append(ConversationMessage("assistant", pending_legacy_answer, pending_legacy_ts))
         pending_legacy_answer = None
+        pending_legacy_ts = None
 
     try:
         with open(path, encoding="utf-8", errors="replace") as file:
@@ -552,7 +553,7 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     text = _extract_text(message.get("content", ""))
                     if text and text != _INTERRUPTED_MARKER:
                         flush_legacy_answer()
-                        messages.append(ConversationMessage("user", text))
+                        messages.append(ConversationMessage("user", text, _entry_time(entry)))
                     continue
 
                 if entry_type != "assistant":
@@ -569,9 +570,11 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                     text = "\n\n".join(text_parts)
                     if message.get("stop_reason") is None:
                         pending_legacy_answer = text
+                        pending_legacy_ts = _entry_time(entry)
                     elif not messages or messages[-1].role != "assistant" or messages[-1].text != text:
                         pending_legacy_answer = None
-                        messages.append(ConversationMessage("assistant", text))
+                        pending_legacy_ts = None
+                        messages.append(ConversationMessage("assistant", text, _entry_time(entry)))
     except OSError:
         return []
     flush_legacy_answer()

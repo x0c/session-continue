@@ -17,7 +17,8 @@ Keywords: Claude Code session manager, Codex CLI resume, terminal TUI, AI coding
 
 - Browse recent Claude Code and Codex CLI sessions from one terminal screen.
 - Resume with the original runtime using native commands such as `claude --resume` and `codex resume`.
-- Preview the user messages and final assistant replies before resuming.
+- Preview the user messages and final assistant replies before resuming, each with a timestamp when
+  the history format has one; the preview page refreshes automatically while a session keeps writing.
 - Hand off unfinished work between runtimes without rewriting or faking session files.
 - Keep generated titles in a local cache so repeat launches stay fast.
 - Use JSON output for scripts and launchers.
@@ -98,6 +99,21 @@ sc --json --limit 5 # script-friendly small result set
 ```
 
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
+
+## Direct Launch
+
+`sc claude [args...]` and `sc codex [args...]` start a brand-new session directly, skipping the
+TUI. Everything after the runtime name is passed through unchanged to the underlying `claude`/`codex`
+command; `sc` only prepends the runtime's auto-approve flag (`--dangerously-skip-permissions` for
+Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex) unless you already included it
+yourself, and wraps the launch in [Keep-Alive](#keep-alive-survive-ssh-disconnects) by default.
+
+```bash
+sc claude                       # blank auto-approved Claude session, kept alive in the background
+sc claude Fix the failing tests # same, with a first instruction passed straight to claude
+sc codex resume                 # `codex resume`, auto-approved and kept alive
+sc --no-keepalive claude        # direct launch without the background tmux wrapper
+```
 
 ## Keep-Alive (survive SSH disconnects)
 
@@ -195,7 +211,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 
 | Path | Purpose |
 | --- | --- |
-| `sc.py` | curses TUI, preview screen, JSON output, and process handoff |
+| `sc.py` | curses TUI, preview screen, JSON output, direct-launch subcommand dispatch, and process handoff |
 | `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
 | `keepalive.py` | tmux-backed launch wrapper: keep-alive on/off detection, wrap/attach launch plans, idle reaping (config for the dedicated tmux server is inlined here, not a separate file — see maintainer notes) |
 | `models.py` | shared session, handoff, and launch-plan data models |

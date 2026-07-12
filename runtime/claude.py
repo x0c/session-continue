@@ -17,6 +17,7 @@ class ClaudeRuntime(BaseRuntime):
         "Claude Code JSONL；重点关注 user、assistant、tool_use、tool_result、"
         "last-prompt 等记录及其 message.content。"
     )
+    auto_approve_args = ("--dangerously-skip-permissions",)
 
     def scan_sessions(self, limit: int) -> list[SessionInfo]:
         return scan_claude.scan_sessions(limit=limit)
@@ -28,7 +29,7 @@ class ClaudeRuntime(BaseRuntime):
         return LaunchPlan(
             argv=(
                 self.executable,
-                "--dangerously-skip-permissions",
+                *self.auto_approve_args,
                 "--resume",
                 str(session["id"]),
             ),
@@ -40,7 +41,7 @@ class ClaudeRuntime(BaseRuntime):
         return LaunchPlan(
             argv=(
                 self.executable,
-                "--dangerously-skip-permissions",
+                *self.auto_approve_args,
                 "--resume",
                 str(session["id"]),
                 "--print",
@@ -56,7 +57,7 @@ class ClaudeRuntime(BaseRuntime):
                 self.executable,
                 "--add-dir",
                 history_dir,
-                "--dangerously-skip-permissions",
+                *self.auto_approve_args,
                 handoff.render_prompt(),
             ),
             cwd=usable_cwd(handoff.original_cwd),
@@ -66,7 +67,7 @@ class ClaudeRuntime(BaseRuntime):
         return LaunchPlan(
             argv=(
                 self.executable,
-                "--dangerously-skip-permissions",
+                *self.auto_approve_args,
             ),
             cwd=usable_cwd(cwd),
         )

@@ -17,7 +17,7 @@ import sys
 
 import keepalive
 import titles
-from models import session_key
+from models import format_message_time, session_key
 from runtime import LaunchError, default_registry
 from runtime.base import usable_cwd
 
@@ -381,7 +381,15 @@ def cmd_show(args, registry) -> dict:
         n = args.messages if args.messages else 20
         messages = messages[-n:]
 
-    payload["messages"] = [{"role": m.role, "text": m.text} for m in messages]
+    payload["messages"] = [
+        {
+            "role": m.role,
+            "text": m.text,
+            "time": format_message_time(m.timestamp) if m.timestamp else None,
+            "mtime": m.timestamp,
+        }
+        for m in messages
+    ]
     payload["message_count_shown"] = len(payload["messages"])
     payload["message_count_total"] = total_messages
 
@@ -582,7 +590,7 @@ COMMANDS = [
         ],
         "fields": {
             "...": "与 list 命令的字段相同",
-            "messages": "[{role: user|assistant, text}]，按时间顺序的用户消息和每轮最终答复；Monitor/task-notification 等系统注入事件已过滤，不出现在这里",
+            "messages": "[{role: user|assistant, text, time, mtime}]，按时间顺序的用户消息和每轮最终答复；time 为人类可读发送时间、mtime 为对应 Unix 时间戳，历史格式解析不出时间时两者均为 null；Monitor/task-notification 等系统注入事件已过滤，不出现在这里",
             "message_count_shown": "本次实际返回的消息条数",
             "message_count_total": "该会话可提取的消息总数",
             "output_path": "--out 模式下写入的 JSON 文件绝对路径",
