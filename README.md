@@ -9,6 +9,10 @@ Fast terminal session picker for Claude Code and Codex CLI.
 
 Keywords: Claude Code session manager, Codex CLI resume, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
 
+![Session list across Claude Code and Codex CLI](docs/screenshots/list.png)
+
+![Full-screen conversation preview](docs/screenshots/preview.png)
+
 ## Why Use It
 
 - Browse recent Claude Code and Codex CLI sessions from one terminal screen.
