@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -393,6 +394,27 @@ class SessionStore:
 
     def load(self) -> None:
         scanned = self.registry.scan_all(self.limit)
+        self._merge_scanned(scanned)
+
+    def refresh(self) -> bool:
+        """后台周期性重扫磁盘，把新增/结束的会话并入当前列表。
+
+        与 load() 共用合并逻辑，唯一区别是返回「会话集合是否真的变了」，
+        供调用方只在有变化时才 dirty.set()，避免主循环无谓重定位光标。
+        """
+        scanned = self.registry.scan_all(self.limit)
+        before = self._sessions_signature()
+        self._merge_scanned(scanned)
+        return self._sessions_signature() != before
+
+    def _sessions_signature(self) -> tuple:
+        with self.lock:
+            return tuple(
+                (runtime_id, tuple(session_key(session) for session in bucket))
+                for runtime_id, bucket in sorted(self.sessions.items())
+            )
+
+    def _merge_scanned(self, scanned: dict[str, list[dict]]) -> None:
         # 每个适配器负责按时间倒序返回，无需在界面层二次排序
         keepalive.annotate([session for bucket in scanned.values() for session in bucket])
 
@@ -785,7 +807,7 @@ def _draw_preview(
     stdscr.addnstr(0, 0, header, width - 1, user_attr)
     if session_id:
         # 展示完整会话 ID（而非 short_id 前缀），方便直接复制去跑 `claude --resume`/`codex resume` 等原生命令。
-        id_label = f" ID {session_id} "
+        id_label = f" Session ID {session_id} "
         id_x = max(0, width - 1 - _text_width(id_label))
         stdscr.addnstr(0, id_x, id_label, width - 1 - id_x, dim)
     stdscr.addnstr(1, 0, "─" * (width - 1), width - 1, dim)
@@ -1130,21 +1152,77 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
         elif ui.proj_idx >= ui.sb_top + list_height:
             ui.sb_top = ui.proj_idx - list_height + 1
 
-    frame = 0
+    # 记住"用户当前看的是哪个会话/哪个项目"，供后台重扫改变列表顺序或增删条目后，
+    # 把光标和侧边栏选中项定位回原处，而不是被新列表的下标错位带偏或跳回开头。
+    last_session_key: str | None = None
+    last_cwd_key: str | None = None
+
+    def _remember_selection(sidebar_visible: bool) -> None:
+        nonlocal last_session_key, last_cwd_key
+        sessions_now = _visible_sessions(store, ui, sidebar_visible)
+        if sessions_now and 0 <= ui.idx < len(sessions_now):
+            last_session_key = session_key(sessions_now[ui.idx])
+        projects_now = store.projects()
+        if ui.proj_idx > 0 and ui.proj_idx - 1 < len(projects_now):
+            last_cwd_key = projects_now[ui.proj_idx - 1]["cwd_key"]
+        else:
+            last_cwd_key = None  # "全部项目" 或越界，无项目可定位
+
+    def _relocate_after_refresh(sidebar_visible: bool) -> None:
+        if last_cwd_key is not None:
+            projects_now = store.projects()
+            for i, project in enumerate(projects_now):
+                if project["cwd_key"] == last_cwd_key:
+                    ui.proj_idx = i + 1
+                    break
+            else:
+                ui.proj_idx = min(ui.proj_idx, len(projects_now))
+        if last_session_key is not None:
+            sessions_now = _visible_sessions(store, ui, sidebar_visible)
+            for i, session in enumerate(sessions_now):
+                if session_key(session) == last_session_key:
+                    ui.idx = i
+                    break
+            else:
+                ui.idx = max(0, min(ui.idx, len(sessions_now) - 1)) if sessions_now else 0
+
     # getch 超时为 200ms，每 5 帧（约 1 秒）轮询一次缓存文件，拾取后台进程产出的新标题。
     POLL_EVERY = 5
+    REFRESH_INTERVAL = 3.0  # 秒，后台重扫会话列表的间隔
+
+    def _background_refresh() -> None:
+        """周期性重扫磁盘发现新增/结束的会话；只在集合真的变化时唤醒主循环重绘，
+        守护线程随进程退出自然结束，无需显式停止。"""
+        while True:
+            time.sleep(REFRESH_INTERVAL)
+            try:
+                if store.refresh():
+                    store.dirty.set()
+            except OSError:
+                pass  # 磁盘短暂不可读（如并发写入）时跳过本轮，下次重试
+
+    threading.Thread(target=_background_refresh, daemon=True).start()
+
+    # 记一次初始选中项：用户在首次后台重扫（约 REFRESH_INTERVAL 秒）前未按任何键时，
+    # 也要有定位基准，否则 _relocate_after_refresh 无从下手。
+    _, _initial_width = stdscr.getmaxyx()
+    _remember_selection(_sidebar_width(store.projects(), _initial_width) > 0)
+
+    frame = 0
 
     while True:
         if frame % POLL_EVERY == 0:
             store.poll_cache_updates()
-        if store.dirty.is_set():
-            store.dirty.clear()
 
         _, width = stdscr.getmaxyx()
         sidebar_visible = _sidebar_width(store.projects(), width) > 0
         if not sidebar_visible and ui.focus == "sidebar":
             # 终端被拖窄导致侧边栏隐藏：焦点强制回列表；proj_idx 保留但过滤旁路，拉宽后自动恢复
             ui.focus = "list"
+
+        if store.dirty.is_set():
+            store.dirty.clear()
+            _relocate_after_refresh(sidebar_visible)
 
         _draw(stdscr, store, ui, frame)
         frame += 1
@@ -1234,6 +1312,8 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
         # 光标移动、切换来源或切换项目都可能改变可见区，统一在这里对齐渲染滚动位置
         _sync_top()
         _sync_sidebar_top()
+        # 记录本次按键后用户实际停留的会话/项目，供下次后台重扫触发的 dirty 事件定位光标
+        _remember_selection(sidebar_visible)
 
 
 def _launch(request: LaunchRequest | NewSessionRequest, registry: RuntimeRegistry, keepalive_on: bool) -> None:
