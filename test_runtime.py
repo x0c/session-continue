@@ -288,7 +288,12 @@ class RuntimeTests(unittest.TestCase):
             mock.patch.object(titles, "generate_titles_batch", return_value=generated),
             mock.patch.object(titles, "save_cache", return_value=None),
         ):
-            result = titles.refresh_titles(sessions, cache)
+            # 显式注入一个真值 generator：CI 环境没有安装 claude/codex，若依赖
+            # refresh_titles 内部的 titlegen.resolve_generator() 自动探测，会在
+            # 探测不到任何 CLI 时提前返回空字典，导致下面 mock 的
+            # generate_titles_batch 根本不会被调用（本机因为装了 claude/codex，
+            # 探测能成功，掩盖了这个问题，只有干净的 CI 环境才会暴露）。
+            result = titles.refresh_titles(sessions, cache, generator=mock.Mock())
 
         self.assertEqual(result, generated)
         self.assertEqual(cache["claude:same"]["title"], "Claude 标题")
