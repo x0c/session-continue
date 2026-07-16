@@ -562,7 +562,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
 
         with mock.patch.object(titles, "generate_titles_batch", return_value={}) as mocked:
             with mock.patch.object(titles, "save_cache", return_value=None) as save_mock:
-                result = titles.refresh_titles(sessions, {})
+                result = titles.refresh_titles(sessions, {}, generator=mock.Mock())
 
         self.assertEqual(result, {})
         mocked.assert_called_once()
@@ -580,7 +580,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
 
         with mock.patch.object(titles, "generate_titles_batch", side_effect=fake_batch):
             with mock.patch.object(titles, "save_cache", return_value=None) as save_mock:
-                result = titles.refresh_titles(sessions, {})
+                result = titles.refresh_titles(sessions, {}, generator=mock.Mock())
 
         self.assertEqual(len(result), titles._BATCH_SIZE * 3)
         self.assertEqual(save_mock.call_count, 3)
