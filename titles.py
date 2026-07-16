@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 
+import titlegen
 from models import session_key
 
 CACHE_DIR = os.path.expanduser("~/.cache/session-continue")
@@ -237,28 +237,17 @@ def _build_batch_prompt(sessions: list[dict]) -> str:
     )
 
 
-def generate_titles_batch(sessions: list[dict], model: str = "haiku", timeout: int = 90) -> dict[str, str]:
-    """调用 `claude -p --model haiku` 批量生成标题，返回 {id: title}。失败时返回空字典。"""
-    if not sessions:
+def generate_titles_batch(sessions: list[dict], generator: "titlegen.TitleGenerator | None", timeout: int = 90) -> dict[str, str]:
+    """通过标题生成器批量生成标题,返回 {id: title}。失败时返回空字典。"""
+    if not sessions or generator is None:
         return {}
 
-    prompt = _build_batch_prompt(sessions)
-    try:
-        proc = subprocess.run(
-            ["claude", "-p", "--model", model],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    text = generator.generate(_build_batch_prompt(sessions), timeout=timeout)
+    if not text:
         return {}
 
-    if proc.returncode != 0:
-        return {}
-
-    text = proc.stdout.strip()
-    # 模型可能用 ```json 包裹，剥掉代码块标记
+    text = text.strip()
+    # 模型可能用 ```json 包裹,剥掉代码块标记
     if text.startswith("```"):
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):
@@ -279,19 +268,24 @@ def generate_titles_batch(sessions: list[dict], model: str = "haiku", timeout: i
 _BATCH_SIZE = 5  # 每次 claude -p 调用最多处理的会话数，超出则拆批串行执行
 
 
-def refresh_titles(sessions: list[dict], cache: dict, model: str = "haiku") -> dict[str, str]:
-    """对一批待生成的会话批量生成标题，写回缓存，返回 {会话键: title} 增量。
+def refresh_titles(sessions: list[dict], cache: dict, generator: "titlegen.TitleGenerator | None" = None) -> dict[str, str]:
+    """对一批待生成的会话批量生成标题,写回缓存,返回 {会话键: title} 增量。
 
-    内部按 _BATCH_SIZE 拆批串行，避免单次调用超时。
+    内部按 _BATCH_SIZE 拆批串行,避免单次调用超时。
+    generator 为 None 时按环境自动选择;本机没有任何可用 CLI 时返回空增量。
     """
     if not sessions:
+        return {}
+    if generator is None:
+        generator = titlegen.resolve_generator()
+    if generator is None:
         return {}
 
     merged: dict[str, str] = {}
 
     for i in range(0, len(sessions), _BATCH_SIZE):
         chunk = sessions[i: i + _BATCH_SIZE]
-        raw = generate_titles_batch(chunk, model=model)
+        raw = generate_titles_batch(chunk, generator)
         chunk_updated = False
         for s in chunk:
             key = session_key(s)

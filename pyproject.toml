@@ -41,5 +41,5 @@ Issues = "https://github.com/x0c/session-continue/issues"
 sc = "sc:main"
 
 [tool.setuptools]
-py-modules = ["models", "sc", "agent_api", "scan_claude", "scan_codex", "titles", "keepalive"]
+py-modules = ["models", "sc", "agent_api", "scan_claude", "scan_codex", "scan_opencode", "titles", "titlegen", "keepalive"]
 packages = ["runtime"]
