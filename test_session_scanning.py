@@ -3,6 +3,7 @@ from __future__ import annotations
 import curses
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import scan_claude
 import scan_codex
+import scan_opencode
 import sc
 import agent_api
 import titles
@@ -24,6 +26,55 @@ from runtime.codex import CodexRuntime
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+
+
+def _make_opencode_db(path: Path, sessions: list[dict], messages: list[dict] = (), parts: list[dict] = ()) -> None:
+    """按 opencode.db 真实 schema（session/message/part 三表）建最小 SQLite fixture。
+
+    sessions: 每项含 id/directory/title/time_created/time_updated，可选 parent_id/time_archived。
+    messages: 每项含 id/session_id/time_created/data（dict，会被 json.dumps）。
+    parts: 每项含 id/message_id/session_id/time_created/data（dict）。
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE session (id text PRIMARY KEY, project_id text, parent_id text, "
+            "slug text, directory text, title text, version text, "
+            "time_created integer, time_updated integer, time_archived integer)"
+        )
+        conn.execute(
+            "CREATE TABLE message (id text PRIMARY KEY, session_id text, "
+            "time_created integer, time_updated integer, data text)"
+        )
+        conn.execute(
+            "CREATE TABLE part (id text PRIMARY KEY, message_id text, session_id text, "
+            "time_created integer, time_updated integer, data text)"
+        )
+        for s in sessions:
+            conn.execute(
+                "INSERT INTO session (id, project_id, parent_id, slug, directory, title, "
+                "version, time_created, time_updated, time_archived) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    s["id"], s.get("project_id", "global"), s.get("parent_id"), s.get("slug", "x"),
+                    s.get("directory", ""), s.get("title"), s.get("version", "1.0.0"),
+                    s.get("time_created", 0), s.get("time_updated", 0), s.get("time_archived"),
+                ),
+            )
+        for m in messages:
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                (m["id"], m["session_id"], m["time_created"], m.get("time_updated", m["time_created"]),
+                 json.dumps(m["data"], ensure_ascii=False)),
+            )
+        for p in parts:
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+                (p["id"], p["message_id"], p["session_id"], p["time_created"],
+                 p.get("time_updated", p["time_created"]), json.dumps(p["data"], ensure_ascii=False)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class TimezoneMixin:
@@ -872,6 +923,333 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             live_ids = scan_codex._live_session_ids()
 
         self.assertEqual(live_ids, {})
+
+    def test_scan_filters_self_generated_title_sessions(self) -> None:
+        # 后台标题生成兜底路径若真在 ~/.codex/sessions/ 留下会话
+        # (旧版 codex 无 --ephemeral,或用户手动跑过同款 prompt),
+        # 必须像 Claude 侧一样按 PROMPT_MARKER 前缀过滤,不进列表。
+        old_sessions_dir = scan_codex.SESSIONS_DIR
+        old_session_index = scan_codex.SESSION_INDEX
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                scan_codex.SESSIONS_DIR = td
+                scan_codex.SESSION_INDEX = os.path.join(td, "session_index.jsonl")
+                real_cwd = Path(td) / "real_cwd"
+                real_cwd.mkdir()
+
+                specs = [
+                    ("019efe42-6d51-7fb3-ad48-112a8eefaa01", "真实的用户问题"),
+                    ("019efe42-6d51-7fb3-ad48-112a8eefaa02", f"{titles.PROMPT_MARKER}(JSON 数组…)"),
+                ]
+                for i, (uuid, first_msg) in enumerate(specs):
+                    path = Path(td) / f"rollout-2026-07-16T10-0{i}-00-{uuid}.jsonl"
+                    _write_jsonl(
+                        path,
+                        [
+                            {
+                                "timestamp": "2026-07-16T02:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": uuid, "cwd": str(real_cwd)},
+                            },
+                            {
+                                "timestamp": "2026-07-16T02:00:10.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "user_message", "message": first_msg},
+                            },
+                        ],
+                    )
+                    mtime = 1_800_000_000 + i * 60
+                    os.utime(path, (mtime, mtime))
+
+                sessions = scan_codex.scan_sessions(limit=10)
+        finally:
+            scan_codex.SESSIONS_DIR = old_sessions_dir
+            scan_codex.SESSION_INDEX = old_session_index
+
+        self.assertEqual([s["first_user_msg"] for s in sessions], ["真实的用户问题"])
+
+
+class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
+    """OpenCode 历史存 SQLite（session/message/part 三表），扫描用只读连接直接查询。"""
+
+    def _text_part(self, part_id: str, message_id: str, session_id: str, text, t: int, synthetic: bool = False) -> dict:
+        data = {"type": "text", "text": text}
+        if synthetic:
+            data["synthetic"] = True
+        return {"id": part_id, "message_id": message_id, "session_id": session_id, "time_created": t, "data": data}
+
+    def test_field_mapping_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[{
+                    "id": "ses_a", "directory": "/tmp/demo", "title": "修复登录",
+                    "time_created": 1_700_000_000_000, "time_updated": 1_700_000_500_000,
+                }],
+                messages=[
+                    {"id": "msg_u1", "session_id": "ses_a", "time_created": 1_700_000_000_000,
+                     "data": {"role": "user", "time": {"created": 1_700_000_000_000}}},
+                    {"id": "msg_a1", "session_id": "ses_a", "time_created": 1_700_000_500_000,
+                     "data": {"role": "assistant", "finish": "stop", "time": {"created": 1_700_000_500_000}}},
+                ],
+                parts=[
+                    self._text_part("p1", "msg_u1", "ses_a", "帮我修复登录报错", 1_700_000_000_000),
+                    self._text_part("p2", "msg_a1", "ses_a", "已定位并修复", 1_700_000_500_000),
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            self.assertEqual(len(sessions), 1)
+            info = sessions[0]
+            self.assertEqual(info["source"], "opencode")
+            self.assertEqual(info["id"], "ses_a")
+            self.assertEqual(info["short_id"], "ses_a"[:12])
+            self.assertEqual(info["cwd"], "/tmp/demo")
+            self.assertEqual(info["native_title"], "修复登录")
+            self.assertEqual(info["fallback_title"], "帮我修复登录报错")
+            self.assertEqual(info["mtime"], 1_700_000_500_000 / 1000)
+            self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(info["size_bytes"], len(json.dumps({"type": "text", "text": "帮我修复登录报错"}, ensure_ascii=False))
+                              + len(json.dumps({"type": "text", "text": "已定位并修复"}, ensure_ascii=False)))
+            self.assertEqual(info["path"], str(db_path))
+
+    def test_filters_out_subagent_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": "ses_root", "directory": "/tmp/demo", "title": "根会话",
+                     "time_created": 0, "time_updated": 100_000},
+                    {"id": "ses_sub", "directory": "/tmp/demo", "title": "子代理会话",
+                     "parent_id": "ses_root", "time_created": 0, "time_updated": 200_000},
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            self.assertEqual([s["id"] for s in sessions], ["ses_root"])
+
+    def test_filters_out_archived_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": "ses_live", "directory": "/tmp/demo", "title": "存活会话",
+                     "time_created": 0, "time_updated": 100_000},
+                    {"id": "ses_arch", "directory": "/tmp/demo", "title": "已归档会话",
+                     "time_archived": 999_999, "time_created": 0, "time_updated": 200_000},
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            self.assertEqual([s["id"] for s in sessions], ["ses_live"])
+
+    def test_empty_session_without_title_is_dropped_but_native_title_alone_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": "ses_blank", "directory": "/tmp/demo", "title": None,
+                     "time_created": 0, "time_updated": 100_000},
+                    {"id": "ses_titled_only", "directory": "/tmp/demo", "title": "简单问候",
+                     "time_created": 0, "time_updated": 200_000},
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            self.assertEqual([s["id"] for s in sessions], ["ses_titled_only"])
+            self.assertEqual(sessions[0]["fallback_title"], "(无消息)")
+
+    def test_status_tag_all_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": "ses_pending", "directory": "/tmp/a", "title": "待回复",
+                     "time_created": 0, "time_updated": 100_000},
+                    {"id": "ses_done", "directory": "/tmp/b", "title": "已完成",
+                     "time_created": 0, "time_updated": 200_000},
+                    {"id": "ses_aborted", "directory": "/tmp/c", "title": "已中断",
+                     "time_created": 0, "time_updated": 300_000},
+                    {"id": "ses_none", "directory": "/tmp/d", "title": "无状态",
+                     "time_created": 0, "time_updated": 400_000},
+                ],
+                messages=[
+                    {"id": "m_pending", "session_id": "ses_pending", "time_created": 100_000,
+                     "data": {"role": "user", "time": {"created": 100_000}}},
+                    {"id": "m_done", "session_id": "ses_done", "time_created": 200_000,
+                     "data": {"role": "assistant", "finish": "stop", "time": {"created": 200_000}}},
+                    {"id": "m_aborted", "session_id": "ses_aborted", "time_created": 300_000,
+                     "data": {"role": "assistant", "error": {"message": "连接失败"}, "time": {"created": 300_000}}},
+                    {"id": "m_none", "session_id": "ses_none", "time_created": 400_000,
+                     "data": {"role": "assistant", "finish": "tool-calls", "time": {"created": 400_000}}},
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            by_id = {s["id"]: s["status_tag"] for s in sessions}
+            self.assertEqual(by_id["ses_pending"], titles.STATUS_PENDING)
+            self.assertEqual(by_id["ses_done"], titles.STATUS_DONE)
+            self.assertEqual(by_id["ses_aborted"], titles.STATUS_ABORTED)
+            self.assertEqual(by_id["ses_none"], titles.STATUS_NONE)
+
+    def test_chinese_native_title_and_preview_survive_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[{
+                    "id": "ses_cn", "directory": "/tmp/demo", "title": "中文标题：修复终端乱码问题",
+                    "time_created": 0, "time_updated": 100_000,
+                }],
+                messages=[
+                    {"id": "m1", "session_id": "ses_cn", "time_created": 0,
+                     "data": {"role": "user", "time": {"created": 0}}},
+                ],
+                parts=[self._text_part("p1", "m1", "ses_cn", "终端显示的中文全是乱码，帮我看看", 0)],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            self.assertEqual(sessions[0]["native_title"], "中文标题：修复终端乱码问题")
+            self.assertEqual(sessions[0]["fallback_title"], "终端显示的中文全是乱码，帮我看看")
+
+    def test_scan_sessions_returns_empty_when_db_missing(self) -> None:
+        with mock.patch.object(scan_opencode, "_db_paths", return_value=[]):
+            self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
+
+    def test_scan_sessions_degrades_when_db_is_corrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            db_path.write_text("不是一个真正的 sqlite 文件", encoding="utf-8")
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
+
+    def test_scan_sessions_degrades_when_tables_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.close()  # 建一个空库，session/message/part 表都不存在
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
+
+    def test_limit_keeps_newest_sessions_in_descending_order(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": f"ses_{i}", "directory": "/tmp/demo", "title": f"会话{i}",
+                     "time_created": 0, "time_updated": i * 100_000}
+                    for i in range(5)
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=3)
+
+            self.assertEqual([s["id"] for s in sessions], ["ses_4", "ses_3", "ses_2"])
+
+    def test_live_backfill_only_marks_newest_session_in_same_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cwd_dir = Path(td) / "workdir"
+            cwd_dir.mkdir()
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": "ses_old", "directory": str(cwd_dir), "title": "旧会话",
+                     "time_created": 0, "time_updated": 100_000},
+                    {"id": "ses_new", "directory": str(cwd_dir), "title": "新会话",
+                     "time_created": 0, "time_updated": 200_000},
+                ],
+            )
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(
+                     scan_opencode, "_live_pids_by_cwd",
+                     return_value={os.path.realpath(str(cwd_dir)): 4242},
+                 ):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+            by_id = {s["id"]: s for s in sessions}
+            self.assertTrue(by_id["ses_new"]["live"])
+            self.assertEqual(by_id["ses_new"]["pid"], 4242)
+            self.assertFalse(by_id["ses_old"]["live"])
+            self.assertIsNone(by_id["ses_old"]["pid"])
+
+    def test_live_pids_by_cwd_degrades_when_pgrep_unavailable(self) -> None:
+        with mock.patch("scan_opencode.subprocess.check_output", side_effect=FileNotFoundError()):
+            self.assertEqual(scan_opencode._live_pids_by_cwd(), {})
+
+    def test_load_conversation_merges_parts_filters_roles_and_avoids_none_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[{"id": "ses_multi", "directory": "/tmp/demo", "title": "多段消息",
+                           "time_created": 0, "time_updated": 300_000}],
+                messages=[
+                    {"id": "m_user", "session_id": "ses_multi", "time_created": 100_000,
+                     "data": {"role": "user", "time": {"created": 100_000}}},
+                    {"id": "m_asst", "session_id": "ses_multi", "time_created": 200_000,
+                     "data": {"role": "assistant", "finish": "stop", "time": {"created": 200_000}}},
+                    {"id": "m_null", "session_id": "ses_multi", "time_created": 300_000,
+                     "data": {"role": "assistant", "finish": "stop", "time": {"created": 300_000}}},
+                ],
+                parts=[
+                    self._text_part("p_user", "m_user", "ses_multi", "先看看这个报错", 100_000),
+                    # 同一条 assistant 消息的两段 text part（step 之间产生），应合并成一条
+                    self._text_part("p_a1", "m_asst", "ses_multi", "第一段结论", 200_000),
+                    self._text_part("p_a2", "m_asst", "ses_multi", "第二段结论", 200_001),
+                    # 非 text 类型的 part 不应出现在对话里
+                    {"id": "p_reason", "message_id": "m_asst", "session_id": "ses_multi",
+                     "time_created": 200_002, "data": {"type": "reasoning", "text": "思考过程"}},
+                    {"id": "p_tool", "message_id": "m_asst", "session_id": "ses_multi",
+                     "time_created": 200_003, "data": {"type": "tool", "tool": "bash"}},
+                    # synthetic 注入内容应被过滤
+                    self._text_part("p_synthetic", "m_asst", "ses_multi", "系统注入内容", 200_004, synthetic=True),
+                    # text 为 JSON null 时不应产出字面量 "None"
+                    self._text_part("p_null", "m_null", "ses_multi", None, 300_000),
+                ],
+            )
+
+            messages = scan_opencode.load_conversation(str(db_path), "ses_multi")
+
+            self.assertEqual([m.role for m in messages], ["user", "assistant"])
+            self.assertEqual(messages[0].text, "先看看这个报错")
+            self.assertEqual(messages[1].text, "第一段结论\n\n第二段结论")
+            self.assertNotIn("None", messages[1].text)
+            self.assertEqual(messages[0].timestamp, 100_000 / 1000)
+            self.assertEqual(messages[1].timestamp, 200_000 / 1000)
+            ts = [m.timestamp for m in messages if m.timestamp is not None]
+            self.assertEqual(ts, sorted(ts))
 
 
 class ConversationPreviewTests(unittest.TestCase):
@@ -1725,7 +2103,7 @@ class HandoffDigestTests(unittest.TestCase):
         prompt = handoff.render_prompt()
         self.assertNotIn("对话摘录", prompt)
         self.assertNotIn("会话状态", prompt)
-        self.assertIn("请先读取上述 JSONL 会话历史", prompt)
+        self.assertIn("请先读取上述会话历史", prompt)
 
     def test_prompt_with_digest_includes_status_and_authority_note(self) -> None:
         messages = [
@@ -1736,7 +2114,7 @@ class HandoffDigestTests(unittest.TestCase):
         self.assertIn(f"会话状态：{titles.STATUS_PENDING}", prompt)
         self.assertIn("以下是从原会话自动提取的对话摘录", prompt)
         self.assertIn("摘录与文件不一致时以文件为准", prompt)
-        self.assertIn("请以上述摘录为线索读取原 JSONL 会话历史", prompt)
+        self.assertIn("请以上述摘录为线索读取原会话历史", prompt)
         self.assertIn("用户: 问题", prompt)
 
     def test_build_new_plan_prompt_carries_digest_for_both_runtimes(self) -> None:

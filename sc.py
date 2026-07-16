@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """sc：终端会话接力工具。
 
-单列表格列出已注册运行时（Claude Code / Codex）的最近会话，左右切换来源、
+单列表格列出已注册运行时（Claude Code / Codex / OpenCode）的最近会话，左右切换来源、
 上下选行，回车后原生恢复，或通过高级操作交给其他运行时接力。
 
 注意：默认启动交互式终端 TUI（curses），需要真实终端，不能被自动化脚本或
@@ -1388,7 +1388,7 @@ def _run_title_daemon(registry: RuntimeRegistry, limit: int) -> None:
     """脱离 TUI 的独立标题生成进程入口（sc --generate-titles）。
 
     用文件锁保证全机单实例：拿不到锁说明已有后台进程在跑，直接退出，
-    避免用户反复进 sc 堆积多个生成进程、重复消耗 Claude 额度。
+    避免用户反复进 sc 堆积多个生成进程、重复消耗模型额度。
     """
     os.makedirs(titles.CACHE_DIR, exist_ok=True)
     lock_fp = open(_TITLE_LOCK_FILE, "w")
@@ -1469,7 +1469,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "sc：终端会话接力工具。\n"
-            "列出 Claude Code / Codex 最近的会话，选择后原生恢复或跨运行时接力。\n"
+            "列出 Claude Code / Codex / OpenCode 最近的会话，选择后原生恢复或跨运行时接力。\n"
             "默认启动交互式 TUI（curses），需要真实终端；非真实终端自动退化为 JSON。\n"
             "大模型 Agent 结构化查询请用 list/search/show/context/describe 子命令。"
         ),
@@ -1482,7 +1482,7 @@ def main() -> None:
             "  sc describe        # 查看 list/search/show/context 等子命令的用法\n"
             "\n"
             "JSON 输出字段说明：\n"
-            "  runtime        运行时标识（claude / codex）\n"
+            "  runtime        运行时标识（claude / codex / opencode）\n"
             "  id             会话 ID\n"
             "  title          会话标题（本地临时兜底，不调用 AI）\n"
             "  cwd            原会话工作目录\n"
@@ -1491,7 +1491,7 @@ def main() -> None:
             "  size_kb        历史文件大小（KB）\n"
             "  status         会话状态（已完成 / 待回复 / 已中断）\n"
             "  resume_command 恢复该会话的完整 shell 命令（可直接执行）\n"
-            "  history_path   历史 JSONL 文件路径\n"
+            "  history_path   历史文件路径（Claude/Codex 为 JSONL；OpenCode 为 SQLite 数据库）\n"
         ),
     )
     parser.add_argument("--limit", type=int, default=50, help="每个来源最多列出多少条")

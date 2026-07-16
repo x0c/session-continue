@@ -351,6 +351,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue  # Codex 自身多智能体拆出的子代理线程，不是用户发起的顶层会话，会与父会话共享同一段历史开头造成列表重复
         if not info["first_user_msg"] or info["fallback_title"] == "(无消息)":
             continue  # 无用户消息的空会话
+        if info["first_user_msg"].startswith(titles.PROMPT_MARKER):
+            continue  # 后台标题生成自产的噪音会话,和 Claude 侧同一套 PROMPT_MARKER 过滤
         if info["cwd"] and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
