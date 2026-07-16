@@ -14,7 +14,7 @@
 - 运行时私有行为必须收敛在 `runtime/` 对应适配器中；新增运行时只实现扫描、对话预览、原生恢复、历史格式提示、接力新会话（读取其他运行时历史）和空白新会话（不关联任何历史，仅指定工作目录）两种启动能力，并在默认注册表注册一次。
 - 跨运行时接力统一走“源适配器导出 `Handoff` → 目标适配器生成 `LaunchPlan`”，禁止增加 Claude→Gemini、Codex→Gemini 等两两转换分支。
 - 同运行时使用原生恢复；跨运行时必须新建目标会话、让目标 Agent 按需读取原始 JSONL，不能改写或伪造原会话。
-- 标题生成是独立服务，不属于任何运行时适配器。标题和界面状态使用“运行时 + 会话 ID”作为唯一键，新增运行时不得退回纯会话 ID。
+- 标题生成是独立服务，不属于任何运行时适配器。生成后端统一走 `titlegen.py` 的 `TitleGenerator` 抽象，`titles.py` 不得直接拼接任何 CLI 命令；`titlegen.py` 与 `runtime/` 互不 import——运行时适配器管「怎么恢复/接力会话」，标题生成器管「怎么无头问一次模型」，两者后端恰好重名但职责不同，不要合并。标题和界面状态使用“运行时 + 会话 ID”作为唯一键，新增运行时不得退回纯会话 ID。新增标题生成后端时，若该 CLI 会把生成调用落盘成会话历史，对应扫描器必须加 `titles.PROMPT_MARKER` 前缀过滤。
 - 会话预览使用全屏页面；预览页回车必须直接原生恢复当前会话，关闭预览时必须清屏并让主列表按当前终端尺寸完整重绘，禁止改回覆盖主列表的居中弹窗。
 - `agent_api.py`（`sc list`/`search`/`show`/`context`/`describe`）是只读数据接口，禁止新增任何执行/拉起副作用命令——sc 只负责把会话数据交出来，怎么用是调用方的事。暴露更多可见性字段（如运行中会话的 `live`/`pid`）不违反这条约束，只要新字段本身来自扫描/只读探测、不触发任何拉起或写操作；真正"接管/下发指令给运行中会话"的能力不属于 sc，留给调用方基于这些数据自行实现。命令参数与 `sc describe` 的输出必须共用同一份 `COMMANDS` 定义，不能各写一份导致漂移。新增或修改子命令时同步 `docs/SKILL.md`。
 - Agent 接口里 `list`/`search` 的 `--limit` 固定表示每个运行时的扫描深度，`--top` 才表示最终返回条数；`--compact` 必须同时做到紧凑 JSON 和精简默认字段。改这三个参数或 `show --out` 大结果落盘行为时，同步 `sc describe`、`docs/SKILL.md` 和 `docs/MAINTAINER_GUIDE.md`。
@@ -41,11 +41,11 @@ print(f'{(time.perf_counter()-t)*1000:.0f}ms')
 改动代码、界面或运行时适配器后至少执行：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 
-涉及界面时还要运行一次真实终端冒烟。标题后台生成会消耗 Claude 额度；只验证界面时，在临时目录把 `claude`、`codex` 指向本机 `true`，放到 `PATH` 最前面，再启动 `python3 sc.py --limit 5`，确认：
+涉及界面时还要运行一次真实终端冒烟。标题后台生成会调用本机 agent CLI、消耗对应账号额度；只验证界面时，在临时目录把 `claude`、`codex` 指向本机 `true`，放到 `PATH` 最前面，再启动 `python3 sc.py --limit 5`，确认：
 
 - 底部显示 `a 高级操作`。
 - 高级操作弹窗动态列出注册表中的运行时。

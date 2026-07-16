@@ -5,15 +5,18 @@
 - 最近会话排序优先使用历史文件更新时间。用户对“最近”的直觉是最近被续接或写入，而不是文件内部最后一条可解析消息。
 - 文件时间不是绝对可信，且污染粒度可以细到单个文件，不一定成批出现：Claude Code 在会话驻留/被重新打开时会追加没有时间戳的元数据条目（`last-prompt`、`ai-title`、`mode`、`permission-mode`），把文件 mtime 顶到“现在”而不产生任何新对话内容；Syncthing、复制、批量元数据刷新是同一类问题的批量版本。修正逻辑统一收在 `models.py` 的 `effective_session_time(file_mtime, event_time)`：当 mtime 比会话内部最后一条真实事件新出 1 小时以上的 gap，就判定 mtime 不可信，逐会话回退到 event_time；两个扫描器的 `_build_session_info` 都在返回结果前调用它写回 `mtime`/`display_time`/`time_source`。曾经按“同一分钟桶 ≥5 个会话”识别批量污染簇的启发式已废弃——它只覆盖批量场景，漏过了本节描述的单文件被驻留进程 touch 的情形（真实故障：两个会话被 touch 到不同分钟，各自没能凑够聚簇阈值，在列表里显示成"20分钟前"，实际是 9-11 天前的会话）。
 - Claude Code 自带 `aiTitle` 不稳定，只能作为临时兜底的最后来源，不能绕过生成缓存直接展示。
-- 无缓存时必须先生成本地短标题，再交给后台模型优化。首屏不能依赖 `claude -p` 是否及时返回。
+- 无缓存时必须先生成本地短标题，再交给后台模型优化。首屏不能依赖后台生成器（`claude`/`codex` 无头调用）是否及时返回。
 - 后台标题生成可能留下新的 Claude 会话记录；扫描侧必须过滤自产标题 prompt 和只有低价值消息的记录，避免历史污染反过来进入列表。
 - 标题生成只做批量调用。批量失败时保留临时标题，不逐条慢重试。
+- 标题生成后端已抽象为 `titlegen.py` 的 `TitleGenerator`（当前有 claude、codex 两个实现）。`titles.py` 只负责批量 prompt、JSON 解析和缓存，不感知具体 CLI；新增生成器只在 `titlegen.py` 加实现并注册进 `_GENERATORS`，禁止在 `titles.py` 里写 `subprocess` 调用。选择顺序：`SC_TITLE_GENERATOR` 环境变量 → 按注册顺序取第一个已安装的；`SC_TITLE_MODEL` 覆盖模型。缓存与生成器无关，换生成器不重算已有标题。
+- 自产噪音会话的过滤，每个可能被生成器落盘的运行时扫描器都要有：Claude 侧靠 `PROMPT_MARKER` 预探过滤（见「扫描性能」）；Codex 侧生成用 `codex exec --ephemeral` 不落盘，扫描过滤仅是兜底。接入没有 ephemeral 类开关的 CLI 后端（如 opencode run，每次调用必然真实落一条会话）时，对应扫描器的 `PROMPT_MARKER` 过滤是必需项，漏掉会让标题生成会话刷屏列表。
 
 ## 标题生成进程
 
 - 标题生成必须由脱离当前终端的独立进程承载，不能放回 TUI 进程内线程。
 - `execute_launch` 会用 `os.execvp` 替换当前进程；按 `q` 退出也会结束 TUI 进程。TUI 内线程会在这些路径上丢失未完成标题。
 - 当前模型是：`_spawn_title_daemon` 拉起 `sc --generate-titles` 后台进程，后台进程用缓存目录下的文件锁保证全机单实例；TUI 侧只读缓存并轮询缓存文件变化。
+- 后台进程内的生成器选择发生在 `refresh_titles`（`titlegen.resolve_generator`），本机一个 agent CLI 都没有时静默跳过，列表保持临时兜底标题；不要在 TUI 首屏路径做可用性探测。
 
 ## Claude 扫描
 
@@ -29,6 +32,15 @@
 ## Codex 扫描
 
 - **Codex 自身的多智能体（swarm/subagent）任务会把每个子代理线程各自写成一份独立的 `rollout-*.jsonl` 文件，扫描时必须过滤掉，不能当作用户发起的顶层会话列出。** 真实故障：一个真实会话（`session_meta.payload.thread_source` 缺失或为 `"user"`）执行多智能体任务时，会派生出好几个子代理线程（`thread_source: "subagent"`，`forked_from_id`/`parent_thread_id` 指向父会话，`agent_nickname` 是 Codex 随机取的代号），这些子代理线程 fork 时继承了父会话开头的历史，因此它们文件里"第一条用户消息"（也就是列表兜底标题的来源）和父会话完全相同。`_find_all_session_files` 对 `~/.codex/sessions/` 下所有 `.jsonl` 一视同仁地扫描，没读 `thread_source` 字段时，这些子代理文件会和父会话一起出现在列表里，表现为同一段任务描述反复出现好几条、目录和时间都很接近，用户会误以为是"同一个会话被重复列出"的 bug，实际是把 Codex 内部子任务线程误当成了独立会话。修法是在 `_build_session_info` 读 `session_meta` 时顺带取 `payload.get("thread_source")`，`scan_sessions` 里 `thread_source == "subagent"` 直接 `continue` 跳过，和过滤空会话、死 cwd 会话放在同一批前置检查里。
+
+## OpenCode 扫描
+
+- **历史存储是 SQLite（`~/.local/share/opencode/opencode.db`），不是 JSONL 文件**：`session`/`message`/`part` 三张表，正文只在 `part.data` 的 JSON `text` 字段（`message.data` 只有角色/时间/finish 等元数据）。OpenCode v1.2.0 起才是这个格式，更早版本的纯 JSON 文件存储**不做兼容**——官方升级会自动迁移到 SQLite，遗留在老格式的用户极少；本机没有 `opencode.db` 时这个运行时的会话列表就是空的，不报错、不尝试读旧格式。
+- **只读连接，WAL 库可能拒绝只读打开**：`_connect_ro` 用 `sqlite3.connect("file:<path>?mode=ro", uri=True, timeout=0.5)`。opencode 正在写库（WAL 模式）时，极端情况下（需要 checkpoint 恢复且无活跃写者）只读打开可能失败；所有查询包一层 `except sqlite3.Error`，失败就把该 db 当 0 条会话处理，不抛异常、不阻塞其它运行时的扫描。`timeout=0.5` 把 busy 等待封顶在 0.5s，避免拖垮首屏 1s 硬指标。
+- **一条 SQL 拿 top-N，含四个预览子查询**：过滤 `parent_id IS NULL`（子代理会话，本机真实数据 31 条会话里 22 条是子代理拆分出的）和 `time_archived IS NULL`（已归档），按 `time_updated DESC` 排序；四个关联子查询分别取最后一条消息（推状态用）、首/末条用户文本、末条助手文本、`SUM(LENGTH(part.data))` 作 `size_bytes`（标题缓存失效 key，必须随内容增长，不能用固定值）。本机 31 会话/219 消息/1135 part 实测这条 SQL 含全部子查询仅 7ms，远在预算内，无需再加 Codex 那种"凑够 limit 提前停止"的优化。
+- **状态推导没有显式中断信号**：OpenCode 不像 Codex 有 `turn_aborted` 这种明确事件，末轮 `finish` 只有 `stop`/`tool-calls`/缺失/未知几种取值；只有消息带非空 `error` 字段才判"已中断"，`finish=="tool-calls"` 或其它值一律归"无状态"（宁缺毋滥），不要臆测把 `tool-calls` 当成中断或完成。
+- **判活没有 Codex 那样"进程独占持有会话文件"的信号**：历史在共享 SQLite 里，无法用 `lsof` 定位某个 pid 对应哪个会话。改用 `pgrep -x opencode` 拿存活进程后读其工作目录（Linux 用 `/proc/<pid>/cwd`，macOS 用 `lsof -a -p <pid> -d cwd -Fn` 只查 cwd 一个 fd，比 Codex 判活时的全量 `lsof -p` 还便宜），与会话的 `directory` 字段（`os.path.realpath` 归一化）匹配；命中即认为该 cwd 下"最新一条"会话存活，同目录下更老的历史会话不标记（宁缺毋滥）。已知局限：`opencode serve`/`opencode run` 等同名进程会被一并计入；判活失败（`pgrep` 缺失/调用失败）静默降级为空集，不抛异常。
+- **`--dangerously-skip-permissions` 实测只在 `opencode run` 子命令下生效，官方文档提到的 `--auto` 在本机 v1.15.11 完全不可用**：起初按照 claude/codex 的既有模式把这个 flag 塞进 `auto_approve_args` 类属性、四处复用，结果真机冒烟发现 `opencode --dangerously-skip-permissions -s <id>`（裸 TUI 命令）直接报错退出（exit=1，打印用法说明）——yargs 对默认/主命令的参数校验是严格模式，这个 flag 只在 `opencode run [message..]` 的 `--help` 里出现，主命令完全不认。同时按官方文档站（`opencode.ai/docs/permissions`）的说法，应该有个语义更安全的 `--auto` 参数（保留 deny 规则，只放行会弹 ask 的请求），但本机实测 `opencode --auto` 和 `opencode run --auto` 两种写法都同样报错退出（exit=1）——这台机器装的 1.15.11 版本还不支持这个参数，文档领先于当前发行版（或反过来是文档过时），**以实测行为为准，不要以文档为准**；未来升级 opencode 版本后应重新验证 `--auto` 是否可用，若可用应优先切换过去（deny 规则仍生效，比 `--dangerously-skip-permissions` 更安全）。因此 `OpenCodeRuntime.auto_approve_args` 显式设为空元组（不像 claude/codex 那样声明危险参数），`--dangerously-skip-permissions` 只硬编码在 `build_continue_plan`（唯一走 `run` 子命令、确认可用的路径）里；这意味着 `sc opencode`（裸直启，透传给主命令）不会像 `sc claude`/`sc codex` 那样自动垫上跳过审批参数，也意味着 `build_new_plan`（跨运行时接力读取其它运行时历史时的新会话）里目标 OpenCode 若触发权限询问，需要用户在 TUI 里手动确认——这是相对 claude/codex 的已知能力差距，不是遗漏。
 
 ## 扫描性能
 
@@ -47,9 +59,10 @@
 - 表格列之间用 `sc.py` 里的 `COL_GAP` 固定间隔拼接。
 - 大小列统一用 MB、保留两位小数、右对齐。
 - 主界面「状态」列显示的是**会话进程活性**（`live: bool`，两档：`进行中`/`已结束`，无图标），不是末轮对话怎么结束的；`titles.py` 里的 `STATUS_ABORTED`/`STATUS_PENDING`/`STATUS_DONE`/`STATUS_NONE`（人看的中文+emoji `status_tag`）和对应的英文枚举只在 `agent_api.py`（`sc list --status` 等脚本接口）里使用，两套语义已解耦，改其中一个不代表另一个也要跟着改。
-- 判活刻意只做「进程在/不在」两档，不做 Claude 能力范围内的「思考中/空闲」细分——因为 Codex 没有对应信号，两个运行时的状态列必须口径一致。
+- 判活刻意只做「进程在/不在」两档，不做 Claude 能力范围内的「思考中/空闲」细分——因为 Codex/OpenCode 没有对应信号，三个运行时的状态列必须口径一致。
 - Claude 判活：遍历 `~/.claude/sessions/{pid}.json`（`scan_claude._live_session_ids`），`os.kill(pid, 0)` 确认进程仍存活后取其 `sessionId`；与 `active-claude-sessions` skill 同一判活思路。
 - Codex 没有 pid 注册表，判活改用 `lsof`：活着的 `codex` 进程会以写模式持有自己的 rollout JSONL（实测 `lsof -p <pid>` 能看到形如 `codex … 45w … rollout-…-<uuid>.jsonl` 的记录），`scan_codex._live_session_ids` 用 `pgrep -x codex` 拿 pid 后逐个 `lsof -p` 解析文件名里的 UUID。`pgrep`/`lsof` 缺失或调用失败一律静默返回空集，退化为全部显示「已结束」，不抛异常、不阻塞扫描。
+- OpenCode 既没有 pid 注册表，也没有可独占定位的会话文件（历史在共享 SQLite 里），判活退化为「进程 cwd 匹配会话 directory」：`scan_opencode._live_pids_by_cwd` 用 `pgrep -x opencode` 拿 pid，读其工作目录后与会话 `directory` 归一化匹配，同一 cwd 下只标最新一条会话存活。细节和已知局限见「OpenCode 扫描」节。
 - 聊天记录预览必须按需读取，不加入启动扫描；只展示真实用户消息和每轮最终答复，过滤工具调用、工具结果、思考过程、进度播报和内部提醒。
 - 预览页头部右侧展示的会话 ID 用完整 `session["id"]`（36 位 UUID），**不用 `short_id`**：这里是给用户直接复制去跑 `claude --resume <id>`/`codex resume <id>` 等原生命令的，这两个命令都要求完整 ID，8 位前缀只在 `sc show <前缀>` 这类 sc 自己的 Agent 接口里可用。
 - **消息级时间戳**：`models.ConversationMessage` 多了个可选 `timestamp: float | None` 字段，两个扫描器的 `load_conversation` 在构造每条消息时顺手带上该条 JSONL 记录已经解析出的时间（`_entry_time(entry)`，扫描器本来就有，之前只用于会话级 `display_time`）。Claude 侧的历史遗留格式（`stop_reason is None` 的 `pending_legacy_answer`）要注意：这类答复要等下一条用户消息或文件末尾才会被 `flush_legacy_answer()` 真正 append 进 `messages`，时间戳必须在"设置 pending"那一刻就记下（`pending_legacy_ts`），不能用 flush 发生时的时间——否则同一条历史遗留答复会显示成很久之后才发的。`_preview_lines` 只在 `message.timestamp` 存在时才追加时间后缀（`format_message_time`，`%m-%d %H:%M`，和列表页时间格式共享同一个 helper），老格式解析不出时间的消息保持不标注，不强行伪造一个。
@@ -61,7 +74,7 @@
 
 ### 项目侧边栏
 
-- 侧边栏展示的「项目」= 所有来源（Claude + Codex）会话 `cwd` 归一化后的完整路径分组统计，`sc._project_groups` 按会话数倒序、同数按最近会话时间倒序排序；显示名只取末级目录名，同名末级目录冲突时由 `sc._disambiguate_labels` 逐级向上补父级路径直到唯一（VS Code 标签页风格）。**过滤永远按完整归一化 cwd 精确匹配（`sc._filter_sessions`），绝不按末级目录名字符串比较**——否则去歧义拆开的两个同名目录会互相污染彼此的会话列表。
+- 侧边栏展示的「项目」= 所有来源（Claude + Codex + OpenCode）会话 `cwd` 归一化后的完整路径分组统计，`sc._project_groups` 按会话数倒序、同数按最近会话时间倒序排序；显示名只取末级目录名，同名末级目录冲突时由 `sc._disambiguate_labels` 逐级向上补父级路径直到唯一（VS Code 标签页风格）。**过滤永远按完整归一化 cwd 精确匹配（`sc._filter_sessions`），绝不按末级目录名字符串比较**——否则去歧义拆开的两个同名目录会互相污染彼此的会话列表。
 - 宽度阈值：终端总宽 `< SIDEBAR_HIDE_THRESHOLD`（96 列）时 `sc._sidebar_width` 返回 0，整个侧边栏不绘制，界面完全退化为改动前的单栏布局；否则按最长项目名自适应，夹在 `SIDEBAR_MIN_WIDTH`(14) ~ `SIDEBAR_MAX_WIDTH`(26) 之间。宽度计算必须走 `_text_width`（中文全角占 2 列），不能用字符数。
 - 焦点通过 `UIState.focus`（`"sidebar"` | `"list"`）驱动，横向序列固定是「侧边栏 → 来源1 → 来源2 → …」：`←` 在第一个来源上再按才会进侧边栏，`→` 从侧边栏出来固定回到第一个来源；侧边栏可见时左右端点**停住不回绕**（`Tab` 仍可循环切来源，不受影响）。焦点视觉规则：反白光标条只出现在真正持有焦点的窗格，另一侧的当前项降级为 `PAIR_TAB_ACTIVE|A_BOLD`（青字不反白），不要两边同时反白。
 - 侧边栏内 `↑/↓` 是「移动即筛选」——不需要回车确认；`SessionStore.projects()` 是惰性缓存，唯一失效点在 `load()`，标题后台轮询（`poll_cache_updates`）不改变会话集，不会也不应该触发重算，否则违反首屏/每帧零 IO 的性能红线。
@@ -112,11 +125,12 @@
 - **已知边缘案例**：`attach-session` 发起瞬间目标会话恰好自然退出（tmux 报错退出），`sc` 不做特殊重试，用户重新打开一次 `sc` 即可（这时该会话已经不再显示"后台运行中"，回车会走正常原生恢复路径）。
 - **`sc claude`/`sc codex` 直启子命令是保活的第三个调用点**：`sc.py` 的 `_dispatch_direct_launch` 同样调 `keepalive.enabled()`/`keepalive.wrap_plan()`，和 TUI 的 `_launch()` 复用同一套开关语义（`--no-keepalive`、`SC_KEEPALIVE=0`）。直启没有"已有保活会话"这个概念（每次都是全新会话，`ident` 用 `keepalive.new_session_ident()` 现生成），所以不需要像 `_launch()` 那样先尝试 `attach_plan`。
 
-## 直启子命令（`sc claude` / `sc codex`）
+## 直启子命令（`sc claude` / `sc codex` / `sc opencode`）
 
 - **定位**：`main()` 里在 agent_api 分发分支之后、TUI 的 argparse 之前再加一个前置分支——`sys.argv[1]`（跳过可选的前置 `--no-keepalive`）命中 `registry.ids` 就整体转发给 `_dispatch_direct_launch`，不进入下面的 TUI/`--json` 参数体系。这个顺序刻意和 agent_api 的分发方式对称：两者都是"整个命令行属于另一套子系统，不该被 TUI 的 argparse 解析"。
 - **为什么是纯透传 + 只垫危险参数，不像 TUI 里的 `build_resume_plan` 之类还塞了 codex 的 `-c model_reasoning_effort="high"`**：直启的诉求是"我知道我要传什么参数给底层 CLI，只是不想每次手打一长串跳过审批的危险参数"，属于用户对透传语义有明确预期的场景；额外静默塞入其它默认配置（哪怕是好意）会让用户没法确定"这次命令实际执行了什么"，所以 `registry.build_passthrough_plan` 只处理 `auto_approve_args`，不碰运行时的其它默认参数。
 - **危险参数改成运行时类属性 `auto_approve_args`**（`runtime/base.py` 声明、`runtime/claude.py`/`runtime/codex.py` 各赋值一次），原本在每个适配器的 `build_resume_plan`/`build_continue_plan`/`build_new_plan`/`build_new_session_plan` 四处各写一遍字面量字符串，现在四处和直启共用同一份声明。新增运行时想接入直启子命令，只需要declare 这个类属性（不声明则默认空元组，直启不会额外加任何参数）。
+- **`OpenCodeRuntime` 是这个模式下的一个刻意例外**：它的危险参数（`--dangerously-skip-permissions`）只在 `opencode run` 子命令下真实生效，裸命令（`sc opencode` 直启透传的默认形态）带上会直接报错退出（实测确认，非猜测）。这个 flag 因此没有放进 `auto_approve_args`（该属性对 OpenCode 显式设为空元组），而是只硬编码在 `build_continue_plan` 内部——`sc opencode`（裸直启）不会被自动垫上这个参数，这是有意为之，不是遗漏。详见「OpenCode 扫描」节最后一条。新增运行时如果也存在"危险参数只在特定子命令下有效"的情况，应参照这个处理方式，不要为了凑统一模式硬塞进 `auto_approve_args` 导致裸命令被打坏。
 - **用户在透传参数里已经带了该运行时的危险参数时不重复添加**（`build_passthrough_plan` 用 `arg not in user_args` 过滤），这样 `sc claude --dangerously-skip-permissions --resume xxx` 这类用户自己拼好完整参数的调用不会看到参数被加两遍。
 - **`cwd` 恒为 `None`（不改变当前目录）**：直启是"就地拉起"语义，和 TUI 里恢复某个历史会话需要 `cd` 回原 `cwd`不是一回事，不要混用 `usable_cwd`。
 - `_dispatch_direct_launch` 捕获 `execute_launch` 抛出的 `LaunchError`（如运行时未安装）打印错误信息并 `sys.exit(1)`，不让用户看到裸 Python 堆栈。
@@ -227,8 +241,8 @@
 改标题、排序或列宽后，除编译和单测外，还要做真实路径验证：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 
-然后用真实会话列表检查前 120 条没有 raw slug、纯命令、省略号或自产标题 prompt；再用真实终端启动一次 TUI 并退出，确认本机 `sc` 入口指向当前代码。
+然后用真实会话列表检查前 120 条没有 raw slug、纯命令、省略号或自产标题 prompt；再用真实终端启动一次 TUI 并退出，确认本机 `sc` 入口指向当前代码。改动会话扫描/预览逻辑时（不限于 Claude/Codex，OpenCode 同样适用），至少随机抽查 5 条真实会话跑一遍 `scan_sessions`/`load_conversation`，断言没有空文本、字面量 `"None"`、角色标错或时间戳非单调，不能只信手写的单测小样例。

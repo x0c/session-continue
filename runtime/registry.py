@@ -11,6 +11,7 @@ from models import LaunchPlan, LaunchRequest, NewSessionRequest, SessionInfo
 from runtime.base import BaseRuntime, LaunchError
 from runtime.claude import ClaudeRuntime
 from runtime.codex import CodexRuntime
+from runtime.opencode import OpenCodeRuntime
 
 
 class RuntimeRegistry:
@@ -72,7 +73,7 @@ class RuntimeRegistry:
 
 def default_registry() -> RuntimeRegistry:
     """创建默认运行时注册表；新增运行时只需在这里注册一次。"""
-    return RuntimeRegistry((ClaudeRuntime(), CodexRuntime()))
+    return RuntimeRegistry((ClaudeRuntime(), CodexRuntime(), OpenCodeRuntime()))
 
 
 def execute_launch(plan: LaunchPlan) -> None:

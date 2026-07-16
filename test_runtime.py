@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -9,6 +10,27 @@ from pathlib import Path
 import titles
 from models import Handoff, LaunchPlan, LaunchRequest, NewSessionRequest, session_key
 from runtime import BaseRuntime, LaunchError, RuntimeRegistry, default_registry
+
+
+def _make_minimal_opencode_db(path: Path, session_id: str, title: str) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE session (id text PRIMARY KEY, project_id text, parent_id text, "
+            "slug text, directory text, title text, version text, "
+            "time_created integer, time_updated integer, time_archived integer)"
+        )
+        conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text, "
+                      "time_created integer, time_updated integer, data text)")
+        conn.execute("CREATE TABLE part (id text PRIMARY KEY, message_id text, session_id text, "
+                      "time_created integer, time_updated integer, data text)")
+        conn.execute(
+            "INSERT INTO session VALUES (?,'global',NULL,'x','/tmp',?, '1.0.0', 0, 0, NULL)",
+            (session_id, title),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class FakeRuntime(BaseRuntime):
@@ -96,6 +118,75 @@ class RuntimeTests(unittest.TestCase):
                 LaunchRequest(session, "codex", "修复会话接力")
             )
 
+    def test_opencode_resume_plan(self) -> None:
+        registry = default_registry()
+        session = self._session("opencode", "/tmp/not-needed.db", "/tmp/not-exists")
+
+        plan = registry.build_launch_plan(LaunchRequest(session, "opencode", "修复会话接力"))
+
+        self.assertEqual(plan.argv, ("opencode", "-s", "session-123"))
+        self.assertIsNone(plan.cwd)
+
+    def test_opencode_continue_plan(self) -> None:
+        registry = default_registry()
+        session = self._session("opencode", "/tmp/not-needed.db", "/tmp/not-exists")
+
+        plan = registry.get("opencode").build_continue_plan(session, "继续处理未完成的任务")
+
+        self.assertEqual(
+            plan.argv,
+            ("opencode", "run", "--dangerously-skip-permissions", "-s", "session-123", "继续处理未完成的任务"),
+        )
+
+    def test_opencode_new_session_plan_has_no_handoff_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan = default_registry().build_new_session_plan(NewSessionRequest("opencode", td))
+
+        self.assertEqual(plan.argv, ("opencode",))
+        self.assertEqual(plan.cwd, td)
+
+    def test_claude_session_can_handoff_to_opencode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            history = Path(td) / "claude.jsonl"
+            history.write_text("{}\n", encoding="utf-8")
+            session = self._session("claude", str(history), td)
+
+            plan = default_registry().build_launch_plan(
+                LaunchRequest(session, "opencode", "修复会话接力")
+            )
+
+            self.assertEqual(plan.argv[0], "opencode")
+            self.assertIn("--prompt", plan.argv)
+            self.assertNotIn("-s", plan.argv)
+            # OpenCode 主命令不接受 --dangerously-skip-permissions（实测非 run 子命令下会报错退出）
+            self.assertNotIn("--dangerously-skip-permissions", plan.argv)
+            self.assertIn("修复会话接力", plan.argv[-1])
+            self.assertIn("Claude Code JSONL", plan.argv[-1])
+            self.assertEqual(plan.cwd, td)
+
+    def test_opencode_session_can_handoff_to_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_minimal_opencode_db(db_path, "ses_abc123", "修复登录")
+            session = self._session("opencode", str(db_path), td)
+            session["id"] = "ses_abc123"
+
+            plan = default_registry().build_launch_plan(
+                LaunchRequest(session, "claude", "继续接力")
+            )
+
+            self.assertEqual(plan.argv[0], "claude")
+            self.assertIn("opencode export", plan.argv[-1])
+            self.assertIn("ses_abc123", plan.argv[-1])
+
+    def test_opencode_handoff_requires_db_file(self) -> None:
+        session = self._session("opencode", "/tmp/missing-opencode.db", os.getcwd())
+
+        with self.assertRaisesRegex(LaunchError, "历史文件不存在"):
+            default_registry().build_launch_plan(
+                LaunchRequest(session, "claude", "修复会话接力")
+            )
+
     def test_registry_accepts_new_runtime_without_pairwise_logic(self) -> None:
         registry = RuntimeRegistry((*default_registry(), FakeRuntime()))
         with tempfile.TemporaryDirectory() as td:
@@ -107,7 +198,7 @@ class RuntimeTests(unittest.TestCase):
                 LaunchRequest(session, "gemini", "验证扩展能力")
             )
 
-        self.assertEqual(registry.ids, ("claude", "codex", "gemini"))
+        self.assertEqual(registry.ids, ("claude", "codex", "opencode", "gemini"))
         self.assertEqual(plan.argv[0], "gemini")
         self.assertIn("验证扩展能力", plan.argv[-1])
 

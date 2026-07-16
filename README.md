@@ -3,11 +3,11 @@
 [![test](https://github.com/x0c/session-continue/actions/workflows/test.yml/badge.svg)](https://github.com/x0c/session-continue/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Fast terminal session picker for Claude Code and Codex CLI.
+Fast terminal session picker for Claude Code, Codex CLI, and OpenCode.
 
-`session-continue` scans your local Claude Code and Codex CLI history, shows recent coding sessions in a curses TUI, and lets you resume the selected session in its native runtime. It can also hand off a Claude session to Codex, or a Codex session to Claude, by starting a new target session with a structured pointer to the original JSONL history.
+`session-continue` scans your local Claude Code, Codex CLI, and OpenCode history, shows recent coding sessions in a curses TUI, and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
 
-Keywords: Claude Code session manager, Codex CLI resume, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
+Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manager, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
 
 ![Session list across Claude Code and Codex CLI](docs/screenshots/list.png)
 
@@ -15,8 +15,8 @@ Keywords: Claude Code session manager, Codex CLI resume, terminal TUI, AI coding
 
 ## Why Use It
 
-- Browse recent Claude Code and Codex CLI sessions from one terminal screen.
-- Resume with the original runtime using native commands such as `claude --resume` and `codex resume`.
+- Browse recent Claude Code, Codex CLI, and OpenCode sessions from one terminal screen.
+- Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, and `opencode -s <id>`.
 - Preview the user messages and final assistant replies before resuming, each with a timestamp when
   the history format has one; the preview page refreshes automatically while a session keeps writing.
 - Hand off unfinished work between runtimes without rewriting or faking session files.
@@ -27,7 +27,7 @@ Keywords: Claude Code session manager, Codex CLI resume, terminal TUI, AI coding
 
 The tool is local-first.
 
-- It reads local history files under `~/.claude/projects/` and `~/.codex/sessions/`.
+- It reads local history under `~/.claude/projects/`, `~/.codex/sessions/`, and (read-only) OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`.
 - It does not upload session history by itself.
 - Cross-runtime handoff passes the original history file path to the target runtime instead of copying the whole conversation into command-line arguments.
 - Optional title generation calls your installed `claude` command and may consume Claude account quota.
@@ -39,7 +39,7 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 
 - Python 3.10 or newer.
 - macOS or Linux terminal with curses support.
-- Claude Code and/or Codex CLI installed if you want to resume those sessions.
+- Claude Code, Codex CLI, and/or OpenCode installed if you want to resume those sessions.
 
 ## Install
 
@@ -102,18 +102,26 @@ JSON output includes runtime, session ID, title, working directory, update time,
 
 ## Direct Launch
 
-`sc claude [args...]` and `sc codex [args...]` start a brand-new session directly, skipping the
-TUI. Everything after the runtime name is passed through unchanged to the underlying `claude`/`codex`
-command; `sc` only prepends the runtime's auto-approve flag (`--dangerously-skip-permissions` for
-Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex) unless you already included it
-yourself, and wraps the launch in [Keep-Alive](#keep-alive-survive-ssh-disconnects) by default.
+`sc claude [args...]`, `sc codex [args...]`, and `sc opencode [args...]` start a brand-new session
+directly, skipping the TUI. Everything after the runtime name is passed through unchanged to the
+underlying command; `sc` only prepends the runtime's auto-approve flag
+(`--dangerously-skip-permissions` for Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex)
+unless you already included it yourself, and wraps the launch in
+[Keep-Alive](#keep-alive-survive-ssh-disconnects) by default.
 
 ```bash
 sc claude                       # blank auto-approved Claude session, kept alive in the background
 sc claude Fix the failing tests # same, with a first instruction passed straight to claude
 sc codex resume                 # `codex resume`, auto-approved and kept alive
+sc opencode                     # blank OpenCode TUI session, kept alive in the background
 sc --no-keepalive claude        # direct launch without the background tmux wrapper
 ```
+
+OpenCode is the exception: its `--dangerously-skip-permissions` flag is only accepted under
+`opencode run`, not the bare TUI command (confirmed by testing the real binary — the flag makes the
+bare command exit with a usage error). `sc opencode` never adds it automatically; use
+`sc opencode run --dangerously-skip-permissions ...` if you want auto-approval for a non-interactive
+run.
 
 ## Keep-Alive (survive SSH disconnects)
 
@@ -190,10 +198,10 @@ When the target runtime is different, `session-continue` creates a new session i
 - source runtime name;
 - original session title;
 - original working directory;
-- original JSONL history path;
+- original history location (a JSONL file for Claude/Codex, or a SQLite database plus session ID for OpenCode);
 - a short format hint for reading that history.
 
-The original session file is left untouched. The target runtime decides what history it needs to read before continuing the work.
+The original session history is left untouched (opened read-only). The target runtime decides what history it needs to read before continuing the work.
 
 ## Title Generation
 
@@ -218,6 +226,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 | `runtime/` | runtime adapters for scanning, native resume, and new-session launch |
 | `scan_claude.py` | Claude Code history scanner |
 | `scan_codex.py` | Codex CLI history scanner |
+| `scan_opencode.py` | OpenCode history scanner (read-only SQLite queries) |
 | `titles.py` | local title fallback, cache, status labels, and batch generation |
 | `docs/SKILL.md` | agent-facing command reference (SKILL.md convention) |
 | `test_*.py` | unit tests |
@@ -227,7 +236,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 Run the same checks used by CI:
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 

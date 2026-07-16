@@ -1,11 +1,12 @@
 ---
 name: session-continue
-description: Query local Claude Code and Codex CLI session history through the `sc` CLI — list recent sessions, search by topic, read a session's conversation, or build a handoff context package to continue interrupted work. Read-only, no side effects.
+description: Query local Claude Code, Codex CLI, and OpenCode session history through the `sc` CLI — list recent sessions, search by topic, read a session's conversation, or build a handoff context package to continue interrupted work. Read-only, no side effects.
 ---
 
 # sc：本地编程会话数据接口
 
-`sc` 扫描本机 `~/.claude/projects/` 和 `~/.codex/sessions/` 下的会话历史，为大模型 Agent
+`sc` 扫描本机 `~/.claude/projects/`、`~/.codex/sessions/` 和 OpenCode 的 SQLite 数据库
+（`~/.local/share/opencode/opencode.db`，只读打开）下的会话历史，为大模型 Agent
 提供结构化查询命令。**这些命令只读、无副作用**：不会拉起新会话、不会自动接续任务、不会修改
 任何历史文件。拿到数据之后要做什么（继续任务、汇总给用户、转发给另一个 Agent）由调用方决定。
 
@@ -41,7 +42,8 @@ description: Query local Claude Code and Codex CLI session history through the `
 
 ### 会话标识（`<会话>` 参数）
 
-支持完整会话 ID、ID 前缀（如 `8892cd3d`）、或带运行时限定的 `runtime:id`（如 `claude:8892cd3d`）。
+支持完整会话 ID、ID 前缀（如 `8892cd3d`）、或带运行时限定的 `runtime:id`（如 `claude:8892cd3d`、
+`opencode:ses_0ae26219`）。
 前缀在多个运行时之间重复时会返回退出码 5（`ambiguous`），`error.next_commands` 里给出具体候选
 的 `sc show runtime:id` 命令，照着执行即可消歧。
 
@@ -116,7 +118,9 @@ sc list --live --status pending --compact # 更进一步：正在跑、且已在
 
 - `title`：只读已生成的标题缓存或本地兜底标题，不会触发新的标题生成（不花账号额度）。
 - `live` / `pid`：`live` 是运行中会话的进程是否真实存活（Claude 用 pid 注册表 + `os.kill`，Codex
-  用 `pgrep`+`lsof` 探测持有对应会话文件的进程），不是根据文件时间猜的。`pid` 只在 `live=true`
+  用 `pgrep`+`lsof` 探测持有对应会话文件的进程，OpenCode 用 `pgrep` 找进程后读取其工作目录与会话
+  `cwd` 匹配——历史存在共享 SQLite 里，没有 Codex 那样可独占定位的会话文件，同目录下多个历史会话
+  只有最新一条会被标记存活），不是根据文件时间猜的。`pid` 只在 `live=true`
   时非空，供调用方定位/给该进程发信号；sc 本身不提供拉起/接管等副作用命令，`pid` 只是可见性。
 - `keepalive`：会话是否正挂在 sc 自己的后台保活（tmux）里（人类在 `sc` TUI 里用 Enter/`a` 启动会话时
   默认会经过这层，SSH 断开也不中断）。为 `true` 时该会话的进程实际跑在保活层里，`resume_command`
