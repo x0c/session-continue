@@ -201,30 +201,44 @@ def _init_colors() -> None:
     except curses.error:
         bg = curses.COLOR_BLACK
 
-    # 弱化文字（分隔线/次要列/帮助文字）不能用 curses.COLOR_WHITE 强制写死前景色：
-    # 之前固定用白色 + A_DIM，在浅色/白色背景终端里等于「白底写白字再调暗」，
-    # 几乎不可读（用户实测反馈）。终端支持 256 色时改用真正的中灰（xterm 256 色
-    # 第 244 号，在浅色和深色背景下对比度都够），不再叠加 A_DIM（灰色本身已经
-    # 够暗，再叠加会变得过淡）；只有退化到 8/16 色终端时才回退到「终端默认前景
-    # 色 + A_DIM」这个次优方案（无法访问 256 色时能做到的最好效果）。
+    # 前景色不能写死 ANSI 亮色，也不能只靠 A_DIM，否则在浅色/白色背景终端上几乎
+    # 不可读（用户实测反馈）。两类坑：
+    #   1) 弱化文字老实现固定 COLOR_WHITE + A_DIM，白底上等于「白底写白字再调暗」。
+    #   2) 强调色（标签/快捷键/用户消息）和状态色（绿/黄/红）都在使用处叠了 A_BOLD，
+    #      而多数终端会把「加粗的 ANSI 0-7 前景色」升成对应亮色：暗青 #008080 在白底
+    #      本来有 4.77 的对比度，一加粗升成亮青 #00ffff 就只剩 1.25，基本看不清；
+    #      黄(1.07)、绿(1.37) 同理。
+    # 修法统一：终端支持 256 色时，改用「xterm 256 调色板里在浅色和深色背景下对比度
+    # 都够」的具体色号（都按 WCAG 对比度选过，白底/黑底均 ≥4.3）。256 色号是索引色，
+    # A_BOLD 只会加粗字重、不会把色相升成刺眼亮色，从根上避开坑 2。退化到 8/16 色终端
+    # 时才回退到原 ANSI 色（假定深色背景，与改动前行为一致，是这类终端能做到的最好效果）。
     if curses.COLORS >= 256:
-        dim_fg = 244
+        dim_fg = 244        # 中灰：不再叠加 A_DIM（灰本身够暗，再叠会过淡）
         DIM_EXTRA_ATTR = 0
+        accent_fg = 30      # 暗青(teal #008787)：替代加粗后刺眼的亮青
+        done_fg = 28        # 绿 #008700
+        pending_fg = 130    # 琥珀 #af5f00：替代白底几乎不可见的黄
+        aborted_fg = 160    # 红 #d70000
     else:
-        # 8/16 色终端拿不到真正的中灰：bg=-1（默认色可用）时用终端默认前景色，
-        # 至少能随浅色/深色主题自适应；用不了默认色的老终端只能假定黑底、退回
-        # 白字，和改动前行为一致。
+        # 8/16 色终端拿不到 256 调色板：bg=-1（默认色可用）时弱化文字用终端默认前景色，
+        # 至少能随浅色/深色主题自适应；用不了默认色的老终端只能假定黑底、退回白字。
+        # 强调/状态色回退到原 ANSI 色，和改动前行为一致。
         dim_fg = -1 if bg == -1 else curses.COLOR_WHITE
         DIM_EXTRA_ATTR = curses.A_DIM
+        accent_fg = curses.COLOR_CYAN
+        done_fg = curses.COLOR_GREEN
+        pending_fg = curses.COLOR_YELLOW
+        aborted_fg = curses.COLOR_RED
 
-    curses.init_pair(PAIR_TAB_ACTIVE, curses.COLOR_CYAN, bg)
+    curses.init_pair(PAIR_TAB_ACTIVE, accent_fg, bg)
     curses.init_pair(PAIR_TAB_INACTIVE, dim_fg, bg)
     curses.init_pair(PAIR_DIM, dim_fg, bg)
+    # 选中条用亮青底黑字：填充块的背景色与终端主题无关，白底/深底都清晰，保持不变。
     curses.init_pair(PAIR_SELECTED, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(PAIR_DONE, curses.COLOR_GREEN, bg)
-    curses.init_pair(PAIR_PENDING, curses.COLOR_YELLOW, bg)
-    curses.init_pair(PAIR_ABORTED, curses.COLOR_RED, bg)
-    curses.init_pair(PAIR_KEY, curses.COLOR_CYAN, bg)
+    curses.init_pair(PAIR_DONE, done_fg, bg)
+    curses.init_pair(PAIR_PENDING, pending_fg, bg)
+    curses.init_pair(PAIR_ABORTED, aborted_fg, bg)
+    curses.init_pair(PAIR_KEY, accent_fg, bg)
 
 
 def _status_attr(live: bool) -> int:
