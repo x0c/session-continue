@@ -86,7 +86,6 @@ class BaseRuntime(ABC):
             history_path=history_path,
             original_cwd=str(session.get("cwd") or ""),
             history_reading_hint=self.history_reading_hint,
-            status_note=str(session.get("status_tag") or ""),
             conversation_digest=self._conversation_digest(session),
         )
 

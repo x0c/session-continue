@@ -2255,13 +2255,14 @@ class HandoffDigestTests(unittest.TestCase):
         self.assertNotIn("会话状态", prompt)
         self.assertIn("请先读取上述会话历史", prompt)
 
-    def test_prompt_with_digest_includes_status_and_authority_note(self) -> None:
+    def test_prompt_with_digest_omits_status_and_keeps_authority_note(self) -> None:
         messages = [
             ConversationMessage("user", "问题"),
             ConversationMessage("assistant", "答复"),
         ]
         prompt = self._export(messages).render_prompt()
-        self.assertIn(f"会话状态：{titles.STATUS_PENDING}", prompt)
+        # 接力目的就是接着往下干，绝不能把源会话状态（尤其"已完成"）注入提示词误导接手方。
+        self.assertNotIn("会话状态", prompt)
         self.assertIn("以下是从原会话自动提取的对话摘录", prompt)
         self.assertIn("摘录与文件不一致时以文件为准", prompt)
         self.assertIn("请以上述摘录为线索读取原会话历史", prompt)
@@ -2271,7 +2272,7 @@ class HandoffDigestTests(unittest.TestCase):
         handoff = Handoff(
             source_runtime_id="claude", source_runtime_name="Claude", title="标题",
             history_path="/tmp/h.jsonl", original_cwd="/tmp", history_reading_hint="hint",
-            status_note=titles.STATUS_PENDING, conversation_digest="【最近对话】\n用户: 独特摘录内容",
+            conversation_digest="【最近对话】\n用户: 独特摘录内容",
         )
         for runtime in (ClaudeRuntime(), CodexRuntime()):
             plan = runtime.build_new_plan(handoff)

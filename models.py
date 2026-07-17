@@ -92,7 +92,6 @@ class Handoff:
     history_path: str
     original_cwd: str
     history_reading_hint: str
-    status_note: str = ""
     conversation_digest: str = ""
 
     def render_prompt(self) -> str:
@@ -103,8 +102,6 @@ class Handoff:
             f"你正在接力一个来自 {self.source_runtime_name} 的会话。这是跨运行时接力，不是原生恢复。",
             f"原会话历史文件：{self.history_path}\n原工作目录：{cwd}\n历史格式提示：{self.history_reading_hint}",
         ]
-        if self.status_note:
-            sections.append(f"会话状态：{self.status_note}")
         if self.conversation_digest:
             sections.append(
                 "以下是从原会话自动提取的对话摘录（截断版，仅供快速定位任务与进展，"

@@ -121,6 +121,11 @@
   它误解为指自己（用户明确纠正过）。消息压平成单行再截断（`_clip`），多行原文会破坏逐行结构。
 - `pickup context` 的 `suggested_prompt` 与 TUI `a` 接力共用同一个 `render_prompt`，改摘录格式时
   两边同时生效，同步检查 `docs/SKILL.md` 的描述。
+- **接力提示词刻意不注入源会话的列表状态标签（`status_tag`，如 `✅已完成`/`待回复`/`已中断`）**：
+  接力的目的就是接着往下干，一旦开头告诉接手 agent「会话状态：✅已完成」，它极可能直接回
+  「当前没有待办、等新指令」，把接力废掉。是否还有未完成任务由接手 agent 自己读历史 + 看工作区
+  实际状态判断，`render_prompt` 末尾已有对应指令。因此 `Handoff` 不再带 `status_note` 字段，
+  `export_handoff` 也不再从 `status_tag` 取值——不要为了「让接手方知道原状态」把这行加回来。
 
 ## 会话保活（keepalive.py）
 
