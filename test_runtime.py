@@ -187,6 +187,55 @@ class RuntimeTests(unittest.TestCase):
                 LaunchRequest(session, "claude", "修复会话接力")
             )
 
+    def test_kimi_resume_plan(self) -> None:
+        registry = default_registry()
+        session = self._session("kimi", "/tmp/not-needed.jsonl", "/tmp/not-exists")
+
+        plan = registry.build_launch_plan(LaunchRequest(session, "kimi", "修复会话接力"))
+
+        self.assertEqual(plan.argv, ("kimi", "-y", "-S", "session-123"))
+        self.assertIsNone(plan.cwd)
+
+    def test_kimi_new_session_plan_has_no_handoff_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan = default_registry().build_new_session_plan(NewSessionRequest("kimi", td))
+
+        self.assertEqual(plan.argv, ("kimi", "-y"))
+        self.assertEqual(plan.cwd, td)
+
+    def test_claude_session_can_handoff_to_kimi(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            history = Path(td) / "claude.jsonl"
+            history.write_text("{}\n", encoding="utf-8")
+            session = self._session("claude", str(history), td)
+
+            plan = default_registry().build_launch_plan(
+                LaunchRequest(session, "kimi", "修复会话接力")
+            )
+
+        self.assertEqual(plan.argv[0], "kimi")
+        self.assertIn("--add-dir", plan.argv)
+        self.assertIn("-p", plan.argv)  # Kimi 接力目标走非交互 prompt 模式（见适配器说明）
+        self.assertNotIn("-S", plan.argv)
+        self.assertIn("修复会话接力", plan.argv[-1])
+        self.assertIn("Claude Code JSONL", plan.argv[-1])
+        self.assertEqual(plan.cwd, td)
+
+    def test_kimi_session_can_handoff_to_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            history = Path(td) / "wire.jsonl"
+            history.write_text("{}\n", encoding="utf-8")
+            session = self._session("kimi", str(history), td)
+
+            plan = default_registry().build_launch_plan(
+                LaunchRequest(session, "claude", "继续接力")
+            )
+
+        self.assertEqual(plan.argv[0], "claude")
+        self.assertNotIn("--resume", plan.argv)
+        self.assertIn("--add-dir", plan.argv)
+        self.assertIn("context.append_message", plan.argv[-1])
+
     def test_registry_accepts_new_runtime_without_pairwise_logic(self) -> None:
         registry = RuntimeRegistry((*default_registry(), FakeRuntime()))
         with tempfile.TemporaryDirectory() as td:
@@ -198,7 +247,7 @@ class RuntimeTests(unittest.TestCase):
                 LaunchRequest(session, "gemini", "验证扩展能力")
             )
 
-        self.assertEqual(registry.ids, ("claude", "codex", "opencode", "gemini"))
+        self.assertEqual(registry.ids, ("claude", "codex", "opencode", "kimi", "gemini"))
         self.assertEqual(plan.argv[0], "gemini")
         self.assertIn("验证扩展能力", plan.argv[-1])
 

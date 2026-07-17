@@ -42,6 +42,16 @@
 - **判活没有 Codex 那样"进程独占持有会话文件"的信号**：历史在共享 SQLite 里，无法用 `lsof` 定位某个 pid 对应哪个会话。改用 `pgrep -x opencode` 拿存活进程后读其工作目录（Linux 用 `/proc/<pid>/cwd`，macOS 用 `lsof -a -p <pid> -d cwd -Fn` 只查 cwd 一个 fd，比 Codex 判活时的全量 `lsof -p` 还便宜），与会话的 `directory` 字段（`os.path.realpath` 归一化）匹配；命中即认为该 cwd 下"最新一条"会话存活，同目录下更老的历史会话不标记（宁缺毋滥）。已知局限：`opencode serve`/`opencode run` 等同名进程会被一并计入；判活失败（`pgrep` 缺失/调用失败）静默降级为空集，不抛异常。
 - **`--dangerously-skip-permissions` 实测只在 `opencode run` 子命令下生效，官方文档提到的 `--auto` 在本机 v1.15.11 完全不可用**：起初按照 claude/codex 的既有模式把这个 flag 塞进 `auto_approve_args` 类属性、四处复用，结果真机冒烟发现 `opencode --dangerously-skip-permissions -s <id>`（裸 TUI 命令）直接报错退出（exit=1，打印用法说明）——yargs 对默认/主命令的参数校验是严格模式，这个 flag 只在 `opencode run [message..]` 的 `--help` 里出现，主命令完全不认。同时按官方文档站（`opencode.ai/docs/permissions`）的说法，应该有个语义更安全的 `--auto` 参数（保留 deny 规则，只放行会弹 ask 的请求），但本机实测 `opencode --auto` 和 `opencode run --auto` 两种写法都同样报错退出（exit=1）——这台机器装的 1.15.11 版本还不支持这个参数，文档领先于当前发行版（或反过来是文档过时），**以实测行为为准，不要以文档为准**；未来升级 opencode 版本后应重新验证 `--auto` 是否可用，若可用应优先切换过去（deny 规则仍生效，比 `--dangerously-skip-permissions` 更安全）。因此 `OpenCodeRuntime.auto_approve_args` 显式设为空元组（不像 claude/codex 那样声明危险参数），`--dangerously-skip-permissions` 只硬编码在 `build_continue_plan`（唯一走 `run` 子命令、确认可用的路径）里；这意味着 `pickup opencode`（裸直启，透传给主命令）不会像 `pickup claude`/`pickup codex` 那样自动垫上跳过审批参数，也意味着 `build_new_plan`（跨运行时接力读取其它运行时历史时的新会话）里目标 OpenCode 若触发权限询问，需要用户在 TUI 里手动确认——这是相对 claude/codex 的已知能力差距，不是遗漏。
 
+## Kimi 扫描
+
+- **历史按「工作区 / 会话」两级目录存放，不是单文件**：`~/.kimi-code/sessions/<workspace_id>/<session_id>/`，元数据在 `state.json`（`title`、`isCustomTitle`、`workDir`、`lastPrompt`、`createdAt`/`updatedAt`），对话流水在 `agents/main/wire.jsonl`。子 agent 的 `agents/<other>/wire.jsonl` 是旁路对话，扫描和预览一律只读 `main`，忽略其它 agent。元数据优先取 `state.json`（小而权威，`updatedAt` 直接作会话时间）；正文只能解析 `wire.jsonl`。本机没有 `~/.kimi-code/sessions/` 时该运行时会话列表为空，不报错。
+- **wire.jsonl 是协议事件流，混着体量很大的噪音行**：开头的 `config.update`（系统提示，约 20KB）、`llm.tools_snapshot`（工具定义，可上百 KB）、`llm.request`/`usage.record` 等都与对话正文无关。逐行 `json.loads` 会很慢，`scan_kimi._iter_message_entries` 先按带引号的类型值子串（`"context.append_message"` / `"context.append_loop_event"`）廉价过滤，只对真正承载对话的两类事件行做完整解析。**用带引号的类型值而不是 `"type":"…"` 前缀做匹配，是为了兼容紧凑与带空格两种 JSON 写法**（真实 wire 是紧凑的，但测试 fixture 用默认 `json.dumps` 带空格）。
+- **用户 / 助手正文分别来自两类事件**：用户消息是 `type=="context.append_message"` 且 `message.role=="user"`，正文在 `message.content` 里 `type=="text"` 的分片；`message.origin.kind` 非 `"user"`（如 `task-notification` 等系统注入事件）一律丢弃，和 Claude 的 `origin.kind` 过滤同思路。助手正文是 `type=="context.append_loop_event"` 且 `event.type=="content.part"` 且 `event.part.type=="text"`；`part.type=="think"` 是思考过程，跳过。同一轮里连续的文本分片合并成一条助手消息，遇到下一条用户消息断开成新一轮。（`turn.prompt` 事件与 `context.append_message` 冗余，不解析，避免用户消息重复。）
+- **状态推导按末轮角色**：解析到的最后一条消息是用户 → `⏳待回复`，是助手 → `✅已完成`，都没有 → 无状态。Kimi 的 `step.end.finishReason` 里虽然可能有中断信号，但格式尚未在真实数据里充分观察，暂不细分「已中断」，宁缺毋滥（和 OpenCode 一致）。
+- **判活同 OpenCode 思路**：Kimi 没有 pid 注册表，历史也不独占单文件。`_live_pids_by_cwd` 用 `pgrep -x kimi-code`（进程 comm 是 `kimi-code`，不是 `kimi`）拿存活进程，读其 cwd 与会话 `workDir` 归一化匹配，同 cwd 只标最新一条存活。已知局限：`kimi server`/`kimi web` 等同名进程会被计入；判活失败静默降级为空集。
+- **接力到 Kimi 只能走非交互模式（相对 claude/codex 的已知能力差距）**：Kimi 的 `-p/--prompt` 是「跑一个 prompt 并打印，跑完退出」的 headless 模式；根命令不接受位置参数形式的初始 prompt（带位置参数会报 `unknown command`），交互式 TUI 也没有从命令行预置首条消息的入口（实测 dist 里根 action 是 `opts.prompt !== void 0 ? "run prompt" : "start shell"`，二选一）。因此 `KimiRuntime.build_new_plan`（跨运行时接力读别家历史新建 Kimi 会话）只能用 `kimi --add-dir <源历史目录> -y -p <接力提示词>`：Kimi 读原始历史、把最后一个未完成任务跑完并打印结果后退出，用户随后可用 `kimi -c`（continue previous session for working dir）在同一会话上继续交互。同运行时原生恢复（`kimi -y -S <sessionId>`）和空白新会话（`kimi -y`）不受此限。Kimi 作为接力**源**（被别家读取）完全正常：`export_handoff` 指向 `wire.jsonl`，`history_reading_hint` 说明上面的格式。未来 Kimi 若新增交互式预置 prompt 的入口，应把 `build_new_plan` 切成交互式，与 claude/codex 对齐。
+- **`-y/--yolo` 在根命令即生效**：不像 OpenCode 的危险参数只在子命令下可用，Kimi 的 `-y` 主命令直接接受，所以正常放进 `KimiRuntime.auto_approve_args`，`pickup kimi` 裸直启会自动垫上，与 claude/codex 一致。
+
 ## 扫描性能
 
 - **硬性指标：`pickup` 首屏（进程启动到 TUI 首次渲染）延迟必须 ≤1s。** `main()` 里 `store.load()`（→ `registry.scan_all()`）是同步阻塞首屏的调用，扫描没跑完屏幕就是空的；这个指标和验证方式记在 `AGENTS.md`「验证要求」，`test_session_scanning.py` 的 `StartupLatencyTests` 是配套的回归闸门。
@@ -125,7 +135,7 @@
 - **已知边缘案例**：`attach-session` 发起瞬间目标会话恰好自然退出（tmux 报错退出），`pickup` 不做特殊重试，用户重新打开一次 `pickup` 即可（这时该会话已经不再显示"后台运行中"，回车会走正常原生恢复路径）。
 - **`pickup claude`/`pickup codex` 直启子命令是保活的第三个调用点**：`sc.py` 的 `_dispatch_direct_launch` 同样调 `keepalive.enabled()`/`keepalive.wrap_plan()`，和 TUI 的 `_launch()` 复用同一套开关语义（`--no-keepalive`、`SC_KEEPALIVE=0`）。直启没有"已有保活会话"这个概念（每次都是全新会话，`ident` 用 `keepalive.new_session_ident()` 现生成），所以不需要像 `_launch()` 那样先尝试 `attach_plan`。
 
-## 直启子命令（`pickup claude` / `pickup codex` / `pickup opencode`）
+## 直启子命令（`pickup claude` / `pickup codex` / `pickup opencode` / `pickup kimi`）
 
 - **定位**：`main()` 里在 agent_api 分发分支之后、TUI 的 argparse 之前再加一个前置分支——`sys.argv[1]`（跳过可选的前置 `--no-keepalive`）命中 `registry.ids` 就整体转发给 `_dispatch_direct_launch`，不进入下面的 TUI/`--json` 参数体系。这个顺序刻意和 agent_api 的分发方式对称：两者都是"整个命令行属于另一套子系统，不该被 TUI 的 argparse 解析"。
 - **为什么是纯透传 + 只垫危险参数，不像 TUI 里的 `build_resume_plan` 之类还塞了 codex 的 `-c model_reasoning_effort="high"`**：直启的诉求是"我知道我要传什么参数给底层 CLI，只是不想每次手打一长串跳过审批的危险参数"，属于用户对透传语义有明确预期的场景；额外静默塞入其它默认配置（哪怕是好意）会让用户没法确定"这次命令实际执行了什么"，所以 `registry.build_passthrough_plan` 只处理 `auto_approve_args`，不碰运行时的其它默认参数。
@@ -242,8 +252,8 @@
 改标题、排序或列宽后，除编译和单测外，还要做真实路径验证：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 
-然后用真实会话列表检查前 120 条没有 raw slug、纯命令、省略号或自产标题 prompt；再用真实终端启动一次 TUI 并退出，确认本机 `pickup` 入口指向当前代码。改动会话扫描/预览逻辑时（不限于 Claude/Codex，OpenCode 同样适用），至少随机抽查 5 条真实会话跑一遍 `scan_sessions`/`load_conversation`，断言没有空文本、字面量 `"None"`、角色标错或时间戳非单调，不能只信手写的单测小样例。
+然后用真实会话列表检查前 120 条没有 raw slug、纯命令、省略号或自产标题 prompt；再用真实终端启动一次 TUI 并退出，确认本机 `pickup` 入口指向当前代码。改动会话扫描/预览逻辑时（不限于 Claude/Codex，OpenCode、Kimi 同样适用），至少随机抽查 5 条真实会话跑一遍 `scan_sessions`/`load_conversation`，断言没有空文本、字面量 `"None"`、角色标错或时间戳非单调，不能只信手写的单测小样例。

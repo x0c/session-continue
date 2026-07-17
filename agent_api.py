@@ -524,7 +524,7 @@ COMMANDS = [
         "name": "list",
         "help": "结构化列出已注册运行时的会话",
         "args": [
-            {"flags": ["--runtime"], "kwargs": {"help": "只看指定运行时（claude / codex / opencode）"}},
+            {"flags": ["--runtime"], "kwargs": {"help": "只看指定运行时（claude / codex / opencode / kimi）"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 50, "help": "每个运行时最多扫描多少条历史（扫描深度）"}},
             {"flags": ["--top"], "kwargs": {"type": int, "help": "最多返回多少条结果；不影响扫描深度"}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON，并默认只返回常用字段"}},
@@ -534,7 +534,7 @@ COMMANDS = [
             {"flags": ["--fields"], "kwargs": {"help": "逗号分隔的字段名，只返回这些字段"}},
         ],
         "fields": {
-            "runtime": "运行时标识（claude / codex / opencode）",
+            "runtime": "运行时标识（claude / codex / opencode / kimi）",
             "id": "会话完整 ID",
             "short_id": "会话短 ID（前 8 位）",
             "title": "会话标题（缓存的生成标题或本地兜底标题，不触发新生成）",

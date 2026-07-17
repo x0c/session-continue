@@ -13,6 +13,7 @@ from pathlib import Path
 
 import scan_claude
 import scan_codex
+import scan_kimi
 import scan_opencode
 import sc
 import agent_api
@@ -1250,6 +1251,155 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             self.assertEqual(messages[1].timestamp, 200_000 / 1000)
             ts = [m.timestamp for m in messages if m.timestamp is not None]
             self.assertEqual(ts, sorted(ts))
+
+
+def _make_kimi_session(sessions_dir: Path, workspace: str, session_id: str,
+                       state: dict, wire_rows: list[dict]) -> Path:
+    """在临时 sessions 目录下落一份 Kimi 会话（state.json + agents/main/wire.jsonl）。"""
+    session_dir = sessions_dir / workspace / session_id
+    (session_dir / "agents" / "main").mkdir(parents=True, exist_ok=True)
+    (session_dir / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in wire_rows) + "\n", encoding="utf-8")
+    return session_dir
+
+
+def _kimi_user_event(text: str, t: int, origin_kind: str = "user") -> dict:
+    return {"type": "context.append_message", "time": t,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}],
+                        "origin": {"kind": origin_kind}}}
+
+
+def _kimi_assistant_text(text: str, t: int) -> dict:
+    return {"type": "context.append_loop_event", "time": t,
+            "event": {"type": "content.part", "part": {"type": "text", "text": text}}}
+
+
+def _kimi_assistant_think(text: str, t: int) -> dict:
+    return {"type": "context.append_loop_event", "time": t,
+            "event": {"type": "content.part", "part": {"type": "think", "think": text}}}
+
+
+class KimiScanTests(TimezoneMixin, unittest.TestCase):
+    """Kimi Code 历史按「工作区 / 会话」两级目录存放，元数据取 state.json，正文解析 wire.jsonl。"""
+
+    def _scan(self, sessions_dir: Path, **kwargs) -> list[dict]:
+        with mock.patch.object(scan_kimi, "SESSIONS_DIR", str(sessions_dir)), \
+             mock.patch.object(scan_kimi, "_live_pids_by_cwd", return_value={}):
+            return scan_kimi.scan_sessions(**kwargs)
+
+    def test_field_mapping_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sessions_dir = Path(td) / "sessions"
+            _make_kimi_session(
+                sessions_dir, "wd_demo", "session_abc",
+                state={"title": "修复登录", "workDir": td, "lastPrompt": "在吗",
+                       "createdAt": "2026-07-17T08:00:00.000Z", "updatedAt": "2026-07-17T08:05:00.000Z"},
+                wire_rows=[
+                    {"type": "metadata", "protocol_version": "1.4", "created_at": 1_784_275_200_000},
+                    {"type": "config.update", "systemPrompt": "You are Kimi " * 500, "time": 1_784_275_200_000},
+                    _kimi_user_event("帮我修复登录报错", 1_784_275_205_000),
+                    _kimi_assistant_think("先看一下报错栈", 1_784_275_206_000),
+                    _kimi_assistant_text("已定位并修复", 1_784_275_207_000),
+                ],
+            )
+            sessions = self._scan(sessions_dir, limit=10)
+
+            self.assertEqual(len(sessions), 1)
+            info = sessions[0]
+            self.assertEqual(info["source"], "kimi")
+            self.assertEqual(info["id"], "session_abc")
+            self.assertEqual(info["short_id"], "abc")
+            self.assertEqual(info["cwd"], td)
+            self.assertEqual(info["native_title"], "修复登录")
+            self.assertEqual(info["fallback_title"], "修复登录")
+            self.assertEqual(info["status_tag"], titles.STATUS_DONE)
+            self.assertEqual(info["first_user_msg"], "帮我修复登录报错")
+            self.assertEqual(info["last_agent_msg"], "已定位并修复")
+            self.assertEqual(info["path"], str(sessions_dir / "wd_demo" / "session_abc" / "agents" / "main" / "wire.jsonl"))
+            # updatedAt 权威时间优先于文件 mtime
+            self.assertEqual(info["mtime"], scan_kimi._parse_iso("2026-07-17T08:05:00.000Z"))
+
+    def test_pending_status_when_last_event_is_user(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sessions_dir = Path(td) / "sessions"
+            _make_kimi_session(
+                sessions_dir, "wd_demo", "session_pending",
+                state={"title": "待回复", "workDir": td, "updatedAt": "2026-07-17T08:05:00.000Z"},
+                wire_rows=[
+                    _kimi_user_event("第一个问题", 1_784_275_205_000),
+                    _kimi_assistant_text("这是回答", 1_784_275_206_000),
+                    _kimi_user_event("追问一下", 1_784_275_207_000),
+                ],
+            )
+            sessions = self._scan(sessions_dir, limit=10)
+            self.assertEqual(sessions[0]["status_tag"], titles.STATUS_PENDING)
+            self.assertEqual(sessions[0]["last_user_msg"], "追问一下")
+
+    def test_empty_session_is_dropped_but_title_only_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sessions_dir = Path(td) / "sessions"
+            _make_kimi_session(
+                sessions_dir, "wd_demo", "session_blank",
+                state={"title": None, "workDir": td, "updatedAt": "2026-07-17T08:01:00.000Z"},
+                wire_rows=[{"type": "metadata", "protocol_version": "1.4", "created_at": 1_784_275_200_000}],
+            )
+            _make_kimi_session(
+                sessions_dir, "wd_demo", "session_titled",
+                state={"title": "简单问候", "workDir": td, "updatedAt": "2026-07-17T08:02:00.000Z"},
+                wire_rows=[{"type": "metadata", "protocol_version": "1.4", "created_at": 1_784_275_200_000}],
+            )
+            sessions = self._scan(sessions_dir, limit=10)
+            self.assertEqual([s["id"] for s in sessions], ["session_titled"])
+            self.assertEqual(sessions[0]["fallback_title"], "简单问候")
+
+    def test_dead_cwd_session_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sessions_dir = Path(td) / "sessions"
+            _make_kimi_session(
+                sessions_dir, "wd_demo", "session_dead",
+                state={"title": "旧任务", "workDir": "/tmp/does-not-exist-kimi-test",
+                       "updatedAt": "2026-07-17T08:05:00.000Z"},
+                wire_rows=[_kimi_user_event("你好", 1_784_275_205_000)],
+            )
+            self.assertEqual(self._scan(sessions_dir, limit=10), [])
+
+    def test_scan_returns_empty_when_dir_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._scan(Path(td) / "nope", limit=10), [])
+
+    def test_load_conversation_filters_think_and_merges_text(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            wire = Path(td) / "wire.jsonl"
+            _write_jsonl(wire, [
+                {"type": "metadata", "protocol_version": "1.4", "created_at": 1_784_275_200_000},
+                {"type": "config.update", "systemPrompt": "system noise", "time": 1_784_275_200_000},
+                _kimi_user_event("先看看这个报错", 100_000),
+                _kimi_assistant_think("我先想想", 150_000),
+                _kimi_assistant_text("第一段结论", 200_000),
+                _kimi_assistant_text("第二段结论", 201_000),
+                _kimi_user_event("好的继续", 300_000),
+                _kimi_assistant_text("已完成", 400_000),
+            ])
+            messages = scan_kimi.load_conversation(str(wire))
+
+            self.assertEqual([m.role for m in messages], ["user", "assistant", "user", "assistant"])
+            self.assertEqual(messages[1].text, "第一段结论\n\n第二段结论")  # 同轮文本合并，思考剔除
+            self.assertEqual(messages[0].timestamp, 100_000 / 1000)
+            self.assertEqual(messages[1].timestamp, 200_000 / 1000)  # 取该轮首个文本分片时间
+            self.assertEqual(messages[3].text, "已完成")
+
+    def test_load_conversation_drops_system_origin_user_events(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            wire = Path(td) / "wire.jsonl"
+            _write_jsonl(wire, [
+                _kimi_user_event("真人提问", 100_000),
+                _kimi_user_event("系统注入的事件", 150_000, origin_kind="task-notification"),
+                _kimi_assistant_text("回答", 200_000),
+            ])
+            messages = scan_kimi.load_conversation(str(wire))
+            self.assertEqual([m.role for m in messages], ["user", "assistant"])
+            self.assertEqual(messages[0].text, "真人提问")
 
 
 class ConversationPreviewTests(unittest.TestCase):

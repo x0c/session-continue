@@ -3,11 +3,11 @@
 [![test](https://github.com/x0c/pickup/actions/workflows/test.yml/badge.svg)](https://github.com/x0c/pickup/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Fast terminal session picker for Claude Code, Codex CLI, and OpenCode.
+Fast terminal session picker for Claude Code, Codex CLI, OpenCode, and Kimi Code CLI.
 
-`pickup` scans your local Claude Code, Codex CLI, and OpenCode history, shows recent coding sessions in a curses TUI, and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
+`pickup` scans your local Claude Code, Codex CLI, OpenCode, and Kimi Code CLI history, shows recent coding sessions in a curses TUI, and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
 
-Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manager, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
+Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manager, Kimi Code CLI session manager, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
 
 ![Session list across Claude Code and Codex CLI](docs/screenshots/list.png)
 
@@ -15,8 +15,8 @@ Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manage
 
 ## Why Use It
 
-- Browse recent Claude Code, Codex CLI, and OpenCode sessions from one terminal screen.
-- Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, and `opencode -s <id>`.
+- Browse recent Claude Code, Codex CLI, OpenCode, and Kimi Code CLI sessions from one terminal screen.
+- Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, `opencode -s <id>`, and `kimi -S <id>`.
 - Preview the user messages and final assistant replies before resuming, each with a timestamp when
   the history format has one; the preview page refreshes automatically while a session keeps writing.
 - Hand off unfinished work between runtimes without rewriting or faking session files.
@@ -27,7 +27,7 @@ Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manage
 
 The tool is local-first.
 
-- It reads local history under `~/.claude/projects/`, `~/.codex/sessions/`, and (read-only) OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`.
+- It reads local history under `~/.claude/projects/`, `~/.codex/sessions/`, `~/.kimi-code/sessions/`, and (read-only) OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`.
 - It does not upload session history by itself.
 - Cross-runtime handoff passes the original history file path to the target runtime instead of copying the whole conversation into command-line arguments.
 - Optional title generation calls your installed `claude` command and may consume Claude account quota.
@@ -39,7 +39,7 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 
 - Python 3.10 or newer.
 - macOS or Linux terminal with curses support.
-- Claude Code, Codex CLI, and/or OpenCode installed if you want to resume those sessions.
+- Claude Code, Codex CLI, OpenCode, and/or Kimi Code CLI installed if you want to resume those sessions.
 
 ## Install
 
@@ -102,10 +102,12 @@ JSON output includes runtime, session ID, title, working directory, update time,
 
 ## Direct Launch
 
-`pickup claude [args...]`, `pickup codex [args...]`, and `pickup opencode [args...]` start a brand-new session
+`pickup claude [args...]`, `pickup codex [args...]`, `pickup opencode [args...]`, and
+`pickup kimi [args...]` start a brand-new session
 directly, skipping the TUI. Everything after the runtime name is passed through unchanged to the
 underlying command; `pickup` only prepends the runtime's auto-approve flag
-(`--dangerously-skip-permissions` for Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex)
+(`--dangerously-skip-permissions` for Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex,
+`-y` for Kimi)
 unless you already included it yourself, and wraps the launch in
 [Keep-Alive](#keep-alive-survive-ssh-disconnects) by default.
 
@@ -114,6 +116,7 @@ pickup claude                       # blank auto-approved Claude session, kept a
 pickup claude Fix the failing tests # same, with a first instruction passed straight to claude
 pickup codex resume                 # `codex resume`, auto-approved and kept alive
 pickup opencode                     # blank OpenCode TUI session, kept alive in the background
+pickup kimi                         # blank auto-approved Kimi session, kept alive in the background
 pickup --no-keepalive claude        # direct launch without the background tmux wrapper
 ```
 
@@ -198,7 +201,7 @@ When the target runtime is different, `pickup` creates a new session in the targ
 - source runtime name;
 - original session title;
 - original working directory;
-- original history location (a JSONL file for Claude/Codex, or a SQLite database plus session ID for OpenCode);
+- original history location (a JSONL file for Claude/Codex/Kimi, or a SQLite database plus session ID for OpenCode);
 - a short format hint for reading that history.
 
 The original session history is left untouched (opened read-only). The target runtime decides what history it needs to read before continuing the work.
@@ -227,6 +230,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 | `scan_claude.py` | Claude Code history scanner |
 | `scan_codex.py` | Codex CLI history scanner |
 | `scan_opencode.py` | OpenCode history scanner (read-only SQLite queries) |
+| `scan_kimi.py` | Kimi Code CLI history scanner (`~/.kimi-code/sessions/` wire.jsonl) |
 | `titles.py` | local title fallback, cache, status labels, and batch generation |
 | `docs/SKILL.md` | agent-facing command reference (SKILL.md convention) |
 | `test_*.py` | unit tests |
@@ -236,7 +240,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 Run the same checks used by CI:
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 

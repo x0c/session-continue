@@ -23,6 +23,7 @@
     pickup describe          # 查看全部子命令的参数与输出字段说明
     pickup claude [参数…]     # 直启：新建 Claude 会话，参数原样透传，默认全自动放行+后台保活
     pickup codex [参数…]      # 直启：新建 Codex 会话，同上
+    pickup kimi [参数…]       # 直启：新建 Kimi 会话，同上
     pickup --no-keepalive claude [参数…]  # 直启但不包后台保活
 """
 
@@ -1469,7 +1470,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "pickup：终端会话接力工具。\n"
-            "列出 Claude Code / Codex / OpenCode 最近的会话，选择后原生恢复或跨运行时接力。\n"
+            "列出 Claude Code / Codex / OpenCode / Kimi Code 最近的会话，选择后原生恢复或跨运行时接力。\n"
             "默认启动交互式 TUI（curses），需要真实终端；非真实终端自动退化为 JSON。\n"
             "大模型 Agent 结构化查询请用 list/search/show/context/describe 子命令。"
         ),
@@ -1482,7 +1483,7 @@ def main() -> None:
             "  pickup describe        # 查看 list/search/show/context 等子命令的用法\n"
             "\n"
             "JSON 输出字段说明：\n"
-            "  runtime        运行时标识（claude / codex / opencode）\n"
+            "  runtime        运行时标识（claude / codex / opencode / kimi）\n"
             "  id             会话 ID\n"
             "  title          会话标题（本地临时兜底，不调用 AI）\n"
             "  cwd            原会话工作目录\n"
@@ -1491,7 +1492,7 @@ def main() -> None:
             "  size_kb        历史文件大小（KB）\n"
             "  status         会话状态（已完成 / 待回复 / 已中断）\n"
             "  resume_command 恢复该会话的完整 shell 命令（可直接执行）\n"
-            "  history_path   历史文件路径（Claude/Codex 为 JSONL；OpenCode 为 SQLite 数据库）\n"
+            "  history_path   历史文件路径（Claude/Codex/Kimi 为 JSONL；OpenCode 为 SQLite 数据库）\n"
         ),
     )
     parser.add_argument("--limit", type=int, default=50, help="每个来源最多列出多少条")

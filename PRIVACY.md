@@ -1,6 +1,6 @@
 # Privacy
 
-`pickup` is designed as a local terminal utility for existing Claude Code, Codex CLI, and OpenCode users.
+`pickup` is designed as a local terminal utility for existing Claude Code, Codex CLI, OpenCode, and Kimi Code CLI users.
 
 ## Data It Reads
 
@@ -10,6 +10,8 @@
 - OpenCode history from its SQLite database at `~/.local/share/opencode/opencode.db` (or the
   directory pointed to by `OPENCODE_DATA_DIR`), opened with a read-only connection (`mode=ro`).
   The tool never writes to this database.
+- Kimi Code CLI history under `~/.kimi-code/sessions/` (per-session `state.json` metadata and the
+  `agents/main/wire.jsonl` conversation log).
 
 The tool reads these files to build a recent-session list, extract a compact preview, and prepare native resume or cross-runtime handoff commands.
 
@@ -18,7 +20,7 @@ The tool reads these files to build a recent-session list, extract a compact pre
 - Generated title cache under `~/.cache/pickup/titles.json`.
 - A lock file under `~/.cache/pickup/titles.lock` while title generation is running.
 
-It does not write to Claude Code, Codex CLI, or OpenCode history.
+It does not write to Claude Code, Codex CLI, OpenCode, or Kimi Code CLI history.
 
 ## Network And Account Usage
 

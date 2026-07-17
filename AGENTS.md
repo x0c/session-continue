@@ -41,7 +41,7 @@ print(f'{(time.perf_counter()-t)*1000:.0f}ms')
 改动代码、界面或运行时适配器后至少执行：
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 
