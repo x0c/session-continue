@@ -1,11 +1,11 @@
 ---
-name: session-continue
-description: Query local Claude Code, Codex CLI, and OpenCode session history through the `sc` CLI — list recent sessions, search by topic, read a session's conversation, or build a handoff context package to continue interrupted work. Read-only, no side effects.
+name: pickup
+description: Query local Claude Code, Codex CLI, and OpenCode session history through the `pickup` CLI — list recent sessions, search by topic, read a session's conversation, or build a handoff context package to continue interrupted work. Read-only, no side effects.
 ---
 
-# sc：本地编程会话数据接口
+# pickup：本地编程会话数据接口
 
-`sc` 扫描本机 `~/.claude/projects/`、`~/.codex/sessions/` 和 OpenCode 的 SQLite 数据库
+`pickup` 扫描本机 `~/.claude/projects/`、`~/.codex/sessions/` 和 OpenCode 的 SQLite 数据库
 （`~/.local/share/opencode/opencode.db`，只读打开）下的会话历史，为大模型 Agent
 提供结构化查询命令。**这些命令只读、无副作用**：不会拉起新会话、不会自动接续任务、不会修改
 任何历史文件。拿到数据之后要做什么（继续任务、汇总给用户、转发给另一个 Agent）由调用方决定。
@@ -28,66 +28,66 @@ description: Query local Claude Code, Codex CLI, and OpenCode session history th
 
 ## 命令
 
-跑 `sc describe` 获取全部命令的机器可读参数说明（与实现同源，不会漂移）；
-`sc describe <command>` 看单个命令的完整参数和输出字段。
+跑 `pickup describe` 获取全部命令的机器可读参数说明（与实现同源，不会漂移）；
+`pickup describe <command>` 看单个命令的完整参数和输出字段。
 
 | 命令 | 用途 |
 | --- | --- |
-| `sc list [--runtime R] [--limit N] [--top N] [--compact] [--status S] [--cwd 子串] [--live] [--fields a,b]` | 结构化列出会话 |
-| `sc search <关键词...> [--deep] [--runtime R] [--limit N] [--top N] [--compact] [--live] [--fields a,b]` | 按主题找会话 |
-| `sc show <会话> [--messages N \| --full] [--compact] [--out 路径] [--fields a,b]` | 会话详情 + 对话内容 |
-| `sc context <会话>` | 生成接续该会话所需的上下文数据包 |
-| `sc plan continue <会话> --instruction <文本>` | 生成带新指令的非交互式原生续接计划；只返回数据，不执行 |
-| `sc describe [command]` | 查看命令 / 参数 / 输出字段说明 |
+| `pickup list [--runtime R] [--limit N] [--top N] [--compact] [--status S] [--cwd 子串] [--live] [--fields a,b]` | 结构化列出会话 |
+| `pickup search <关键词...> [--deep] [--runtime R] [--limit N] [--top N] [--compact] [--live] [--fields a,b]` | 按主题找会话 |
+| `pickup show <会话> [--messages N \| --full] [--compact] [--out 路径] [--fields a,b]` | 会话详情 + 对话内容 |
+| `pickup context <会话>` | 生成接续该会话所需的上下文数据包 |
+| `pickup plan continue <会话> --instruction <文本>` | 生成带新指令的非交互式原生续接计划；只返回数据，不执行 |
+| `pickup describe [command]` | 查看命令 / 参数 / 输出字段说明 |
 
 ### 会话标识（`<会话>` 参数）
 
 支持完整会话 ID、ID 前缀（如 `8892cd3d`）、或带运行时限定的 `runtime:id`（如 `claude:8892cd3d`、
 `opencode:ses_0ae26219`）。
 前缀在多个运行时之间重复时会返回退出码 5（`ambiguous`），`error.next_commands` 里给出具体候选
-的 `sc show runtime:id` 命令，照着执行即可消歧。
+的 `pickup show runtime:id` 命令，照着执行即可消歧。
 
 ## 典型流程
 
 **按主题找到会话并接续未完成的工作：**
 
 ```bash
-sc search 天气 app                    # 快速搜标题/首尾消息/工作目录
-sc search 天气 app --top 3 --compact  # 只取最相关的 3 条，减少 token
-sc search 天气 app --deep             # 快速搜没结果时，搜全部对话内容（较慢）
-sc show <候选会话的 short_id>          # 确认是不是要找的那次会话
-sc show <候选会话> --full --out /tmp/sc-session.json  # 完整大结果落盘，stdout 只返回引用
-sc context <会话>                     # 拿到 history_path / suggested_prompt / resume_command
-sc plan continue <会话> --instruction "继续完成剩余工作并汇报结果" # 只生成外部执行器可运行的计划
+pickup search 天气 app                    # 快速搜标题/首尾消息/工作目录
+pickup search 天气 app --top 3 --compact  # 只取最相关的 3 条，减少 token
+pickup search 天气 app --deep             # 快速搜没结果时，搜全部对话内容（较慢）
+pickup show <候选会话的 short_id>          # 确认是不是要找的那次会话
+pickup show <候选会话> --full --out /tmp/pickup-session.json  # 完整大结果落盘，stdout 只返回引用
+pickup context <会话>                     # 拿到 history_path / suggested_prompt / resume_command
+pickup plan continue <会话> --instruction "继续完成剩余工作并汇报结果" # 只生成外部执行器可运行的计划
 ```
 
-`sc context` 返回的 `resume_command` 是同运行时原生恢复该会话的 shell 命令（可能为 `null`，
+`pickup context` 返回的 `resume_command` 是同运行时原生恢复该会话的 shell 命令（可能为 `null`，
 比如原历史文件已被删除）；`suggested_prompt` 是跨运行时接力时可以直接复用的首条提示词，内含
 原会话历史文件路径、格式提示、会话状态和从原会话自动提取的对话摘录（原始需求 + 最近数条对话，
 截断版）——摘录给目标运行时一个任务与进展锚点，原始历史文件仍是权威来源，目标运行时应以摘录
 为线索去读取历史、判断已完成和未完成的部分。
 
-`sc plan continue` 用于调用方需要把同运行时续接交给后台执行器时。它会依据运行时适配器返回
+`pickup plan continue` 用于调用方需要把同运行时续接交给后台执行器时。它会依据运行时适配器返回
 `session_ref`、`runtime`、原 `cwd`、能力边界和 `launch`；其中 `launch.argv` 是**参数数组**，新指令
 作为一个独立元素保留，调用方必须以 `execve` / `subprocess` 的 argv 形式执行，不能重新拼成 shell
 字符串。`launch.cwd` 为 `null` 时表示原目录已不可用，调用方应自行拒绝或选择安全的工作目录。
 
 该命令同样只读：不会启动 CLI、不会写入原会话历史、不会创建新会话，也不会消耗模型额度。返回的
-`capabilities.execution=external_only` 明确表示执行责任属于调用方；`sc` 不提供执行、停止或向运行中
+`capabilities.execution=external_only` 明确表示执行责任属于调用方；`pickup` 不提供执行、停止或向运行中
 会话下发消息的能力。内置 Claude/Codex 计划使用各自的非交互式原生续接入口，以便外部后台任务接收
 完成输出；人类在 TUI 中的原生交互恢复行为不受影响。
 
 **列出某个项目最近的会话：**
 
 ```bash
-sc list --cwd my-weather-app --limit 20
-sc list --cwd my-weather-app --limit 80 --top 5 --compact
+pickup list --cwd my-weather-app --limit 20
+pickup list --cwd my-weather-app --limit 80 --top 5 --compact
 ```
 
 **只要还没回复的会话：**
 
 ```bash
-sc list --status pending
+pickup list --status pending
 ```
 
 ## 管家编排典型流程
@@ -95,24 +95,24 @@ sc list --status pending
 **找到当前正在运行的 CodingAgent,判断能不能直接下指令:**
 
 ```bash
-sc list --live --compact                 # 一步拿到「现在有哪些会话进程真的在跑」
-sc list --live --status pending --compact # 更进一步：正在跑、且已在等你回复的
+pickup list --live --compact                 # 一步拿到「现在有哪些会话进程真的在跑」
+pickup list --live --status pending --compact # 更进一步：正在跑、且已在等你回复的
 ```
 
 `live` 是按进程真实判活（pid 存活/写文件锁定），不是文件时间推断；`status` 是最后一轮角色推断的
 会话内容状态。两者组合判断能不能打扰：`live=true` 且 `status=done` 说明进程还开着但已经把当前
 任务处理完，可以直接接着聊；`live=true` 且 `status=pending` 说明正忙着等你回复，插话前先看
 `last_user`/`last_agent` 摘要搞清楚它在问什么。`live=false` 的会话只能走 `resume_command` 重新
-拉起一个进程，不能"接管"——sc 不提供向运行中进程注入输入的能力（本文档开头即说明：sc 只读、无
+拉起一个进程，不能"接管"——pickup 不提供向运行中进程注入输入的能力（本文档开头即说明：pickup 只读、无
 副作用,拿到数据后要做什么由调用方决定）。
 
-`keepalive=true` 的会话额外要注意：它的进程挂在 sc 的后台保活层里，`live` 通常也是 `true`，但
+`keepalive=true` 的会话额外要注意：它的进程挂在 pickup 的后台保活层里，`live` 通常也是 `true`，但
 `resume_command` 此时不安全——执行它会另起一个和保活进程抢同一份会话文件的新进程。这种会话只能
-由人类回到 `sc` TUI 按 Enter 接回现场，管家 Agent 判断"能不能直接下指令"时应把 `keepalive=true`
+由人类回到 `pickup` TUI 按 Enter 接回现场，管家 Agent 判断"能不能直接下指令"时应把 `keepalive=true`
 当作"这条会话已经有人在管，只能提示人类去接，不要建议或代为执行 resume_command"的信号。
 
 `list`/`search` 默认输出已经带 `last_user`/`last_agent`（最近一轮真人消息和助手回复，硬截断精简），
-多数情况下看这两个字段就够判断"这条会话在干嘛"，不必为每条候选都跑一次 `sc show`。
+多数情况下看这两个字段就够判断"这条会话在干嘛"，不必为每条候选都跑一次 `pickup show`。
 
 ## 字段说明要点
 
@@ -121,20 +121,20 @@ sc list --live --status pending --compact # 更进一步：正在跑、且已在
   用 `pgrep`+`lsof` 探测持有对应会话文件的进程，OpenCode 用 `pgrep` 找进程后读取其工作目录与会话
   `cwd` 匹配——历史存在共享 SQLite 里，没有 Codex 那样可独占定位的会话文件，同目录下多个历史会话
   只有最新一条会被标记存活），不是根据文件时间猜的。`pid` 只在 `live=true`
-  时非空，供调用方定位/给该进程发信号；sc 本身不提供拉起/接管等副作用命令，`pid` 只是可见性。
-- `keepalive`：会话是否正挂在 sc 自己的后台保活（tmux）里（人类在 `sc` TUI 里用 Enter/`a` 启动会话时
+  时非空，供调用方定位/给该进程发信号；pickup 本身不提供拉起/接管等副作用命令，`pid` 只是可见性。
+- `keepalive`：会话是否正挂在 pickup 自己的后台保活（tmux）里（人类在 `pickup` TUI 里用 Enter/`a` 启动会话时
   默认会经过这层，SSH 断开也不中断）。为 `true` 时该会话的进程实际跑在保活层里，`resume_command`
-  会另起一个直接抢同一份会话文件的新进程，不应该在这种情况下使用；sc 不提供从命令行直接"接管"
-  保活会话的能力（这属于交互式 TUI 的 Enter 键行为），调用方需要接管时只能提示人类回到 `sc` TUI 操作。
+  会另起一个直接抢同一份会话文件的新进程，不应该在这种情况下使用；pickup 不提供从命令行直接"接管"
+  保活会话的能力（这属于交互式 TUI 的 Enter 键行为），调用方需要接管时只能提示人类回到 `pickup` TUI 操作。
 - `last_user` / `last_agent`：最后一条真人消息和助手最后一轮回复的硬截断摘要（约 120 字），用于
-  快速判断会话在干嘛；需要完整对话仍然用 `sc show`。
+  快速判断会话在干嘛；需要完整对话仍然用 `pickup show`。
 - `status`：英文枚举 `done` / `pending` / `aborted` / `unknown`，程序判断用这个字段，不要解析
   `status_tag`（中文 + emoji，只给人看）。
 - `resumable` / `resume_command`：是否能生成同运行时原生恢复命令，以及可直接执行的恢复命令；这些字段
   只基于扫描结果和运行时适配器生成，不会额外读取会话全文。
 - `session_ref` / `launch`：仅 `plan continue` 返回。`session_ref` 是带运行时的唯一标识；`launch.argv`
   是不经 shell 解释的启动参数数组，`launch.cwd` 是推荐工作目录。不要把 `argv` 拼为 `resume_command`
-  风格的字符串，也不要让 `sc` 代为执行。
+  风格的字符串，也不要让 `pickup` 代为执行。
 - `score` / `matched_via` / `matched_fields`：仅 `search` 返回。`score` 是相关性分数，排序先按分数倒序，
   再按更新时间倒序；`matched_via` 是 `quick` 或 `deep`，兼容旧调用方；`matched_fields` 是命中的字段
   列表，如 `title`、`first_user_msg`、`conversation`。
@@ -153,20 +153,20 @@ sc list --live --status pending --compact # 更进一步：正在跑、且已在
 
 ## 与 OpenConductor 项目关联
 
-`sc` 只提供 `cwd` / `cwd_display`（会话当时的原始工作目录），**不提供、也不应该提供**任何
+`pickup` 只提供 `cwd` / `cwd_display`（会话当时的原始工作目录），**不提供、也不应该提供**任何
 "项目 ID"字段：OpenConductor 的项目标识是项目根目录（通常是含 `.git` 的目录）绝对路径的 SHA1
-摘要（形如 `proj_a1b2c3d4e5f6a7b8`），既算不出来（`sc` 不知道 OpenConductor 的项目扫描结果），
+摘要（形如 `proj_a1b2c3d4e5f6a7b8`），既算不出来（`pickup` 不知道 OpenConductor 的项目扫描结果），
 也不能直接由 cwd 推导（会话当时的 cwd 可能是项目子目录，不等于项目根目录）。
 
 调用方（如需要把某条会话关联到 OpenConductor 已注册项目的管家 Agent）应该：
 
 1. 调 `oc projects --json`，拿到项目列表，每项含 `id`（`proj_` 前缀的项目标识）和 `path`（项目根目录绝对路径）。
-2. 用 `sc` 返回的 `cwd` 去匹配：`cwd` 等于某个 `path`，或 `cwd` 位于该 `path` 之下（前缀匹配），命中的
+2. 用 `pickup` 返回的 `cwd` 去匹配：`cwd` 等于某个 `path`，或 `cwd` 位于该 `path` 之下（前缀匹配），命中的
    那一项的 `id` 就是要用的项目标识。
-3. 不要在 `sc` 侧本地计算或猜测这个 ID——匹配逻辑属于调用方职责，不属于 `sc`。
+3. 不要在 `pickup` 侧本地计算或猜测这个 ID——匹配逻辑属于调用方职责，不属于 `pickup`。
 
 ## 非 Agent 用法
 
-不带子命令直接运行 `sc` 会打开交互式终端 TUI，需要真实终端，供人类手动选择会话；在非真实
-终端环境下会自动退化为 JSON 列表（等价于 `sc list`）。旧版 `sc --json` 参数仍然保留，但字段
-少于 `sc list`（没有 `status` 英文枚举、`short_id` 等），新集成建议直接用本文档的子命令。
+不带子命令直接运行 `pickup` 会打开交互式终端 TUI，需要真实终端，供人类手动选择会话；在非真实
+终端环境下会自动退化为 JSON 列表（等价于 `pickup list`）。旧版 `pickup --json` 参数仍然保留，但字段
+少于 `pickup list`（没有 `status` 英文枚举、`short_id` 等），新集成建议直接用本文档的子命令。

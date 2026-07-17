@@ -1,6 +1,6 @@
 # Privacy
 
-`session-continue` is designed as a local terminal utility for existing Claude Code, Codex CLI, and OpenCode users.
+`pickup` is designed as a local terminal utility for existing Claude Code, Codex CLI, and OpenCode users.
 
 ## Data It Reads
 
@@ -15,8 +15,8 @@ The tool reads these files to build a recent-session list, extract a compact pre
 
 ## Data It Writes
 
-- Generated title cache under `~/.cache/session-continue/titles.json`.
-- A lock file under `~/.cache/session-continue/titles.lock` while title generation is running.
+- Generated title cache under `~/.cache/pickup/titles.json`.
+- A lock file under `~/.cache/pickup/titles.lock` while title generation is running.
 
 It does not write to Claude Code, Codex CLI, or OpenCode history.
 
@@ -31,21 +31,21 @@ When you resume or hand off a session, the selected runtime process takes over t
 ## Keep-Alive (Background tmux)
 
 By default, sessions started or resumed from the TUI are wrapped in a dedicated background `tmux`
-server (socket name `sc-keepalive`) so the underlying process survives an SSH disconnect. This changes
-what stays running after `sc` exits:
+server (socket name `pickup-keepalive`) so the underlying process survives an SSH disconnect. This changes
+what stays running after `pickup` exits:
 
 - The wrapped runtime process (and everything it does) keeps running in the background until it exits
   on its own, is manually closed (`x` in the TUI), or is auto-reaped after being idle (default 24h, see
   `SC_KEEPALIVE_IDLE_HOURS`).
-- To detect which sessions are already backgrounded, `sc` reads the local process table (`ps -eo
-  pid,ppid`) and lists the tmux server's own sessions (`tmux -L sc-keepalive list-sessions`). This is
+- To detect which sessions are already backgrounded, `pickup` reads the local process table (`ps -eo
+  pid,ppid`) and lists the tmux server's own sessions (`tmux -L pickup-keepalive list-sessions`). This is
   local process metadata, not file content, and is not written anywhere.
 - On a machine shared with other local users, anyone able to run commands as your OS user (or root) can
-  attach to `tmux -L sc-keepalive` and see the live terminal content of a backgrounded session — the
-  same exposure any tmux session already has under your account; `sc` does not add encryption or
+  attach to `tmux -L pickup-keepalive` and see the live terminal content of a backgrounded session — the
+  same exposure any tmux session already has under your account; `pickup` does not add encryption or
   access control on top of it.
-- Disable entirely with `sc --no-keepalive` for one run, or `SC_KEEPALIVE=0` permanently. Skipped
-  automatically when `tmux` is not installed or `sc` is already running inside `tmux`/`screen`.
+- Disable entirely with `pickup --no-keepalive` for one run, or `SC_KEEPALIVE=0` permanently. Skipped
+  automatically when `tmux` is not installed or `pickup` is already running inside `tmux`/`screen`.
 
 ## Cross-Runtime Handoff
 

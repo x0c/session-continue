@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sc：终端会话接力工具。
+"""pickup：终端会话接力工具。
 
 单列表格列出已注册运行时（Claude Code / Codex / OpenCode）的最近会话，左右切换来源、
 上下选行，回车后原生恢复，或通过高级操作交给其他运行时接力。
@@ -7,23 +7,23 @@
 注意：默认启动交互式终端 TUI（curses），需要真实终端，不能被自动化脚本或
 大模型直接调用。非真实终端环境（管道、脚本、Agent 调用）会自动退化为 JSON
 会话列表。大模型 Agent 需要结构化查询（列表/搜索/详情/接续上下文/续接计划）时，使用
-`sc list` / `sc search` / `sc show` / `sc context` / `sc plan continue` / `sc describe` 子命令，
+`pickup list` / `pickup search` / `pickup show` / `pickup context` / `pickup plan continue` / `pickup describe` 子命令，
 详见 agent_api.py 和 docs/SKILL.md。
 
 用法：
-    sc                  # 启动 TUI（交互式，需要真实终端）
-    sc --limit 30        # 每个来源最多列出 30 条
-    sc --json            # 输出 JSON 会话列表后退出，不启动 TUI（旧格式，仍保留）
-    sc --json --limit 5  # JSON 模式，每个来源最多 5 条
-    sc list              # 结构化会话列表（推荐给 Agent 使用，字段更完整）
-    sc search 天气 app    # 按关键词搜会话
-    sc show <会话ID前缀>  # 查看会话详情和对话内容
-    sc context <会话ID前缀>  # 生成接续该会话所需的上下文数据包
-    sc plan continue <会话ID前缀> --instruction "继续完成剩余工作"  # 只生成后台续接计划
-    sc describe          # 查看全部子命令的参数与输出字段说明
-    sc claude [参数…]     # 直启：新建 Claude 会话，参数原样透传，默认全自动放行+后台保活
-    sc codex [参数…]      # 直启：新建 Codex 会话，同上
-    sc --no-keepalive claude [参数…]  # 直启但不包后台保活
+    pickup                  # 启动 TUI（交互式，需要真实终端）
+    pickup --limit 30        # 每个来源最多列出 30 条
+    pickup --json            # 输出 JSON 会话列表后退出，不启动 TUI（旧格式，仍保留）
+    pickup --json --limit 5  # JSON 模式，每个来源最多 5 条
+    pickup list              # 结构化会话列表（推荐给 Agent 使用，字段更完整）
+    pickup search 天气 app    # 按关键词搜会话
+    pickup show <会话ID前缀>  # 查看会话详情和对话内容
+    pickup context <会话ID前缀>  # 生成接续该会话所需的上下文数据包
+    pickup plan continue <会话ID前缀> --instruction "继续完成剩余工作"  # 只生成后台续接计划
+    pickup describe          # 查看全部子命令的参数与输出字段说明
+    pickup claude [参数…]     # 直启：新建 Claude 会话，参数原样透传，默认全自动放行+后台保活
+    pickup codex [参数…]      # 直启：新建 Codex 会话，同上
+    pickup --no-keepalive claude [参数…]  # 直启但不包后台保活
 """
 
 from __future__ import annotations
@@ -365,7 +365,7 @@ def _sidebar_width(projects: list[dict], screen_width: int) -> int:
 class SessionStore:
     """持有所有已注册运行时的会话列表与标题缓存。
 
-    标题生成已移交独立后台进程（sc --generate-titles），本类只负责读取缓存，
+    标题生成已移交独立后台进程（pickup --generate-titles），本类只负责读取缓存，
     并通过轮询缓存文件把后台进程逐批写入的新标题反映到界面，自身不写缓存、
     不调用 claude，避免与后台进程重复花额度或竞争缓存文件。
     """
@@ -380,7 +380,7 @@ class SessionStore:
         self.cache = titles.load_cache()
         self.generating: set[str] = set()  # 仍是临时兜底、等待后台进程产出的会话键（转圈圈）
         # 值是 (读取时的历史文件 mtime, 消息列表)；文件 mtime 变化就重读，
-        # 修掉"同一次 sc 内 / 关闭预览重开还是旧内容"的问题。
+        # 修掉"同一次 pickup 内 / 关闭预览重开还是旧内容"的问题。
         self.conversations: dict[str, tuple[float | None, list[ConversationMessage]]] = {}
         self._cache_mtime: float = self._cache_file_mtime()
         self._projects: list[dict] | None = None  # 项目聚合缓存，仅在 load() 时失效
@@ -1385,10 +1385,10 @@ _TITLE_LOCK_FILE = os.path.join(titles.CACHE_DIR, "titles.lock")
 
 
 def _run_title_daemon(registry: RuntimeRegistry, limit: int) -> None:
-    """脱离 TUI 的独立标题生成进程入口（sc --generate-titles）。
+    """脱离 TUI 的独立标题生成进程入口（pickup --generate-titles）。
 
     用文件锁保证全机单实例：拿不到锁说明已有后台进程在跑，直接退出，
-    避免用户反复进 sc 堆积多个生成进程、重复消耗模型额度。
+    避免用户反复进 pickup 堆积多个生成进程、重复消耗模型额度。
     """
     os.makedirs(titles.CACHE_DIR, exist_ok=True)
     lock_fp = open(_TITLE_LOCK_FILE, "w")
@@ -1432,7 +1432,7 @@ def _spawn_title_daemon(limit: int) -> None:
 
 
 def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
-    """处理 `sc [--no-keepalive] <runtime> [参数…]` 直启透传子命令。
+    """处理 `pickup [--no-keepalive] <runtime> [参数…]` 直启透传子命令。
 
     参数原样交给底层运行时（`registry.build_passthrough_plan` 只垫上默认全自动放行参数，
     用户已显式带了就不重复），默认包进后台保活，`--no-keepalive` 可临时关闭。
@@ -1456,7 +1456,7 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_ROOT_NAMES:
         sys.exit(agent_api.dispatch(sys.argv[1:]))
 
-    # `sc claude …` / `sc codex …`（可选前置 --no-keepalive）是直启透传子命令，同样整体
+    # `pickup claude …` / `pickup codex …`（可选前置 --no-keepalive）是直启透传子命令，同样整体
     # 绕开下面的 TUI/--json 旧参数 parser，此处只需运行时 ID 集合，不做真实扫描。
     _direct_launch_argv = sys.argv[1:]
     _direct_launch_probe = (
@@ -1468,7 +1468,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "sc：终端会话接力工具。\n"
+            "pickup：终端会话接力工具。\n"
             "列出 Claude Code / Codex / OpenCode 最近的会话，选择后原生恢复或跨运行时接力。\n"
             "默认启动交互式 TUI（curses），需要真实终端；非真实终端自动退化为 JSON。\n"
             "大模型 Agent 结构化查询请用 list/search/show/context/describe 子命令。"
@@ -1476,10 +1476,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
-            "  sc                 # 启动 TUI，交互式选择并接管终端\n"
-            "  sc --json          # 输出 JSON 会话列表后退出，不启动 TUI（旧格式）\n"
-            "  sc --json --limit 5  # JSON 模式，每个运行时最多 5 条\n"
-            "  sc describe        # 查看 list/search/show/context 等子命令的用法\n"
+            "  pickup                 # 启动 TUI，交互式选择并接管终端\n"
+            "  pickup --json          # 输出 JSON 会话列表后退出，不启动 TUI（旧格式）\n"
+            "  pickup --json --limit 5  # JSON 模式，每个运行时最多 5 条\n"
+            "  pickup describe        # 查看 list/search/show/context 等子命令的用法\n"
             "\n"
             "JSON 输出字段说明：\n"
             "  runtime        运行时标识（claude / codex / opencode）\n"

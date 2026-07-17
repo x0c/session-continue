@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for improving `session-continue`.
+Thanks for improving `pickup`.
 
 ## Development Setup
 

@@ -23,7 +23,7 @@ class OpenCodeRuntime(BaseRuntime):
     # 主命令（TUI，即 -s/--prompt/裸启动 三种交互路径）的 yargs 校验是严格模式，
     # 带上这个未声明的 flag 会直接报错退出（实测 exit=1），而不是像文档假设的
     # 那样被静默忽略。所以这里不把它放进 auto_approve_args——那会被
-    # registry.build_passthrough_plan 无条件拼进 `sc opencode` 裸启动，反而
+    # registry.build_passthrough_plan 无条件拼进 `pickup opencode` 裸启动，反而
     # 直接打不开。只在 build_continue_plan（走 `run` 子命令）里硬编码这一份，
     # 是该参数在 OpenCode 上唯一被证实可用的位置。详见 MAINTAINER_GUIDE。
     auto_approve_args = ()

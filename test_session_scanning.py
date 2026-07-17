@@ -1816,7 +1816,7 @@ class ProjectSidebarTests(unittest.TestCase):
         self.assertEqual(sc._sidebar_width(long_label_projects, 200), sc.SIDEBAR_MAX_WIDTH)
 
     def test_truncate_left_keeps_tail_display_width(self) -> None:
-        text = "SessionContinue/cli"
+        text = "x0c/pickup/cli"
         truncated = sc._truncate_left(text, 10)
 
         self.assertLessEqual(sc._text_width(truncated), 10)
@@ -1954,7 +1954,7 @@ class SessionActionTests(unittest.TestCase):
 
 
 class DirectLaunchTests(unittest.TestCase):
-    """`sc claude [参数…]` / `sc codex [参数…]` 直启透传子命令的分发逻辑。"""
+    """`pickup claude [参数…]` / `pickup codex [参数…]` 直启透传子命令的分发逻辑。"""
 
     def _registry_returning(self, plan: LaunchPlan) -> mock.Mock:
         registry = mock.Mock()
@@ -1963,7 +1963,7 @@ class DirectLaunchTests(unittest.TestCase):
 
     def test_passes_through_args_and_wraps_with_keepalive_by_default(self) -> None:
         plan = LaunchPlan(("claude", "--dangerously-skip-permissions", "把测试修到全绿"), None)
-        wrapped = LaunchPlan(("tmux", "-L", "sc-keepalive", "new-session", "-A", "-s", "sc-claude-xxxx"), None)
+        wrapped = LaunchPlan(("tmux", "-L", "pickup-keepalive", "new-session", "-A", "-s", "sc-claude-xxxx"), None)
         registry = self._registry_returning(plan)
 
         with (
@@ -2351,7 +2351,7 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(result["data"]["pid"], 999)
 
     def test_describe_list_and_search_document_live_flag_and_new_fields(self) -> None:
-        # sc describe 的输出与实现同源，改完命令必须同步这里，防止参数/字段说明漂移。
+        # pickup describe 的输出与实现同源，改完命令必须同步这里，防止参数/字段说明漂移。
         args = mock.Mock(target="list")
         result = agent_api.cmd_describe(args, registry=None)
         list_flags = [flag for arg in result["data"]["args"] for flag in arg["flags"]]
@@ -2371,7 +2371,7 @@ class AgentApiTests(unittest.TestCase):
 class StartupLatencyTests(unittest.TestCase):
     """首屏延迟硬性上限闸门：改动扫描/界面/标题相关代码后必须跑这个用例。
 
-    见 AGENTS.md「验证要求」：sc 首屏（启动到首次渲染）延迟必须 ≤1s。
+    见 AGENTS.md「验证要求」：pickup 首屏（启动到首次渲染）延迟必须 ≤1s。
     registry.scan_all() 就是 main() 里 store.load() 实际同步阻塞首屏的调用；
     本机无真实会话数据时（例如 CI/新机）跳过，避免假失败。
     """

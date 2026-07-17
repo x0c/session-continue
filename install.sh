@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 一键安装 session-continue（不使用 Homebrew 的场景，例如 Linux 或未装 Homebrew 的 macOS）。
-# 用法：curl -fsSL https://raw.githubusercontent.com/x0c/session-continue/main/install.sh | bash
+# 一键安装 pickup（不使用 Homebrew 的场景，例如 Linux 或未装 Homebrew 的 macOS）。
+# 用法：curl -fsSL https://raw.githubusercontent.com/x0c/pickup/main/install.sh | bash
 set -euo pipefail
 
-REPO="x0c/session-continue"
+REPO="x0c/pickup"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "错误：未找到 python3，请先安装 Python 3.10 及以上版本" >&2
@@ -22,19 +22,19 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-VERSION="${SC_VERSION:-}"
+VERSION="${PICKUP_VERSION:-}"
 if [ -z "$VERSION" ]; then
   VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
 fi
 
-echo "正在安装 session-continue ${VERSION} ..."
+echo "正在安装 pickup ${VERSION} ..."
 python3 -m pip install --user --upgrade "git+https://github.com/${REPO}.git@${VERSION}"
 
 SCRIPTS_DIR="$(python3 -m site --user-base)/bin"
 case ":${PATH}:" in
   *":${SCRIPTS_DIR}:"*)
-    echo "安装完成，运行 sc 开始使用。"
+    echo "安装完成，运行 pickup 开始使用。"
     ;;
   *)
     echo ""

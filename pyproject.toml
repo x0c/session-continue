@@ -3,13 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "session-continue"
-version = "0.13.1"
+name = "pickup"
+version = "0.14.0"
 description = "Terminal session picker and handoff tool for Claude Code, Codex CLI, and OpenCode."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "session-continue contributors" }]
+authors = [{ name = "pickup contributors" }]
 keywords = [
   "claude-code",
   "codex-cli",
@@ -35,11 +35,11 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/x0c/session-continue"
-Issues = "https://github.com/x0c/session-continue/issues"
+Homepage = "https://github.com/x0c/pickup"
+Issues = "https://github.com/x0c/pickup/issues"
 
 [project.scripts]
-sc = "sc:main"
+pickup = "sc:main"
 
 [tool.setuptools]
 py-modules = ["models", "sc", "agent_api", "scan_claude", "scan_codex", "scan_opencode", "titles", "titlegen", "keepalive"]

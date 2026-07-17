@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""sc 的机器可读数据接口：面向大模型 Agent 的只读命令集合。
+"""pickup 的机器可读数据接口：面向大模型 Agent 的只读命令集合。
 
-sc 只负责把本地会话数据结构化地交出来（列表 / 搜索 / 详情 / 接续上下文），
+pickup 只负责把本地会话数据结构化地交出来（列表 / 搜索 / 详情 / 接续上下文），
 不负责决定"拿到数据之后做什么"——不新增自动拉起、后台执行等副作用命令。
 所有命令输出统一 JSON envelope：{ok, data, error, meta}。
 
@@ -82,8 +82,8 @@ class JSONArgumentParser(argparse.ArgumentParser):
             "error": {
                 "code": "usage_error",
                 "message": message,
-                "hint": "运行 sc describe 或 sc describe <command> 查看用法",
-                "next_commands": ["sc describe"],
+                "hint": "运行 pickup describe 或 pickup describe <command> 查看用法",
+                "next_commands": ["pickup describe"],
             },
             "meta": {"version": AGENT_API_VERSION},
         })
@@ -198,8 +198,8 @@ def resolve_ref(registry, ref: str, limit: int) -> dict:
     if not matches:
         raise ApiError(
             "not_found", f"未找到匹配会话：{ref}", EXIT_NOT_FOUND,
-            hint="确认会话 ID 或前缀是否正确，可先用 sc search 或 sc list 查看",
-            next_commands=[f"sc search {ref}", "sc list"],
+            hint="确认会话 ID 或前缀是否正确，可先用 pickup search 或 pickup list 查看",
+            next_commands=[f"pickup search {ref}", "pickup list"],
         )
     keepalive.annotate(matches)
 
@@ -211,7 +211,7 @@ def resolve_ref(registry, ref: str, limit: int) -> dict:
         raise ApiError(
             "ambiguous", f"会话标识存在多个候选：{ref}", EXIT_AMBIGUOUS,
             hint="使用更长的前缀或完整 runtime:id",
-            next_commands=[f"sc show {c}" for c in candidates],
+            next_commands=[f"pickup show {c}" for c in candidates],
         )
     return matches[0]
 
@@ -466,13 +466,13 @@ def cmd_plan_continue(args, registry) -> dict:
         raise ApiError(
             "not_resumable", f"该会话无法生成续接计划：{exc}", EXIT_ERROR,
             hint="确认会话所属运行时支持带新指令的原生续接",
-            next_commands=[f"sc context {session_key(session)}"],
+            next_commands=[f"pickup context {session_key(session)}"],
         ) from exc
     except Exception as exc:
         raise ApiError(
             "not_resumable", f"该会话无法生成续接计划：{exc}", EXIT_ERROR,
             hint="确认会话所属运行时支持带新指令的原生续接",
-            next_commands=[f"sc context {session_key(session)}"],
+            next_commands=[f"pickup context {session_key(session)}"],
         ) from exc
 
     return _ok({
@@ -499,7 +499,7 @@ def cmd_describe(args, registry) -> dict:
         if spec is None:
             raise ApiError(
                 "not_found", f"未知命令：{target}", EXIT_NOT_FOUND,
-                hint="运行 sc describe 查看全部命令",
+                hint="运行 pickup describe 查看全部命令",
             )
         return _ok(_describe_command(spec, full=True))
     return _ok({"commands": [_describe_command(spec, full=False) for spec in COMMANDS]})
@@ -546,7 +546,7 @@ COMMANDS = [
             "status": "英文状态枚举：done / pending / aborted / unknown",
             "status_tag": "中文状态标签（含图标），供人类展示用",
             "live": "进程是否真实运行中（true/false），不是文件时间推断",
-            "keepalive": "是否正挂在 sc 的后台保活（tmux）里；为 true 时 resume_command 会另起一个竞争同一份会话文件的新进程，应改用 sc 的 Enter/接回操作而不是 resume_command",
+            "keepalive": "是否正挂在 pickup 的后台保活（tmux）里；为 true 时 resume_command 会另起一个竞争同一份会话文件的新进程，应改用 pickup 的 Enter/接回操作而不是 resume_command",
             "pid": "运行中会话的进程号；非运行中为 null，可用于定位/发信号给该进程",
             "last_user": "最后一条真人消息，硬截断精简，一眼看懂最近在聊什么",
             "last_agent": "助手最后一轮回复片段，硬截断精简",
@@ -632,7 +632,7 @@ COMMANDS = [
             "runtime": "运行时标识",
             "id": "原会话完整 ID",
             "cwd": "原会话工作目录；可能已不存在",
-            "capabilities": "该计划的能力与边界；execution 为 external_only，sc 不会执行计划",
+            "capabilities": "该计划的能力与边界；execution 为 external_only，pickup 不会执行计划",
             "launch.argv": "不经 shell 解释的启动参数数组；新指令是其中独立的一项",
             "launch.cwd": "外部执行器启动进程时应使用的工作目录；目录不可用时为 null",
         },
@@ -662,8 +662,8 @@ COMMAND_ROOT_NAMES = tuple(dict.fromkeys(spec["name"].split()[0] for spec in COM
 
 def build_parser() -> JSONArgumentParser:
     parser = JSONArgumentParser(
-        prog="sc",
-        description="sc 的机器可读数据接口：只读，供大模型 Agent 查询本地会话。",
+        prog="pickup",
+        description="pickup 的机器可读数据接口：只读，供大模型 Agent 查询本地会话。",
     )
     sub = parser.add_subparsers(dest="command")
     parents = {}
@@ -696,11 +696,11 @@ def dispatch(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command:
-        parser.error("缺少子命令，请使用 sc describe 查看可用命令")
+        parser.error("缺少子命令，请使用 pickup describe 查看可用命令")
         return EXIT_USAGE  # pragma: no cover — parser.error 内部已 sys.exit
 
     if args.command not in HANDLERS:
-        parser.error(f"子命令不完整，请使用 sc describe {args.command} 查看用法")
+        parser.error(f"子命令不完整，请使用 pickup describe {args.command} 查看用法")
         return EXIT_USAGE  # pragma: no cover — parser.error 内部已 sys.exit
 
     registry = default_registry()

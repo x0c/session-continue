@@ -14,9 +14,22 @@ import re
 import titlegen
 from models import session_key
 
-CACHE_DIR = os.path.expanduser("~/.cache/session-continue")
+CACHE_DIR = os.path.expanduser("~/.cache/pickup")
+_LEGACY_CACHE_DIR = os.path.expanduser("~/.cache/session-continue")
 CACHE_FILE = os.path.join(CACHE_DIR, "titles.json")
 TITLE_CACHE_VERSION = 3
+
+
+def _migrate_legacy_cache_dir() -> None:
+    """项目改名 session-continue → pickup 后一次性迁移旧缓存目录，避免标题重新生成花钱。"""
+    if os.path.isdir(_LEGACY_CACHE_DIR) and not os.path.exists(CACHE_DIR):
+        try:
+            os.rename(_LEGACY_CACHE_DIR, CACHE_DIR)
+        except OSError:
+            pass
+
+
+_migrate_legacy_cache_dir()
 
 # 状态列统一枚举：Claude / Codex 两个来源共用同一套标签和判定优先级。
 # 优先级（高到低）：已中断 > 待回复 > 已完成 > 空（无法判断末轮角色时不展示状态）。

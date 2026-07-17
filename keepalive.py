@@ -2,7 +2,7 @@
 
 运行时无关的启动包装层，地位类似 titles.py——不属于任何 runtime 适配器，
 `runtime/registry.py` 只负责生成 `LaunchPlan`，本模块负责在执行前后包一层
-tmux。使用独立 socket（`-L sc-keepalive`）和专属配置，与用户自己的 tmux
+tmux。使用独立 socket（`-L pickup-keepalive`）和专属配置，与用户自己的 tmux
 会话/配置完全隔离，不互相污染。
 
 匹配保活会话到已扫描出的 `SessionInfo` 时，不能只靠 tmux 会话名：
@@ -23,7 +23,7 @@ import uuid
 import titles
 from models import LaunchPlan
 
-SOCKET_NAME = "sc-keepalive"
+SOCKET_NAME = "pickup-keepalive"
 SESSION_PREFIX = "sc-"
 _DEFAULT_IDLE_HOURS = 24.0
 _SUBPROCESS_TIMEOUT = 1.5
@@ -37,7 +37,7 @@ _BASE_ARGV = ("tmux", "-L", SOCKET_NAME)
 # 完全缺失，wrap_plan 在真实安装环境里会直接报 `-f` 文件不存在）。改动配置只改这个
 # 常量即可，_ensure_config_file() 会在下次调用时自动把新内容重新落盘覆盖旧文件。
 _TMUX_CONFIG = """\
-# sc 保活会话专用 tmux 配置：只在 `tmux -L sc-keepalive` 这个独立 socket 上生效，
+# pickup 保活会话专用 tmux 配置：只在 `tmux -L pickup-keepalive` 这个独立 socket 上生效，
 # 不读取、不影响用户自己的 ~/.tmux.conf。目标是让接入的会话看起来和原生终端
 # 一样，感觉不到自己在 tmux 里。
 
@@ -57,7 +57,7 @@ bind-key -n C-\\\\ detach-client
 
 
 def _ensure_config_file() -> str:
-    """把内联的 tmux 配置落盘到本地缓存目录，返回文件路径；内容有变化才重写。"""
+    """把内联的 tmux 配置落盘到本地缓存目录（`~/.cache/pickup`），返回文件路径；内容有变化才重写。"""
     os.makedirs(titles.CACHE_DIR, exist_ok=True)
     path = os.path.join(titles.CACHE_DIR, "keepalive.tmux.conf")
     try:

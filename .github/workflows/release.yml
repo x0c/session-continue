@@ -28,13 +28,13 @@ jobs:
           set -euo pipefail
 
           version="${VERSION#v}"
-          download_url="https://github.com/x0c/session-continue/archive/refs/tags/${VERSION}.tar.gz"
+          download_url="https://github.com/x0c/pickup/archive/refs/tags/${VERSION}.tar.gz"
           sha256=$(curl -fsSL "$download_url" | sha256sum | cut -d' ' -f1)
 
           git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/x0c/homebrew-tap.git" tap
           cd tap
 
-          formula="Formula/session-continue.rb"
+          formula="Formula/pickup.rb"
           sed -i \
             -e "s#^  url \".*\"#  url \"${download_url}\"#" \
             -e "s#^  sha256 \".*\"#  sha256 \"${sha256}\"#" \
@@ -48,5 +48,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$formula"
-          git commit -m "session-continue ${version}"
+          git commit -m "pickup ${version}"
           git push origin main
