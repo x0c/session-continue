@@ -50,7 +50,9 @@ def _extract_text(content) -> str | None:
         texts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
-                t = part.get("text", "").strip()
+                # part.get("text", "") 的默认值只在 key 缺失时生效；key 存在但值是
+                # JSON null 时会拿到 None，.strip() 直接 AttributeError，必须 `or ""` 兜底。
+                t = (part.get("text") or "").strip()
                 if t:
                     texts.append(t)
         return " ".join(texts) if texts else None
@@ -72,7 +74,10 @@ def _parse_timestamp(value) -> float | None:
 
 
 def _entry_time(entry: dict) -> float | None:
-    return _parse_timestamp(entry.get("timestamp")) or _parse_timestamp(entry.get("snapshot", {}).get("timestamp"))
+    # entry.get("snapshot", {}) 的默认值只在 key 缺失时生效；key 存在但值是 JSON null
+    # 时会拿到 None，再 .get("timestamp") 直接 AttributeError，必须 `or {}` 兜底。
+    snapshot = entry.get("snapshot") or {}
+    return _parse_timestamp(entry.get("timestamp")) or _parse_timestamp(snapshot.get("timestamp"))
 
 
 _format_display_time = format_message_time
@@ -310,7 +315,9 @@ def _build_session_info(fpath: str, proj: str) -> dict:
             content = e.get("message", {}).get("content", [])
             if isinstance(content, list):
                 for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text", "").strip():
+                    # part.get("text") 可能是 JSON null（key 存在但值为 null），
+                    # 裸 .get("text", "") 的默认值只在 key 缺失时生效，`or ""` 兜底。
+                    if isinstance(part, dict) and part.get("type") == "text" and (part.get("text") or "").strip():
                         last_agent_msg = part["text"]
                         title_candidates.append(("last_agent", last_agent_msg))
                         last_was_user = False
@@ -561,10 +568,14 @@ def load_conversation(path: str) -> list[ConversationMessage]:
                 content = message.get("content", [])
                 if not isinstance(content, list):
                     continue
+                # part.get("text") 可能是 JSON null（key 存在但值为 null）；裸
+                # .get("text", "") 的默认值只在 key 缺失时生效，取到 null 时
+                # str(None) 会产出字面量 "None" 混进正文，或在过滤条件里
+                # .strip() 直接 AttributeError，统一改用 `or ""` 兜底。
                 text_parts = [
-                    str(part.get("text", "")).strip()
+                    (part.get("text") or "").strip()
                     for part in content
-                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text", "").strip()
+                    if isinstance(part, dict) and part.get("type") == "text" and (part.get("text") or "").strip()
                 ]
                 if text_parts:
                     text = "\n\n".join(text_parts)

@@ -48,6 +48,30 @@ class FakeRuntime(BaseRuntime):
         return LaunchPlan((self.executable,), cwd)
 
 
+class BrokenRuntime(BaseRuntime):
+    """scan_sessions 必抛异常的假运行时，供验证 _scan_runtimes 的异常隔离。"""
+
+    id = "broken"
+    display_name = "Broken"
+    executable = "true"
+    history_reading_hint = "测试格式"
+
+    def scan_sessions(self, limit: int) -> list[dict]:
+        raise RuntimeError("模拟某条真实会话记录触发的未预料解析异常")
+
+    def load_conversation(self, session: dict) -> list:
+        return []
+
+    def build_resume_plan(self, session: dict) -> LaunchPlan:
+        return LaunchPlan((self.executable,), None)
+
+    def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
+        return LaunchPlan((self.executable,), None)
+
+    def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
+        return LaunchPlan((self.executable,), cwd)
+
+
 def _session(history_path: str, **overrides) -> dict:
     base = {
         "source": "fake",
@@ -121,6 +145,16 @@ class AgentApiTests(unittest.TestCase):
         args = argparse_namespace(runtime=None, limit=50, status="pending", cwd=None, fields=None)
         result = agent_api.cmd_list(args, self.registry)
         self.assertEqual(result["data"]["count"], 0)
+
+    def test_cmd_list_isolates_exception_from_one_runtime(self) -> None:
+        # 单个运行时的扫描异常（如某条真实会话记录触发未预料的解析 bug）不能
+        # 拖垮其余运行时的结果，也不能让 list 命令直接报错退出。
+        registry = RuntimeRegistry((self.runtime, BrokenRuntime()))
+        args = argparse_namespace(runtime=None, limit=50, status=None, cwd=None, fields=None)
+
+        result = agent_api.cmd_list(args, registry)
+
+        self.assertEqual(result["data"]["count"], 1)
 
     # ---- search ----
 

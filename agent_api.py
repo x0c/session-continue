@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import keepalive
 import titles
@@ -178,6 +179,25 @@ def _match_sessions(sessions: list[dict], ident: str) -> list[dict]:
     ]
 
 
+def _scan_runtimes(runtimes: list, limit: int) -> dict[str, list[dict]]:
+    """并发扫描多个运行时的会话列表，返回 {运行时 id: 会话列表}。
+
+    与 runtime.registry.scan_all 同语义：各运行时读取完全独立的历史目录，
+    线程池只是为了重叠磁盘 I/O 等待；单个运行时扫描异常时降级为空列表，
+    不拖累其余运行时的结果，也不让 list/search/show 等命令因为一条脏数据
+    直接报错退出。
+    """
+    def _scan_one(runtime):
+        try:
+            return runtime.scan_sessions(limit)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=max(1, len(runtimes))) as pool:
+        scanned = pool.map(_scan_one, runtimes)
+    return {runtime.id: result for runtime, result in zip(runtimes, scanned)}
+
+
 def resolve_ref(registry, ref: str, limit: int) -> dict:
     """把用户提供的会话标识（完整 ID / 前缀 / runtime:id）解析为唯一会话。"""
     if not ref:
@@ -191,9 +211,11 @@ def resolve_ref(registry, ref: str, limit: int) -> dict:
             raise ApiError("not_found", f"未注册的运行时：{runtime_id}", EXIT_NOT_FOUND)
         matches = _match_sessions(runtime.scan_sessions(limit), ident)
     else:
+        runtimes = list(registry)
+        scanned = _scan_runtimes(runtimes, limit)
         matches = []
-        for runtime in registry:
-            matches.extend(_match_sessions(runtime.scan_sessions(limit), ref))
+        for runtime in runtimes:
+            matches.extend(_match_sessions(scanned[runtime.id], ref))
 
     if not matches:
         raise ApiError(
@@ -272,7 +294,7 @@ def cmd_list(args, registry) -> dict:
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
     cache = titles.load_cache()
 
-    scanned = {runtime.id: runtime.scan_sessions(args.limit) for runtime in runtimes}
+    scanned = _scan_runtimes(runtimes, args.limit)
     keepalive.annotate([session for bucket in scanned.values() for session in bucket])
 
     candidates = []
@@ -309,7 +331,7 @@ def cmd_search(args, registry) -> dict:
     runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
     cache = titles.load_cache()
 
-    scanned = {runtime.id: runtime.scan_sessions(args.limit) for runtime in runtimes}
+    scanned = _scan_runtimes(runtimes, args.limit)
     keepalive.annotate([session for bucket in scanned.values() for session in bucket])
 
     results = []

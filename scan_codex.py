@@ -97,7 +97,9 @@ def _parse_timestamp(value) -> float | None:
 
 
 def _entry_time(entry: dict) -> float | None:
-    payload = entry.get("payload", {})
+    # entry.get("payload", {}) 的默认值只在 key 缺失时生效；key 存在但值是
+    # JSON null 时会拿到 None，再 .get(...) 直接 AttributeError，必须 `or {}` 兜底。
+    payload = entry.get("payload") or {}
     return _parse_timestamp(entry.get("timestamp")) or _parse_timestamp(payload.get("timestamp"))
 
 
@@ -121,7 +123,7 @@ def _read_session_head(path: str, max_lines: int = 30) -> list[dict]:
                     obj = json.loads(line)
                     entries.append(obj)
                     t = obj.get("type")
-                    pt = obj.get("payload", {}).get("type", "")
+                    pt = (obj.get("payload") or {}).get("type", "")
                     if t == "session_meta":
                         found_meta = True
                     if t == "event_msg" and pt == "user_message":
@@ -201,7 +203,9 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         if entry_time is not None:
             event_time = entry_time
         t = e.get("type")
-        payload = e.get("payload", {})
+        # e.get("payload", {}) 的默认值只在 key 缺失时生效；key 存在但值是
+        # JSON null 时会拿到 None，后续 .get(...) 直接 AttributeError，`or {}` 兜底。
+        payload = e.get("payload") or {}
         pt = payload.get("type", "")
         if t == "session_meta" and cwd is None:
             cwd = payload.get("cwd")
@@ -214,7 +218,7 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
         if entry_time is not None:
             event_time = entry_time
         t = e.get("type")
-        payload = e.get("payload", {})
+        payload = e.get("payload") or {}
         pt = payload.get("type", "")
         if t == "event_msg":
             if pt == "user_message":

@@ -76,12 +76,22 @@ def load_cache() -> dict:
 
 
 def save_cache(cache: dict) -> None:
+    """原子写：后台标题生成进程逐批写、TUI 每秒轮询读同一份缓存文件，
+    直接覆写会被并发读到半截 JSON（load_cache 解析失败退回空字典，界面
+    标题短暂回退临时兜底、转圈圈重置）。先写临时文件再 os.replace 落地，
+    读取方任何时刻看到的都是完整的旧版本或新版本，不会看到半截内容。
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp_path = CACHE_FILE + f".tmp.{os.getpid()}"
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, CACHE_FILE)
     except OSError:
-        pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _title_line(text: str | None) -> str | None:

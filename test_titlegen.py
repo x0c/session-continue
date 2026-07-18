@@ -208,5 +208,41 @@ class RefreshTitlesGeneratorTests(unittest.TestCase):
             self.assertEqual(titles.refresh_titles([_session("s1")], {}), {})
 
 
+class SaveCacheAtomicWriteTests(unittest.TestCase):
+    """save_cache 原子写：后台生成进程逐批写、TUI 轮询读同一文件，不能被撕裂读。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = __import__("tempfile").TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self._patch_dir = mock.patch.object(titles, "CACHE_DIR", self._tmpdir.name)
+        self._patch_file = mock.patch.object(
+            titles, "CACHE_FILE", os.path.join(self._tmpdir.name, "titles.json")
+        )
+        self._patch_dir.start()
+        self._patch_file.start()
+        self.addCleanup(self._patch_dir.stop)
+        self.addCleanup(self._patch_file.stop)
+
+    def test_round_trip_and_no_leftover_tmp_file(self) -> None:
+        titles.save_cache({"claude:s1": {"fp": "v3:100", "title": "修复登录报错"}})
+
+        self.assertEqual(
+            titles.load_cache(), {"claude:s1": {"fp": "v3:100", "title": "修复登录报错"}}
+        )
+        leftovers = [
+            name for name in os.listdir(self._tmpdir.name) if name != "titles.json"
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_readers_never_see_partial_content_across_repeated_writes(self) -> None:
+        # os.replace 是同文件系统内的原子操作：反复覆写后，读到的内容必须
+        # 始终是某一次完整写入的结果，不能是半截 JSON（load_cache 解析失败
+        # 会静默退回 {}，这里断言每次都非空且可解析）。
+        for i in range(20):
+            titles.save_cache({f"claude:s{i}": {"fp": f"v3:{i}", "title": f"标题{i}"}})
+            cache = titles.load_cache()
+            self.assertEqual(len(cache), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

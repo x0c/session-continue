@@ -109,6 +109,35 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
             "@openconductor 页面输入框要支持文件上传和选择图片",
         )
 
+    def test_extract_text_does_not_crash_when_part_text_is_json_null(self) -> None:
+        # part.get("text", "") 的默认值只在 key 缺失时生效；key 存在但值为
+        # JSON null 时曾直接 AttributeError（.strip() on None）。
+        content = [{"type": "text", "text": None}, {"type": "text", "text": "真实文本"}]
+        self.assertEqual(scan_claude._extract_text(content), "真实文本")
+
+    def test_entry_time_does_not_crash_when_snapshot_is_json_null(self) -> None:
+        self.assertIsNone(scan_claude._entry_time({"snapshot": None}))
+
+    def test_build_session_info_does_not_crash_when_tail_assistant_text_is_json_null(self) -> None:
+        # _build_session_info 的尾部循环里同样按 part.get("text", "").strip() 过滤
+        # assistant 文本 part，text 为 JSON null 时曾直接 AttributeError。
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "abc.jsonl"
+            _write_jsonl(
+                path,
+                [
+                    {"type": "user", "message": {"content": "问题"}, "cwd": td,
+                     "timestamp": "2026-07-01T10:00:00Z"},
+                    {"type": "assistant",
+                     "message": {"content": [{"type": "text", "text": None},
+                                              {"type": "text", "text": "真实答复"}]},
+                     "timestamp": "2026-07-01T10:00:05Z"},
+                ],
+            )
+            info = scan_claude._build_session_info(str(path), "proj")
+
+        self.assertEqual(info["last_agent_msg"], "真实答复")
+
     def test_title_uses_last_prompt_and_time_falls_back_to_event_time_when_mtime_stale(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "abc.jsonl"
@@ -747,6 +776,38 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             self.assertEqual(scan_codex._format_display_time(info["event_time"]), "06-25 18:12")
             self.assertEqual(info["status_tag"], titles.STATUS_DONE)
             self.assertEqual(info["first_user_msg"], "修复会话展示")
+
+    def test_build_session_info_does_not_crash_when_payload_is_json_null(self) -> None:
+        # entry.get("payload", {}) 的默认值只在 key 缺失时生效；某些事件类型的
+        # payload 字段可能是 JSON null（key 存在但值为 null），曾在后续
+        # .get(...) 上直接 AttributeError 崩掉整个扫描。
+        with tempfile.TemporaryDirectory() as td:
+            uuid = "019efe42-6d51-7fb3-ad48-112a8eefa03c"
+            path = Path(td) / f"rollout-2026-06-25T18-10-26-{uuid}.jsonl"
+            _write_jsonl(
+                path,
+                [
+                    {
+                        "timestamp": "2026-06-25T10:10:40.522Z",
+                        "type": "session_meta",
+                        "payload": {"id": uuid, "cwd": "/tmp/demo"},
+                    },
+                    {"timestamp": "2026-06-25T10:10:45.000Z", "type": "noise_event", "payload": None},
+                    {
+                        "timestamp": "2026-06-25T10:10:50.000Z",
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": "真实用户消息"},
+                    },
+                ],
+            )
+
+            info = scan_codex._build_session_info(str(path), {})
+
+        self.assertIsNotNone(info)
+        self.assertEqual(info["first_user_msg"], "真实用户消息")
+
+    def test_entry_time_does_not_crash_when_payload_is_json_null(self) -> None:
+        self.assertIsNone(scan_codex._entry_time({"payload": None}))
 
     def test_recovers_true_time_when_stale_session_file_gets_touched(self) -> None:
         """复现真实故障的 Codex 版本：会话内容 9 天前结束，文件之后被 touch
@@ -1612,6 +1673,29 @@ class ConversationPreviewTests(unittest.TestCase):
 
         self.assertEqual(messages[-1].role, "assistant")
         self.assertEqual(messages[-1].timestamp, scan_claude._parse_timestamp("2026-07-01T10:00:05Z"))
+
+    def test_load_conversation_does_not_crash_when_assistant_text_part_is_json_null(self) -> None:
+        # content 数组里某个 text part 的 text 字段是 JSON null（key 存在但值为 null）时，
+        # 曾在过滤条件 part.get("text", "").strip() 上直接 AttributeError 崩掉整段解析。
+        entries = [
+            {"type": "user", "timestamp": "2026-07-01T10:00:00Z", "message": {"content": "问题"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:05Z",
+                "message": {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": None}, {"type": "text", "text": "真实答复"}],
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries), encoding="utf-8")
+
+            messages = scan_claude.load_conversation(str(path))
+
+        self.assertEqual(messages[-1].text, "真实答复")
+        self.assertNotIn("None", messages[-1].text)
 
     def test_codex_conversation_carries_message_timestamp(self) -> None:
         entries = [
