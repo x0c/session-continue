@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import titlegen
@@ -299,20 +300,40 @@ def refresh_titles(sessions: list[dict], cache: dict, generator: "titlegen.Title
     内部按 _BATCH_SIZE 拆批，并以最多 _MAX_PARALLEL_BATCHES 批并行生成。
     例如 25 条待生成会话会启动 5 个并行任务，每个任务处理 5 条；超过
     25 条时，完成的任务会继续领取下一批，避免同时启动过多模型进程。
-    generator 为 None 时按环境自动选择;本机没有任何可用 CLI 时返回空增量。
+    generator 为 None 时按环境自动选择;首选生成器运行失败时自动切换到下一个
+    已安装生成器。本机没有任何可用 CLI 时返回空增量。
     """
     if not sessions:
         return {}
-    if generator is None:
-        generator = titlegen.resolve_generator()
-    if generator is None:
+    generators = (generator,) if generator is not None else titlegen.available_generators()
+    if not generators:
         return {}
 
     merged: dict[str, str] = {}
+    failed_generator_ids: set[str] = set()
+    failure_lock = threading.Lock()
+
+    def generate_chunk(chunk: list[dict]) -> dict[str, str]:
+        """首选生成器失效后降级，避免每个后续批次重复等待同一故障。"""
+        for candidate in generators:
+            with failure_lock:
+                if candidate.id in failed_generator_ids:
+                    continue
+            try:
+                raw = generate_titles_batch(chunk, candidate)
+            except Exception:
+                raw = {}
+            if raw:
+                return raw
+            # 生成器返回空结果代表调用失败、超时或返回内容不可解析。熔断该生成器，
+            # 同一次后台补全内其余批次直接改走下一个候选，避免反复消耗等待时间。
+            with failure_lock:
+                failed_generator_ids.add(candidate.id)
+        return {}
 
     chunks = [sessions[i: i + _BATCH_SIZE] for i in range(0, len(sessions), _BATCH_SIZE)]
     with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_BATCHES, len(chunks))) as pool:
-        futures = {pool.submit(generate_titles_batch, chunk, generator): chunk for chunk in chunks}
+        futures = {pool.submit(generate_chunk, chunk): chunk for chunk in chunks}
         for future in as_completed(futures):
             chunk = futures[future]
             raw = future.result()

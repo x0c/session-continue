@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 import unittest
 from unittest import mock
 
@@ -45,6 +46,12 @@ class ResolveGeneratorTests(unittest.TestCase):
                 mock.patch.dict(os.environ, _NO_ENV):
             generator = titlegen.resolve_generator()
         self.assertEqual(generator.id, "claude")
+
+    def test_available_generators_keeps_configured_choice_first_with_fallback(self) -> None:
+        with mock.patch.object(titlegen.shutil, "which", side_effect=_which({"claude", "codex"})), \
+                mock.patch.dict(os.environ, {**_NO_ENV, titlegen.ENV_GENERATOR: "codex"}):
+            generators = titlegen.available_generators()
+        self.assertEqual([generator.id for generator in generators], ["codex", "claude"])
 
     def test_returns_none_when_nothing_available(self) -> None:
         with mock.patch.object(titlegen.shutil, "which", side_effect=_which(set())), \
@@ -204,8 +211,43 @@ class RefreshTitlesGeneratorTests(unittest.TestCase):
         self.assertEqual(cache["claude:s1"]["title"], "修复登录报错")
 
     def test_returns_empty_when_no_generator_resolvable(self) -> None:
-        with mock.patch.object(titlegen, "resolve_generator", return_value=None):
+        with mock.patch.object(titlegen, "available_generators", return_value=()):
             self.assertEqual(titles.refresh_titles([_session("s1")], {}), {})
+
+    def test_falls_back_to_next_generator_after_preferred_generator_fails(self) -> None:
+        failed = mock.Mock(spec=titlegen.TitleGenerator)
+        failed.id = "claude"
+        failed.generate.side_effect = RuntimeError("Claude 当前不可用")
+        fallback = _StaticGenerator('{"claude:s1": "修复登录报错"}')
+        fallback.id = "codex"
+        with mock.patch.object(titlegen, "available_generators", return_value=(failed, fallback)), \
+                mock.patch.object(titles, "save_cache"):
+            result = titles.refresh_titles([_session("s1")], {})
+        self.assertEqual(result, {"claude:s1": "修复登录报错"})
+        failed.generate.assert_called_once()
+        self.assertTrue(fallback.last_prompt.startswith(titles.PROMPT_MARKER))
+
+    def test_failed_generator_is_not_retried_by_later_batches(self) -> None:
+        failed = mock.Mock(spec=titlegen.TitleGenerator)
+        failed.id = "claude"
+        failed.generate.side_effect = RuntimeError("Claude 当前不可用")
+        fallback = mock.Mock(spec=titlegen.TitleGenerator)
+        fallback.id = "codex"
+
+        def generate_fallback(prompt: str, timeout: int) -> str:
+            payload = json.loads(prompt.rsplit("\n\n", 1)[1])
+            return json.dumps({item["id"]: f"标题{item['id']}" for item in payload}, ensure_ascii=False)
+
+        fallback.generate.side_effect = generate_fallback
+        sessions = [_session(f"s{i}") for i in range(titles._BATCH_SIZE + 1)]
+        with mock.patch.object(titlegen, "available_generators", return_value=(failed, fallback)), \
+                mock.patch.object(titles, "_MAX_PARALLEL_BATCHES", 1), \
+                mock.patch.object(titles, "save_cache"):
+            result = titles.refresh_titles(sessions, {})
+
+        self.assertEqual(len(result), len(sessions))
+        failed.generate.assert_called_once()
+        self.assertEqual(fallback.generate.call_count, 2)
 
 
 class SaveCacheAtomicWriteTests(unittest.TestCase):

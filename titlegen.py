@@ -110,13 +110,17 @@ class CodexTitleGenerator(TitleGenerator):
 _GENERATORS: tuple[TitleGenerator, ...] = (ClaudeTitleGenerator(), CodexTitleGenerator())
 
 
-def resolve_generator() -> TitleGenerator | None:
-    """按环境变量与本机可用性选定生成器;一个都不可用时返回 None。"""
+def available_generators() -> tuple[TitleGenerator, ...]:
+    """返回可用生成器的优先顺序，首选失败时可继续降级。"""
     configured = _env(ENV_GENERATOR, LEGACY_ENV_GENERATOR).lower()
-    for generator in _GENERATORS:
-        if generator.id == configured and generator.is_available():
-            return generator
-    for generator in _GENERATORS:
-        if generator.is_available():
-            return generator
-    return None
+    available = tuple(generator for generator in _GENERATORS if generator.is_available())
+    preferred = next((generator for generator in available if generator.id == configured), None)
+    if preferred is None:
+        return available
+    return (preferred, *(generator for generator in available if generator is not preferred))
+
+
+def resolve_generator() -> TitleGenerator | None:
+    """兼容旧调用：返回当前优先级最高的可用生成器。"""
+    generators = available_generators()
+    return generators[0] if generators else None

@@ -30,7 +30,7 @@ The tool is local-first.
 - It reads local history under `~/.claude/projects/`, `~/.codex/sessions/`, `~/.kimi-code/sessions/`, and (read-only) OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`.
 - It does not upload session history by itself.
 - Cross-runtime handoff passes the original history file path to the target runtime instead of copying the whole conversation into command-line arguments.
-- Optional title generation calls your installed `claude` command and may consume Claude account quota.
+- Optional title generation calls the preferred installed agent CLI (Claude Code first, then Codex) and may consume its account quota.
 - Title cache files are stored under `~/.cache/pickup/`.
 
 See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
