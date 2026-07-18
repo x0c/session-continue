@@ -216,14 +216,15 @@ def resolve_initial_title(session: dict, cache: dict) -> tuple[str, bool]:
     """返回 (标题, 是否还需要后台生成)。
 
     策略：
-    - 缓存命中生成标题 → 直接用。
-    - 缓存缺失或失效 → 显示临时兜底，并提交后台生成。
+    - 缓存命中生成标题 → 直接用，后续会话内容增长也不重新生成。
+    - 缓存缺失或标题无效 → 显示临时兜底，并提交后台生成。
     - 原生标题只在兜底标题不可用时作为临时占位，不作为最终展示来源。
     """
     cached = _cached_entry(session, cache)
     cached_title = _normalize_title(cached.get("title") if cached else None)
     if cached and not _is_low_value_title(cached_title) and not _is_machine_slug(cached_title):
-        return cached_title, cached.get("fp") != _fingerprint(session)
+        # 标题描述的是会话最初的任务，不应因对话持续追加而反复消耗模型重写。
+        return cached_title, False
 
     temporary = _temporary_title(session)
     if temporary:

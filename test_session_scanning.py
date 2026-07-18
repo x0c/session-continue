@@ -568,7 +568,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         self.assertEqual(title, "稳定生成标题")
         self.assertFalse(needs_gen)
 
-    def test_stale_cached_title_is_displayed_while_refreshing(self) -> None:
+    def test_cached_title_is_not_regenerated_when_session_grows(self) -> None:
         session = {
             "source": "codex",
             "id": "abc",
@@ -583,7 +583,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         title, needs_gen = titles.resolve_initial_title(session, cache)
 
         self.assertEqual(title, "稳定生成标题")
-        self.assertTrue(needs_gen)
+        self.assertFalse(needs_gen)
 
     def test_refresh_titles_does_not_retry_each_session_when_batch_fails(self) -> None:
         sessions = [
@@ -645,7 +645,10 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
             except BaseException as exc:
                 outcome["error"] = exc
 
-        with mock.patch.object(titles, "generate_titles_batch", side_effect=fake_batch):
+        with (
+            mock.patch.object(titles, "generate_titles_batch", side_effect=fake_batch),
+            mock.patch.object(titles, "save_cache", return_value=None),
+        ):
             runner = threading.Thread(target=run_refresh)
             runner.start()
             try:
