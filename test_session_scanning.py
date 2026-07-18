@@ -1987,7 +1987,7 @@ class TuiLayoutTests(unittest.TestCase):
         store.registry.get.return_value.display_name = "Claude"
         session = {"source": "claude", "id": full_id, "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
-        screen.getch.return_value = ord("q")
+        screen.getch.return_value = 27
         with mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)) as draw:
             result = pickup._show_preview(screen, store, ui, session, "标题", False)
         draw.assert_called_once_with(screen, messages, "标题", "Claude", full_id, True, 10 ** 9)
@@ -2013,16 +2013,146 @@ class TuiLayoutTests(unittest.TestCase):
         with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, pickup.curses.BUTTON4_PRESSED)):
             self.assertEqual(pickup._preview_mouse_scroll_delta(), -pickup.PREVIEW_MOUSE_SCROLL_LINES)
 
-        # 部分 macOS curses 不暴露 BUTTON5_PRESSED；补出该常量后仍应按相同语义处理向下滚轮。
+        # macOS 自带 ncurses 5.x 不暴露 BUTTON5_PRESSED，而是把向下滚轮
+        # 伪装成中键按下 + 鼠标移动；这条回归确保该平台不会只能向上回滚。
+        with mock.patch.object(pickup.curses, "getmouse",
+                               return_value=(0, 0, 0, 0, pickup.curses.BUTTON2_PRESSED
+                                             | pickup.curses.REPORT_MOUSE_POSITION)):
+            self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
+
+        with mock.patch.object(pickup.curses, "getmouse",
+                               return_value=(0, 0, 0, 0, pickup.curses.BUTTON2_PRESSED)):
+            self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
+
+        # 较新的 ncurses 直接导出 BUTTON5_PRESSED 时仍采用标准掩码。
         with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True):
             with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, 1 << 20)):
                 self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
+
+        # 旧版 curses 的另一种真实形态：BUTTON5_PRESSED「存在但等于 0x0」（Homebrew
+        # Python 按 macOS 系统 ncurses 头文件编译的产物，getattr default 分支救不了），
+        # 下滚可能只报一个裸 REPORT_MOUSE_POSITION 位；掩码必须订阅它、判定必须认它。
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 0, create=True):
+            self.assertTrue(pickup._mouse_wheel_down_mask()
+                            & pickup.curses.REPORT_MOUSE_POSITION)
+            with mock.patch.object(pickup.curses, "getmouse",
+                                   return_value=(0, 0, 0, 0, pickup.curses.REPORT_MOUSE_POSITION)):
+                self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
+
+        # 新版 ncurses 有真 BUTTON5 时，裸位置上报是拖拽 motion 之类的其他事件，
+        # 不能误判为下滚。
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True):
+            with mock.patch.object(pickup.curses, "getmouse",
+                                   return_value=(0, 0, 0, 0, pickup.curses.REPORT_MOUSE_POSITION)):
+                self.assertIsNone(pickup._preview_mouse_scroll_delta())
 
         with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, 0)):
             self.assertIsNone(pickup._preview_mouse_scroll_delta())
 
         with mock.patch.object(pickup.curses, "getmouse", side_effect=pickup.curses.error("no event")):
             self.assertIsNone(pickup._preview_mouse_scroll_delta())
+
+    def test_scrollback_return_event_treats_unknown_mouse_event_as_down_only_while_scrolled(self) -> None:
+        self.assertTrue(pickup._is_scrollback_return_event(0, 3))
+        self.assertFalse(pickup._is_scrollback_return_event(0, 0))
+        self.assertFalse(pickup._is_scrollback_return_event(pickup.curses.BUTTON1_PRESSED, 3))
+
+    def test_main_routes_wheel_from_list_focus_to_left_list_scroll(self) -> None:
+        """左侧滚轮滚列表视口，不能暗中切换当前选中的会话。"""
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 160)
+        sessions = [
+            {"source": "claude", "id": str(i), "short_id": str(i)}
+            for i in range(12)
+        ]
+        store = mock.Mock()
+        store.registry.ids = ["claude"]
+        store.sessions = {"claude": sessions}
+        store.dirty = threading.Event()
+        store.snapshot.return_value = ({}, False)
+        drawn_states: list[tuple[int, int]] = []
+
+        def record_draw(*args) -> None:
+            drawn_states.append((args[2].idx, args[2].top))
+
+        screen.getch.side_effect = [curses.KEY_MOUSE, 27, -1]
+        with (
+            mock.patch.object(pickup.curses, "curs_set"),
+            mock.patch.object(pickup.curses, "raw"),
+            mock.patch.object(pickup, "_init_colors"),
+            mock.patch.object(pickup, "_apply_mousemask"),
+            mock.patch.object(pickup.embed, "PairPool"),
+            mock.patch.object(pickup, "_draw", side_effect=record_draw),
+            mock.patch.object(pickup, "_visible_sessions", return_value=sessions),
+            mock.patch.object(pickup.curses, "getmouse",
+                              return_value=(0, 0, 3, 0, curses.BUTTON2_PRESSED)) as getmouse,
+            mock.patch.object(pickup.threading, "Thread"),
+        ):
+            self.assertIsNone(pickup._run(screen, store, False))
+
+        getmouse.assert_called_once_with()
+        self.assertIn((0, 3), drawn_states)
+
+    def test_main_routes_raw_sgr_wheel_to_left_list_scroll(self) -> None:
+        """ncurses 未转成 KEY_MOUSE 的 SGR 滚轮也必须滚动左侧列表。"""
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 160)
+        sessions = [
+            {"source": "claude", "id": str(i), "short_id": str(i)}
+            for i in range(12)
+        ]
+        store = mock.Mock()
+        store.registry.ids = ["claude"]
+        store.sessions = {"claude": sessions}
+        store.dirty = threading.Event()
+        store.snapshot.return_value = ({}, False)
+        drawn_states: list[tuple[int, int]] = []
+
+        def record_draw(*args) -> None:
+            drawn_states.append((args[2].idx, args[2].top))
+
+        # ESC [ < 65 ; 1 ; 4 M：原始 SGR 向下滚轮，坐标落在左栏。
+        screen.getch.side_effect = [27, *(ord(c) for c in "[<65;1;4M"), 27, -1]
+        with (
+            mock.patch.object(pickup.curses, "curs_set"),
+            mock.patch.object(pickup.curses, "raw"),
+            mock.patch.object(pickup, "_init_colors"),
+            mock.patch.object(pickup, "_apply_mousemask"),
+            mock.patch.object(pickup.embed, "PairPool"),
+            mock.patch.object(pickup, "_draw", side_effect=record_draw),
+            mock.patch.object(pickup, "_visible_sessions", return_value=sessions),
+            mock.patch.object(pickup.threading, "Thread"),
+        ):
+            self.assertIsNone(pickup._run(screen, store, False))
+
+        self.assertIn((0, 3), drawn_states)
+
+    def test_mousemask_forces_sgr_wheel_encoding_for_macos_compatibility(self) -> None:
+        """不依赖旧 ncurses 缺失的 Button5，主动请求 SGR 1006。"""
+        stdout = mock.Mock()
+        with (
+            mock.patch.object(pickup.curses, "mousemask"),
+            mock.patch.object(pickup.curses, "mouseinterval"),
+            mock.patch.object(pickup.sys, "stdout", stdout),
+        ):
+            pickup._apply_mousemask(True)
+            pickup._apply_mousemask(False)
+
+        self.assertEqual(
+            [call.args[0] for call in stdout.write.call_args_list],
+            ["\x1b[?1000h\x1b[?1006h", "\x1b[?1006l\x1b[?1000l"],
+        )
+        self.assertEqual(stdout.flush.call_count, 2)
+
+    def test_runtime_picker_esc_cancels(self) -> None:
+        """所有选择弹窗也必须统一用 Esc 返回。"""
+        screen = mock.Mock()
+        screen.getch.return_value = 27
+        store = mock.Mock()
+        store.registry = []
+
+        with mock.patch.object(pickup, "_draw_runtime_menu"):
+            self.assertIsNone(pickup._pick_runtime(screen, store, "接力", lambda _: "", 0))
 
     def test_preview_scrolls_on_mouse_wheel_and_resets_mousemask_on_exit(self) -> None:
         screen = mock.Mock()
@@ -2034,7 +2164,7 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
 
-        screen.getch.side_effect = [curses.KEY_MOUSE, ord("q")]
+        screen.getch.side_effect = [curses.KEY_MOUSE, 27]
         with (
             mock.patch.object(pickup, "_draw_preview", return_value=(5, 10)) as draw,
             mock.patch.object(pickup.curses, "mousemask") as mousemask,
@@ -2044,12 +2174,13 @@ class TuiLayoutTests(unittest.TestCase):
 
         # 进入时开启滚轮上报；退出时恢复主循环的滚轮上报（主列表页/内嵌面板同样依赖它），
         # 不再清零——清零会让退出预览后主列表的滚轮滚动失效。
-        # 掩码与 pickup._apply_mousemask 一致：滚轮 + 左键按下/抬起（面板内点击丢弃需要
+        # 掩码与 pickup._apply_mousemask 一致：滚轮 + 左键点击/按下/抬起（面板内点击丢弃需要
         # 先订阅到事件，不订阅会被 ncurses 队列层直接滤掉）
         wheel_mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
+                      | getattr(curses, "BUTTON1_CLICKED", 0)
                       | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
                       | getattr(curses, "REPORT_MOUSE_POSITION", 0)
-                      | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+                      | curses.BUTTON4_PRESSED | pickup._mouse_wheel_down_mask())
         mousemask.assert_any_call(wheel_mask)
         mousemask.assert_called_with(wheel_mask)
         # 第二次绘制应该带着鼠标滚轮增量后的滚动位置。
@@ -2066,7 +2197,7 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
 
-        screen.getch.side_effect = [ord("m"), ord("m"), ord("q")]
+        screen.getch.side_effect = [ord("m"), ord("m"), 27]
         with (
             mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)) as draw,
             mock.patch.object(pickup.curses, "mousemask") as mousemask,
@@ -2074,9 +2205,10 @@ class TuiLayoutTests(unittest.TestCase):
             pickup._show_preview(screen, store, ui, session, "标题", False)
 
         default_mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
+                        | getattr(curses, "BUTTON1_CLICKED", 0)
                         | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
                         | getattr(curses, "REPORT_MOUSE_POSITION", 0)
-                        | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+                        | curses.BUTTON4_PRESSED | pickup._mouse_wheel_down_mask())
         # 进入开、按 m 关、再按 m 开、退出恢复：退出时恢复主循环的滚轮上报（默认掩码）而非清零，
         # mousemask 调用序列必须完整反映这四步。
         self.assertEqual(
@@ -2193,56 +2325,42 @@ class ProjectSidebarTests(unittest.TestCase):
         self.assertTrue(truncated.startswith("…"))
         self.assertEqual(pickup._truncate_left("cli", 10), "cli")  # 不超宽时原样返回
 
-    def test_visible_sessions_filters_by_selected_project(self) -> None:
+    def test_visible_sessions_mixes_runtimes_and_filters_by_project(self) -> None:
         sessions = [{"cwd": "/a/x"}, {"cwd": "/a/y"}]
         store = mock.Mock()
-        store.sessions = {"claude": sessions}
-        store.projects.return_value = [
-            {"cwd_key": "/a/x", "label": "x", "count": 1, "latest_mtime": 1},
-            {"cwd_key": "/a/y", "label": "y", "count": 1, "latest_mtime": 1},
-        ]
+        store.all_sessions.return_value = sessions
 
-        filtered = pickup._visible_sessions(store, pickup.UIState(source="claude", proj_idx=1), sidebar_visible=True)
+        filtered = pickup._visible_sessions(store, pickup.UIState(source="claude", project_key="/a/x"))
         self.assertEqual(filtered, [sessions[0]])
 
-        unfiltered = pickup._visible_sessions(store, pickup.UIState(source="claude", proj_idx=0), sidebar_visible=True)
+        unfiltered = pickup._visible_sessions(store, pickup.UIState(source="claude"))
         self.assertEqual(unfiltered, sessions)
 
-        hidden = pickup._visible_sessions(store, pickup.UIState(source="claude", proj_idx=1), sidebar_visible=False)
-        self.assertEqual(hidden, sessions)
-
-    def _store_with_projects(self, projects: list[dict]) -> mock.Mock:
-        store = mock.Mock()
-        store.projects.return_value = projects
-        return store
-
     def test_new_session_cwd_prefers_selected_project_over_session(self) -> None:
-        store = self._store_with_projects([{"cwd_key": "/proj/a", "label": "a"}])
-        ui = pickup.UIState(source="claude", proj_idx=1)
+        store = mock.Mock()
+        ui = pickup.UIState(source="claude", project_key="/proj/a")
         session = {"cwd": "/proj/other"}
 
-        self.assertEqual(pickup._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/a")
+        self.assertEqual(pickup._new_session_cwd(store, ui, session), "/proj/a")
 
     def test_new_session_cwd_falls_back_to_session_cwd_when_all_projects(self) -> None:
-        store = self._store_with_projects([{"cwd_key": "/proj/a", "label": "a"}])
-        ui = pickup.UIState(source="claude", proj_idx=0)
+        store = mock.Mock()
+        ui = pickup.UIState(source="claude")
         session = {"cwd": "/proj/session"}
 
-        self.assertEqual(pickup._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/session")
+        self.assertEqual(pickup._new_session_cwd(store, ui, session), "/proj/session")
 
     def test_new_session_cwd_none_without_project_or_session(self) -> None:
-        store = self._store_with_projects([])
-        ui = pickup.UIState(source="claude", proj_idx=0)
+        store = mock.Mock()
+        ui = pickup.UIState(source="claude")
 
-        self.assertIsNone(pickup._new_session_cwd(store, ui, None, sidebar_visible=True))
-        self.assertIsNone(pickup._new_session_cwd(store, ui, None, sidebar_visible=False))
+        self.assertIsNone(pickup._new_session_cwd(store, ui, None))
 
     def test_new_session_cwd_unknown_project_returns_none(self) -> None:
-        # cwd_key == "" 表示"(未知目录)"分组，没有真实路径可用。
-        store = self._store_with_projects([{"cwd_key": "", "label": pickup.UNKNOWN_PROJECT_LABEL}])
-        ui = pickup.UIState(source="claude", proj_idx=1)
+        store = mock.Mock()
+        ui = pickup.UIState(source="claude", project_key="")
 
-        self.assertIsNone(pickup._new_session_cwd(store, ui, {"cwd": "/should/not/use"}, sidebar_visible=True))
+        self.assertIsNone(pickup._new_session_cwd(store, ui, {"cwd": "/should/not/use"}))
 
 
 class SessionActionTests(unittest.TestCase):
@@ -2300,26 +2418,16 @@ class SessionActionTests(unittest.TestCase):
         pick.assert_not_called()
         self.assertEqual(result, pickup.NewSessionRequest("claude", "/proj/a"))
 
-    def test_n_on_sidebar_focus_opens_runtime_picker(self) -> None:
-        ui = pickup.UIState(source="claude", focus="sidebar", proj_idx=1)
+    def test_n_uses_runtime_of_current_global_selection(self) -> None:
+        ui = pickup.UIState(source="codex")
         with (
             mock.patch.object(pickup, "_new_session_cwd", return_value="/proj/a"),
             mock.patch.object(pickup, "usable_cwd", side_effect=lambda cwd: cwd),
-            mock.patch.object(pickup, "_pick_runtime_for_new_session", return_value="codex") as pick,
+            mock.patch.object(pickup, "_pick_runtime_for_new_session") as pick,
         ):
-            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
-        pick.assert_called_once_with(mock.ANY, self.store, "claude")
+            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, {"cwd": "/proj/a"}, False)
+        pick.assert_not_called()
         self.assertEqual(result, pickup.NewSessionRequest("codex", "/proj/a"))
-
-    def test_n_on_sidebar_focus_cancelled_picker_stays(self) -> None:
-        ui = pickup.UIState(source="claude", focus="sidebar", proj_idx=1)
-        with (
-            mock.patch.object(pickup, "_new_session_cwd", return_value="/proj/a"),
-            mock.patch.object(pickup, "usable_cwd", side_effect=lambda cwd: cwd),
-            mock.patch.object(pickup, "_pick_runtime_for_new_session", return_value=None),
-        ):
-            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
-        self.assertIs(result, pickup._ACTION_STAY)
 
 
 class DirectLaunchTests(unittest.TestCase):

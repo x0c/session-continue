@@ -103,19 +103,24 @@ JSON output includes runtime, session ID, title, working directory, update time,
 
 ## Embedded Panes (work on multiple sessions at once)
 
-Pressing `Enter` on a session no longer takes over your terminal. Instead, the session opens
-**embedded** in the right half of the `pickup` window, hosted in the background tmux server, while
-the session list shrinks to a left sidebar — so you can run several agent sessions in parallel and
-switch between them without losing any of them:
+`pickup` is a unified, time-ordered session timeline: Claude Code, Codex CLI, OpenCode, and Kimi
+Code sessions appear in one list rather than separate runtime tabs. Each two-line card shows
+`project: title` first, then runtime, status, and the right-aligned update time. The right half
+always follows the selection: hosted sessions render their live terminal, while history that is not
+currently hosted shows an instant summary without starting a process.
 
-- `Enter` opens the selected session in the right-hand pane (already-running background sessions
-  just focus their live view). Keystrokes go straight to the session over a persistent tmux
-  control-mode channel; the agent keeps running in tmux even when you leave the pane.
-- `Ctrl-\` moves keyboard focus back to the session list (same muscle memory as detaching).
-- Scroll wheel works inside the pane: if the agent requested mouse input, wheel events are
-  forwarded to it as SGR mouse sequences; otherwise the wheel browses the pane's scrollback
-  (rendered from tmux history) and any keystroke drops you back to the live view. Wheel over
-  the left sidebar scrolls the session list. Mouse events never trigger a full redraw, so
+- `Enter` resumes the selected session in the right-hand pane, or gives keyboard focus to its
+  already-hosted live terminal. Moving the selection alone never starts an agent.
+- Click a session card to do the same thing as `Enter`; click an empty part of the left list to
+  return keyboard control to browsing.
+- Type `\\` quickly while operating a pane to return keyboard focus to the list. A single `\`
+  is passed through to the agent after a short delay, and `Ctrl-\` remains supported for compatibility.
+- `p` pins the right pane to the current session so you can browse other history while monitoring it;
+  press `p` again to restore follow mode. `f` cycles the optional project filter.
+- Scroll wheel always browses the pane's scrollback (rendered from tmux history), even when the
+  embedded agent requests mouse input; this makes up/down scrolling reliable and any keystroke
+  drops you back to the live view. Use `e` when an agent needs direct mouse-wheel input. Wheel
+  over the left sidebar scrolls the session list. Mouse events never trigger a full redraw, so
   drag storms can't freeze the UI.
 - Drag to select anywhere — pickup implements its own selection: drag with the left button
   and the highlighted text is copied straight to your clipboard (OSC 52, works over SSH),
@@ -136,7 +141,7 @@ switch between them without losing any of them:
   `Shift`/`Option`-drag, which bypasses mouse reporting).
 - `c` closes the split and returns to the full-width list; hosted sessions keep running in the
   background and can be reopened with `Enter`.
-- `x` on a backgrounded session still kills it (with confirmation); quitting `pickup` with `q`
+- `x` on a backgrounded session still kills it (with confirmation); quitting `pickup` with `Esc`
   never kills anything — everything stays alive in tmux.
 
 ## Direct Launch
@@ -221,16 +226,19 @@ agent workflows.
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` / `j` / `k` | Move selection |
-| `Left` / `Right` / `Tab` | Switch runtime column |
+| `f` | Cycle the project filter (all projects first) |
+| `p` | Pin or unpin the right-hand detail pane |
 | `Space` | Open full-screen conversation preview |
 | `Home` / `End` | Jump in preview |
 | `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background) |
 | `a` | Open advanced handoff actions |
 | `x` | Close a backgrounded (keep-alive) session, with confirmation |
-| `q` | Close preview/dialog or quit |
+| `Esc` | Close preview/dialog or quit |
 
-`Esc` is intentionally not used as the quit key because terminals also use escape sequences for arrow keys.
-Inside a keep-alive session, `Ctrl-\` detaches back to `pickup` without ending the process (see [Keep-Alive](#keep-alive-survive-ssh-disconnects)).
+`pickup` waits briefly for an escape sequence to complete, so `Esc` can close the current
+view without breaking arrow keys.
+Inside an embedded session, `\\` returns to browsing without ending the process; `Ctrl-\` remains a
+compatibility shortcut (see [Keep-Alive](#keep-alive-survive-ssh-disconnects)).
 
 ## Cross-Runtime Handoff
 
