@@ -13,11 +13,12 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
 from models import ConversationMessage, effective_session_time, format_message_time
+from scan_common import parse_timestamp as _parse_timestamp
+from scan_common import shorten_cwd as _shorten_cwd
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects/")
 
@@ -57,20 +58,6 @@ def _extract_text(content) -> str | None:
                     texts.append(t)
         return " ".join(texts) if texts else None
     return None
-
-
-def _parse_timestamp(value) -> float | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None
 
 
 def _entry_time(entry: dict) -> float | None:
@@ -250,13 +237,6 @@ def _choose_claude_fallback_title(candidates: list[tuple[str, str | None]]) -> s
     if scored:
         return max(scored, key=lambda item: item[0])[1]
     return "(仅本地命令)"
-
-
-def _shorten_cwd(cwd: str) -> str:
-    home = os.path.expanduser("~")
-    if cwd.startswith(home):
-        return "~" + cwd[len(home):]
-    return cwd
 
 
 def _build_session_info(fpath: str, proj: str) -> dict:

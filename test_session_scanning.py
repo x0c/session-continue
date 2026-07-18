@@ -1095,7 +1095,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=10)
 
             self.assertEqual(len(sessions), 1)
@@ -1126,7 +1126,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=10)
 
             self.assertEqual([s["id"] for s in sessions], ["ses_root"])
@@ -1145,7 +1145,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=10)
 
             self.assertEqual([s["id"] for s in sessions], ["ses_live"])
@@ -1164,7 +1164,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=10)
 
             self.assertEqual([s["id"] for s in sessions], ["ses_titled_only"])
@@ -1198,7 +1198,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=10)
 
             by_id = {s["id"]: s["status_tag"] for s in sessions}
@@ -1224,7 +1224,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=10)
 
             self.assertEqual(sessions[0]["native_title"], "中文标题：修复终端乱码问题")
@@ -1240,7 +1240,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             db_path.write_text("不是一个真正的 sqlite 文件", encoding="utf-8")
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
 
     def test_scan_sessions_degrades_when_tables_are_missing(self) -> None:
@@ -1250,7 +1250,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             conn.close()  # 建一个空库，session/message/part 表都不存在
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
 
     def test_limit_keeps_newest_sessions_in_descending_order(self) -> None:
@@ -1266,7 +1266,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             )
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
-                 mock.patch.object(scan_opencode, "_live_pids_by_cwd", return_value={}):
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
                 sessions = scan_opencode.scan_sessions(limit=3)
 
             self.assertEqual([s["id"] for s in sessions], ["ses_4", "ses_3", "ses_2"])
@@ -1288,7 +1288,7 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
                  mock.patch.object(
-                     scan_opencode, "_live_pids_by_cwd",
+                     scan_opencode, "live_pids_by_process_name",
                      return_value={os.path.realpath(str(cwd_dir)): 4242},
                  ):
                 sessions = scan_opencode.scan_sessions(limit=10)
@@ -1300,8 +1300,8 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
             self.assertIsNone(by_id["ses_old"]["pid"])
 
     def test_live_pids_by_cwd_degrades_when_pgrep_unavailable(self) -> None:
-        with mock.patch("scan_opencode.subprocess.check_output", side_effect=FileNotFoundError()):
-            self.assertEqual(scan_opencode._live_pids_by_cwd(), {})
+        with mock.patch("scan_common.subprocess.check_output", side_effect=FileNotFoundError()):
+            self.assertEqual(scan_opencode.live_pids_by_process_name("opencode"), {})
 
     def test_load_conversation_merges_parts_filters_roles_and_avoids_none_literal(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1379,7 +1379,7 @@ class KimiScanTests(TimezoneMixin, unittest.TestCase):
 
     def _scan(self, sessions_dir: Path, **kwargs) -> list[dict]:
         with mock.patch.object(scan_kimi, "SESSIONS_DIR", str(sessions_dir)), \
-             mock.patch.object(scan_kimi, "_live_pids_by_cwd", return_value={}):
+             mock.patch.object(scan_kimi, "live_pids_by_process_name", return_value={}):
             return scan_kimi.scan_sessions(**kwargs)
 
     def test_field_mapping_baseline(self) -> None:

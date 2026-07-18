@@ -17,6 +17,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
 from models import ConversationMessage, effective_session_time, format_message_time
+from scan_common import parse_timestamp as _parse_timestamp
+from scan_common import shorten_cwd as _shorten_cwd
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 SESSION_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
@@ -80,20 +82,6 @@ def _extract_datetime_from_filename(path: str) -> datetime | None:
         except ValueError:
             pass
     return None
-
-
-def _parse_timestamp(value) -> float | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None
 
 
 def _entry_time(entry: dict) -> float | None:
@@ -160,13 +148,6 @@ def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
     except OSError:
         pass
     return entries
-
-
-def _shorten_cwd(cwd: str) -> str:
-    home = os.path.expanduser("~")
-    if cwd.startswith(home):
-        return "~" + cwd[len(home):]
-    return cwd
 
 
 def _status_tag(last_event_type: str | None) -> str:

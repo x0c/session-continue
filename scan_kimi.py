@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
-from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
 from models import ConversationMessage, effective_session_time, format_message_time
+from scan_common import live_pids_by_process_name
+from scan_common import parse_timestamp as _parse_iso
+from scan_common import shorten_cwd as _shorten_cwd
 
 KIMI_HOME = os.path.expanduser("~/.kimi-code")
 SESSIONS_DIR = os.path.join(KIMI_HOME, "sessions")
@@ -39,21 +40,6 @@ _USER_EVENT_MARKER = '"context.append_message"'
 _LOOP_EVENT_MARKER = '"context.append_loop_event"'
 
 
-def _parse_iso(value) -> float | None:
-    """解析 state.json 里 ISO8601（带尾部 Z）时间戳为 epoch 秒。"""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None
-
-
 def _event_time(entry: dict) -> float | None:
     """wire.jsonl 每行的 time 是毫秒 epoch，转成秒。"""
     t = entry.get("time")
@@ -61,12 +47,6 @@ def _event_time(entry: dict) -> float | None:
         return t / 1000
     return None
 
-
-def _shorten_cwd(cwd: str) -> str:
-    home = os.path.expanduser("~")
-    if cwd.startswith(home):
-        return "~" + cwd[len(home):]
-    return cwd
 
 
 def _text_from_parts(parts) -> str:
@@ -253,59 +233,13 @@ def _build_session_info(session_dir: str, session_id: str) -> dict | None:
         "native_title": native_title,
         "fallback_title": fallback or "(无消息)",
         "status_tag": status_tag,
-        "live": False,  # scan_sessions 统一按 _live_pids_by_cwd() 回填
+        "live": False,  # scan_sessions 统一按 live_pids_by_process_name() 回填
         "pid": None,
         "first_user_msg": (first_user_msg or "")[:300],
         "last_user_msg": (last_user_msg or "")[:300],
         "last_agent_msg": (last_agent_msg or "")[:300],
         "path": wire_path,
     }
-
-
-def _live_pids_by_cwd() -> dict[str, int]:
-    """返回「工作目录 -> pid」映射，供同目录会话判活。
-
-    Kimi Code 没有 Claude 那样的 pid 注册表，历史也不像 Codex 每会话独占一个可
-    被 lsof 定位的文件。这里退而求其次（与 scan_opencode 同思路）：找到存活的
-    kimi-code 进程，读取其工作目录，与会话 workDir 匹配。已知局限：同目录多个
-    会话只把最新一条标记存活；`kimi server`/`kimi web` 等同名进程也会被计入。
-    任一环节失败都静默降级为空集。
-    """
-    live: dict[str, int] = {}
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-x", "kimi-code"], stderr=subprocess.DEVNULL
-        ).decode().split()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return live
-
-    for pid_str in pids:
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        cwd = None
-        if sys.platform.startswith("linux"):
-            try:
-                cwd = os.readlink(f"/proc/{pid}/cwd")
-            except OSError:
-                continue
-        elif sys.platform == "darwin":
-            try:
-                out = subprocess.check_output(
-                    ["lsof", "-a", "-p", pid_str, "-d", "cwd", "-Fn"], stderr=subprocess.DEVNULL
-                ).decode(errors="replace")
-            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-                continue
-            for line in out.splitlines():
-                if line.startswith("n"):
-                    cwd = line[1:]
-                    break
-        else:
-            continue
-        if cwd:
-            live[os.path.realpath(cwd)] = pid
-    return live
 
 
 def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
@@ -362,7 +296,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     if not results:
         return results  # 无会话时跳过 pgrep 子进程，省下首屏预算里最贵的一笔
 
-    live_by_cwd = _live_pids_by_cwd()
+    live_by_cwd = live_pids_by_process_name("kimi-code")
     for info in results:  # 已按 mtime 降序，同 cwd 只把最新一条标记存活
         cwd = info.get("cwd") or ""
         pid = live_by_cwd.pop(os.path.realpath(cwd), None) if cwd else None

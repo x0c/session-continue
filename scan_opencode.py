@@ -11,13 +11,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 from itertools import groupby
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
 from models import ConversationMessage, format_message_time
+from scan_common import live_pids_by_process_name, shorten_cwd as _shorten_cwd
 
 DB_FILENAME = "opencode.db"
 
@@ -88,13 +88,6 @@ def _connect_ro(db_path: str) -> sqlite3.Connection | None:
         return None
 
 
-def _shorten_cwd(cwd: str) -> str:
-    home = os.path.expanduser("~")
-    if cwd.startswith(home):
-        return "~" + cwd[len(home):]
-    return cwd
-
-
 def _status_tag(last_msg_data: str | None) -> str:
     """末轮状态判定，与 scan_claude.py / scan_codex.py 共用 titles.py 里的统一枚举。
 
@@ -119,52 +112,6 @@ def _status_tag(last_msg_data: str | None) -> str:
             return titles.STATUS_DONE
     return titles.STATUS_NONE
 
-
-def _live_pids_by_cwd() -> dict[str, int]:
-    """返回「工作目录 -> pid」映射，供同目录会话判活。
-
-    OpenCode 没有类似 Claude 的 pid 注册表，也不像 Codex 那样每会话独占一个
-    可被 lsof 定位的历史文件（历史在共享的 SQLite 里）。这里退而求其次：找到
-    存活的 opencode 进程，读取其当前工作目录，与会话的 directory 字段匹配。
-    已知局限（写进 MAINTAINER_GUIDE）：`opencode serve`/`opencode run` 进程
-    同名会被一并计入；同一目录下的多个历史会话只把最新一条标记存活。
-    任一环节失败都静默降级为空集。
-    """
-    live: dict[str, int] = {}
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-x", "opencode"], stderr=subprocess.DEVNULL
-        ).decode().split()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return live
-
-    for pid_str in pids:
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        cwd = None
-        if sys.platform.startswith("linux"):
-            try:
-                cwd = os.readlink(f"/proc/{pid}/cwd")
-            except OSError:
-                continue
-        elif sys.platform == "darwin":
-            try:
-                out = subprocess.check_output(
-                    ["lsof", "-a", "-p", pid_str, "-d", "cwd", "-Fn"], stderr=subprocess.DEVNULL
-                ).decode(errors="replace")
-            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-                continue
-            for line in out.splitlines():
-                if line.startswith("n"):
-                    cwd = line[1:]
-                    break
-        else:
-            continue
-        if cwd:
-            live[os.path.realpath(cwd)] = pid
-    return live
 
 
 def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
@@ -199,7 +146,7 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
         "native_title": native_title,
         "fallback_title": fallback,
         "status_tag": _status_tag(row["last_msg_data"]),
-        "live": False,  # scan_sessions 统一按 _live_pids_by_cwd() 回填
+        "live": False,  # scan_sessions 统一按 live_pids_by_process_name() 回填
         "pid": None,
         "first_user_msg": first_user[:300],
         "last_user_msg": str(row["last_user_text"] or "")[:300],
@@ -215,7 +162,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     多目录结果合并后再按 mtime 重排、截到 limit——实测单条 SQL（含四个预览
     子查询）耗时个位数毫秒，远在首屏 ≤1s 预算内，无需额外的早停优化。
     """
-    live_by_cwd = _live_pids_by_cwd()
+    live_by_cwd = live_pids_by_process_name("opencode")
     results: list[dict] = []
     for db_path in _db_paths():
         conn = _connect_ro(db_path)

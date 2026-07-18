@@ -43,5 +43,5 @@ Issues = "https://github.com/x0c/pickup/issues"
 pickup = "pickup:main"
 
 [tool.setuptools]
-py-modules = ["models", "pickup", "agent_api", "scan_claude", "scan_codex", "scan_opencode", "scan_kimi", "titles", "titlegen", "keepalive", "embed"]
+py-modules = ["models", "pickup", "agent_api", "scan_claude", "scan_codex", "scan_opencode", "scan_kimi", "scan_common", "titles", "titlegen", "keepalive", "embed"]
 packages = ["runtime"]
