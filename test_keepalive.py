@@ -15,6 +15,12 @@ class EnabledTests(unittest.TestCase):
             self.assertFalse(keepalive.enabled(disabled_flag=True))
 
     def test_env_var_disables(self) -> None:
+        with mock.patch.dict("os.environ", {"PICKUP_KEEPALIVE": "0"}, clear=True), \
+             mock.patch("keepalive.shutil.which", return_value="/usr/bin/tmux"):
+            self.assertFalse(keepalive.enabled())
+
+    def test_legacy_env_var_still_disables(self) -> None:
+        # 改名前的旧变量名 SC_KEEPALIVE 继续生效，不悄悄破坏已有的用户配置
         with mock.patch.dict("os.environ", {"SC_KEEPALIVE": "0"}, clear=True), \
              mock.patch("keepalive.shutil.which", return_value="/usr/bin/tmux"):
             self.assertFalse(keepalive.enabled())
@@ -53,7 +59,7 @@ class WrapPlanTests(unittest.TestCase):
         self.assertIn("-A", wrapped.argv)
         self.assertIn("-s", wrapped.argv)
         session_name = wrapped.argv[wrapped.argv.index("-s") + 1]
-        self.assertTrue(session_name.startswith("sc-claude-"))
+        self.assertTrue(session_name.startswith("pickup-claude-"))
         self.assertIn("-c", wrapped.argv)
         self.assertEqual(wrapped.argv[wrapped.argv.index("-c") + 1], "/work/dir")
         self.assertIn("--", wrapped.argv)
@@ -62,6 +68,15 @@ class WrapPlanTests(unittest.TestCase):
         self.assertEqual(tail, plan.argv)
         # tmux 自己接管 -c，不需要 execute_launch 再 os.chdir 一次
         self.assertIsNone(wrapped.cwd)
+
+    def test_injects_both_new_and_legacy_env_vars(self) -> None:
+        plan = LaunchPlan(("claude",), None)
+
+        wrapped = keepalive.wrap_plan(plan, "claude", "abcd1234")
+
+        for name in ("PICKUP_RUNTIME", "PICKUP_SESSION_ID", "SC_RUNTIME", "SC_SESSION_ID"):
+            self.assertTrue(any(arg == f"{name}={'claude' if name.endswith('RUNTIME') else 'abcd1234'}"
+                                for arg in wrapped.argv), name)
 
     def test_wrap_plan_without_cwd_skips_dash_c(self) -> None:
         plan = LaunchPlan(("codex",), None)
@@ -76,7 +91,7 @@ class WrapPlanTests(unittest.TestCase):
         wrapped = keepalive.wrap_plan(plan, "claude", "0123456789abcdef")
 
         session_name = wrapped.argv[wrapped.argv.index("-s") + 1]
-        self.assertEqual(session_name, "sc-claude-01234567")
+        self.assertEqual(session_name, "pickup-claude-01234567")
 
 
 class AttachPlanTests(unittest.TestCase):
@@ -109,7 +124,7 @@ class AnnotateTests(unittest.TestCase):
         # tmux pane 顶层 pid 是 100（tmux 直接 exec 的进程），但运行时自己注册的
         # "活跃 pid" 是 102——中间隔了一层 fork，必须靠祖先链才能追上，不能只比对 pid 相等。
         sessions = [{"id": "s1", "pid": 102}, {"id": "s2", "pid": 999}]
-        list_sessions_out = "sc-claude-abcd1234|100\n"
+        list_sessions_out = "pickup-claude-abcd1234|100\n"
         ps_out = "  PID  PPID\n  100     1\n  101   100\n  102   101\n  999     1\n"
 
         with mock.patch("keepalive.shutil.which", return_value="/usr/bin/tmux"), \
@@ -117,8 +132,21 @@ class AnnotateTests(unittest.TestCase):
                          side_effect=_fake_check_output(list_sessions_out, ps_out)):
             keepalive.annotate(sessions)
 
-        self.assertEqual(sessions[0]["keepalive_name"], "sc-claude-abcd1234")
+        self.assertEqual(sessions[0]["keepalive_name"], "pickup-claude-abcd1234")
         self.assertNotIn("keepalive_name", sessions[1])
+
+    def test_legacy_sc_prefix_sessions_still_matched(self) -> None:
+        # 改名前创建的 sc-* 保活会话（可能仍在用户机器上跑）必须继续被识别/回收
+        sessions = [{"id": "s1", "pid": 101}]
+        list_sessions_out = "sc-claude-abcd1234|100\n"
+        ps_out = "  PID  PPID\n  100     1\n  101   100\n"
+
+        with mock.patch("keepalive.shutil.which", return_value="/usr/bin/tmux"), \
+             mock.patch("keepalive.subprocess.check_output",
+                         side_effect=_fake_check_output(list_sessions_out, ps_out)):
+            keepalive.annotate(sessions)
+
+        self.assertEqual(sessions[0]["keepalive_name"], "sc-claude-abcd1234")
 
     def test_no_tmux_server_running_is_a_noop(self) -> None:
         sessions = [{"id": "s1", "pid": 100}]
@@ -142,8 +170,9 @@ class AnnotateTests(unittest.TestCase):
 
 class ReapIdleTests(unittest.TestCase):
     def test_kills_sessions_past_idle_threshold(self) -> None:
-        rows = "sc-claude-old|1000\nsc-claude-fresh|99999\n"
-        now = 100000.0  # sc-claude-old 空闲 99000 秒 ≈ 27.5 小时，超过默认 24 小时阈值
+        # 新旧两种前缀的会话都要被回收（sc-* 是改名前留下的存量）
+        rows = "pickup-claude-old|1000\nsc-claude-legacy|1000\npickup-claude-fresh|99999\n"
+        now = 100000.0  # 前两个空闲 99000 秒 ≈ 27.5 小时，超过默认 24 小时阈值
 
         with mock.patch.dict("os.environ", {}, clear=True), \
              mock.patch("keepalive.shutil.which", return_value="/usr/bin/tmux"), \
@@ -151,10 +180,18 @@ class ReapIdleTests(unittest.TestCase):
              mock.patch("keepalive.kill", return_value=True) as mocked_kill:
             reaped = keepalive.reap_idle(now=now)
 
-        self.assertEqual(reaped, ["sc-claude-old"])
-        mocked_kill.assert_called_once_with("sc-claude-old")
+        self.assertEqual(reaped, ["pickup-claude-old", "sc-claude-legacy"])
+        self.assertEqual(mocked_kill.call_count, 2)
 
     def test_zero_threshold_disables_reaping(self) -> None:
+        with mock.patch.dict("os.environ", {"PICKUP_KEEPALIVE_IDLE_HOURS": "0"}, clear=True), \
+             mock.patch("keepalive.subprocess.check_output") as mocked:
+            reaped = keepalive.reap_idle(now=100000.0)
+
+        self.assertEqual(reaped, [])
+        mocked.assert_not_called()
+
+    def test_legacy_env_threshold_still_honored(self) -> None:
         with mock.patch.dict("os.environ", {"SC_KEEPALIVE_IDLE_HOURS": "0"}, clear=True), \
              mock.patch("keepalive.subprocess.check_output") as mocked:
             reaped = keepalive.reap_idle(now=100000.0)
@@ -163,16 +200,16 @@ class ReapIdleTests(unittest.TestCase):
         mocked.assert_not_called()
 
     def test_custom_threshold_from_env(self) -> None:
-        rows = "sc-claude-borderline|1000\n"
+        rows = "pickup-claude-borderline|1000\n"
         now = 1000.0 + 3600.0  # 恰好空闲 1 小时
 
-        with mock.patch.dict("os.environ", {"SC_KEEPALIVE_IDLE_HOURS": "0.5"}, clear=True), \
+        with mock.patch.dict("os.environ", {"PICKUP_KEEPALIVE_IDLE_HOURS": "0.5"}, clear=True), \
              mock.patch("keepalive.shutil.which", return_value="/usr/bin/tmux"), \
              mock.patch("keepalive.subprocess.check_output", return_value=rows.encode()), \
              mock.patch("keepalive.kill", return_value=True) as mocked_kill:
             reaped = keepalive.reap_idle(now=now)
 
-        self.assertEqual(reaped, ["sc-claude-borderline"])
+        self.assertEqual(reaped, ["pickup-claude-borderline"])
         mocked_kill.assert_called_once()
 
 

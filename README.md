@@ -38,6 +38,7 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 ## Requirements
 
 - Python 3.10 or newer.
+- `tmux` (hard requirement — session hosting, embedded panes, and SSH keep-alive are all built on it).
 - macOS or Linux terminal with curses support.
 - Claude Code, Codex CLI, OpenCode, and/or Kimi Code CLI installed if you want to resume those sessions.
 
@@ -76,15 +77,15 @@ pickup
 ```bash
 git clone https://github.com/x0c/pickup.git
 cd pickup
-python3 sc.py
+python3 pickup.py
 ```
 
 You can also add a symlink manually:
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf "$PWD/sc.py" ~/.local/bin/pickup
-chmod +x sc.py
+ln -sf "$PWD/pickup.py" ~/.local/bin/pickup
+chmod +x pickup.py
 ```
 
 Make sure `~/.local/bin` is in your `PATH`.
@@ -99,6 +100,40 @@ pickup --json --limit 5 # script-friendly small result set
 ```
 
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
+
+## Embedded Panes (work on multiple sessions at once)
+
+Pressing `Enter` on a session no longer takes over your terminal. Instead, the session opens
+**embedded** in the right half of the `pickup` window, hosted in the background tmux server, while
+the session list shrinks to a left sidebar — so you can run several agent sessions in parallel and
+switch between them without losing any of them:
+
+- `Enter` opens the selected session in the right-hand pane (already-running background sessions
+  just focus their live view). Keystrokes go straight to the session over a persistent tmux
+  control-mode channel; the agent keeps running in tmux even when you leave the pane.
+- `Ctrl-\` moves keyboard focus back to the session list (same muscle memory as detaching).
+- Scroll wheel works inside the pane: if the agent requested mouse input, wheel events are
+  forwarded to it as SGR mouse sequences; otherwise the wheel browses the pane's scrollback
+  (tmux copy-mode) and any keystroke drops you back to the live view. Wheel over the left
+  sidebar scrolls the session list. Mouse events never trigger a full redraw, so
+  drag storms can't freeze the UI.
+- `m` (in the list/sidebar) toggles mouse reporting off and on — turn it off to get your
+  terminal's native drag-to-select back for copying text out of the pane (the two are
+  mutually exclusive by protocol); turn it back on to resume wheel forwarding.
+- The terminal cursor is parked at the agent's own cursor position, so IME preedit popups
+  (e.g. CJK input methods) appear right at the agent's input box, not at the bottom of the screen.
+- Dark/light theme detection inside panes is repaired on tmux ≥ 3.5a: `pickup` probes your real
+  terminal's background color at startup and feeds it to each hosted pane
+  (`refresh-client -r`), so agents that query OSC 11 get the true value. Agents that were
+  already running keep their earlier guess — restart them or set their theme manually once.
+- `e` takes over the full terminal the classic way (use it when you need a big screen, easy
+  text selection, or mouse clicking/dragging inside the agent TUI — only wheel scrolling can be
+  injected into an embedded pane; for selection use your terminal's modifier-drag, e.g.
+  `Shift`/`Option`-drag, which bypasses mouse reporting).
+- `c` closes the split and returns to the full-width list; hosted sessions keep running in the
+  background and can be reopened with `Enter`.
+- `x` on a backgrounded session still kills it (with confirmation); quitting `pickup` with `q`
+  never kills anything — everything stays alive in tmux.
 
 ## Direct Launch
 
@@ -138,11 +173,12 @@ the remote machine. Reopen `pickup` and the session shows `后台运行中` (run
   the standard `Ctrl-b d` also works.
 - Press `x` on a backgrounded session to kill it manually (with a confirmation prompt).
 - Idle sessions (no tmux activity) are auto-reaped after 24h by default; tune with
-  `SC_KEEPALIVE_IDLE_HOURS` (`0` disables reaping) or set `SC_KEEPALIVE_IDLE_HOURS=0` to keep sessions
-  forever. Reaping only closes the background tmux session — history stays on disk.
-- Disable keep-alive for a single run with `pickup --no-keepalive`, or permanently with `SC_KEEPALIVE=0`.
-- Automatically skipped when `tmux` isn't installed, or when `pickup` is already running inside a
-  `tmux`/`screen` session (no nesting).
+  `PICKUP_KEEPALIVE_IDLE_HOURS` (`0` disables reaping; the legacy name `SC_KEEPALIVE_IDLE_HOURS`
+  still works). Reaping only closes the background tmux session — history stays on disk.
+- Disable keep-alive for a single run with `pickup --no-keepalive`, or permanently with
+  `PICKUP_KEEPALIVE=0` (legacy `SC_KEEPALIVE=0` also works).
+- Keep-alive of the full-screen attach form is skipped when `pickup` is already running inside a
+  `tmux`/`screen` session (no nesting); embedded panes don't attach and work fine there.
 
 ## Agent / Automation
 
@@ -222,7 +258,8 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 
 | Path | Purpose |
 | --- | --- |
-| `sc.py` | curses TUI, preview screen, JSON output, direct-launch subcommand dispatch, and process handoff |
+| `pickup.py` | curses TUI, preview screen, embedded-pane view, JSON output, direct-launch subcommand dispatch, and process handoff |
+| `embed.py` | embedded-pane host: renders hosted tmux sessions into the TUI (`capture-pane` out, `send-keys` in), SGR parsing, color-pair pool |
 | `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
 | `keepalive.py` | tmux-backed launch wrapper: keep-alive on/off detection, wrap/attach launch plans, idle reaping (config for the dedicated tmux server is inlined here, not a separate file — see maintainer notes) |
 | `models.py` | shared session, handoff, and launch-plan data models |
@@ -240,7 +277,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 Run the same checks used by CI:
 
 ```bash
-python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
+python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py test_*.py
 python3 -m unittest -v
 ```
 

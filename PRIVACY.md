@@ -26,7 +26,7 @@ It does not write to Claude Code, Codex CLI, OpenCode, or Kimi Code CLI history.
 
 The core scanner, TUI, preview screen, and JSON output do not make network requests by themselves.
 
-Optional title generation launches one of your locally installed agent CLIs (`claude` or `codex`; auto-detected, or pinned via `SC_TITLE_GENERATOR`). That command sends short session excerpts to the corresponding model provider under your own account and credentials. If the command is missing or fails, the tool keeps using local fallback titles.
+Optional title generation launches one of your locally installed agent CLIs (`claude` or `codex`; auto-detected, or pinned via `PICKUP_TITLE_GENERATOR`, legacy name `SC_TITLE_GENERATOR`). That command sends short session excerpts to the corresponding model provider under your own account and credentials. If the command is missing or fails, the tool keeps using local fallback titles.
 
 When you resume or hand off a session, the selected runtime process takes over the terminal. From that point on, Claude Code or Codex CLI behaves according to its own configuration.
 
@@ -38,7 +38,7 @@ what stays running after `pickup` exits:
 
 - The wrapped runtime process (and everything it does) keeps running in the background until it exits
   on its own, is manually closed (`x` in the TUI), or is auto-reaped after being idle (default 24h, see
-  `SC_KEEPALIVE_IDLE_HOURS`).
+  `PICKUP_KEEPALIVE_IDLE_HOURS`, legacy name `SC_KEEPALIVE_IDLE_HOURS`).
 - To detect which sessions are already backgrounded, `pickup` reads the local process table (`ps -eo
   pid,ppid`) and lists the tmux server's own sessions (`tmux -L pickup-keepalive list-sessions`). This is
   local process metadata, not file content, and is not written anywhere.
@@ -46,8 +46,9 @@ what stays running after `pickup` exits:
   attach to `tmux -L pickup-keepalive` and see the live terminal content of a backgrounded session — the
   same exposure any tmux session already has under your account; `pickup` does not add encryption or
   access control on top of it.
-- Disable entirely with `pickup --no-keepalive` for one run, or `SC_KEEPALIVE=0` permanently. Skipped
-  automatically when `tmux` is not installed or `pickup` is already running inside `tmux`/`screen`.
+- Disable entirely with `pickup --no-keepalive` for one run, or `PICKUP_KEEPALIVE=0` (legacy
+  `SC_KEEPALIVE=0`) permanently. The full-screen attach form is skipped when `pickup` is already
+  running inside `tmux`/`screen`; embedded panes don't attach and are unaffected.
 
 ## Cross-Runtime Handoff
 

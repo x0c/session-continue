@@ -6,9 +6,9 @@
 结果解析和缓存;本模块的每个生成器只负责一次无头 CLI 调用并交回原始文本。
 
 选择策略:
-- 环境变量 SC_TITLE_GENERATOR(claude/codex)显式指定;
+- 环境变量 PICKUP_TITLE_GENERATOR(claude/codex)显式指定(旧名 SC_TITLE_GENERATOR 仍生效);
 - 未指定或指定的不可用时,按注册顺序取第一个本机已安装的;
-- 环境变量 SC_TITLE_MODEL 覆盖生成器默认模型。
+- 环境变量 PICKUP_TITLE_MODEL 覆盖生成器默认模型(旧名 SC_TITLE_MODEL 仍生效)。
 """
 
 from __future__ import annotations
@@ -19,8 +19,19 @@ import subprocess
 import tempfile
 from abc import ABC, abstractmethod
 
-ENV_GENERATOR = "SC_TITLE_GENERATOR"
-ENV_MODEL = "SC_TITLE_MODEL"
+ENV_GENERATOR = "PICKUP_TITLE_GENERATOR"
+ENV_MODEL = "PICKUP_TITLE_MODEL"
+LEGACY_ENV_GENERATOR = "SC_TITLE_GENERATOR"  # 项目改名 sessionContinue → pickup 前的旧变量名
+LEGACY_ENV_MODEL = "SC_TITLE_MODEL"
+
+
+def _env(*names: str) -> str:
+    """按优先级取第一个非空的环境变量值（新名在前、旧名兜底）。"""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _run(argv: list[str], input_text: str | None, timeout: int) -> str | None:
@@ -45,7 +56,7 @@ class TitleGenerator(ABC):
         return shutil.which(self.executable) is not None
 
     def _model(self) -> str | None:
-        return os.environ.get(ENV_MODEL, "").strip() or self.default_model
+        return _env(ENV_MODEL, LEGACY_ENV_MODEL) or self.default_model
 
     @abstractmethod
     def generate(self, prompt: str, timeout: int) -> str | None:
@@ -69,7 +80,7 @@ class CodexTitleGenerator(TitleGenerator):
     def generate(self, prompt: str, timeout: int) -> str | None:
         # stdout 混着事件日志,最终答复用 -o 落到临时文件读取;
         # --ephemeral 不落盘会话文件,避免自产噪音污染 Codex 历史扫描。
-        fd, out_path = tempfile.mkstemp(prefix="sc-title-", suffix=".txt")
+        fd, out_path = tempfile.mkstemp(prefix="pickup-title-", suffix=".txt")
         os.close(fd)
         try:
             argv = [
@@ -101,7 +112,7 @@ _GENERATORS: tuple[TitleGenerator, ...] = (ClaudeTitleGenerator(), CodexTitleGen
 
 def resolve_generator() -> TitleGenerator | None:
     """按环境变量与本机可用性选定生成器;一个都不可用时返回 None。"""
-    configured = os.environ.get(ENV_GENERATOR, "").strip().lower()
+    configured = _env(ENV_GENERATOR, LEGACY_ENV_GENERATOR).lower()
     for generator in _GENERATORS:
         if generator.id == configured and generator.is_available():
             return generator

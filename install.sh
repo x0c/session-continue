@@ -22,6 +22,15 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+# tmux 是硬依赖（会话托管、内嵌面板、断线保活全部建立在 tmux 之上），装之前先拦住
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "错误：pickup 需要 tmux 才能运行，请先安装" >&2
+  echo "  macOS:          brew install tmux" >&2
+  echo "  Debian/Ubuntu:  sudo apt install tmux" >&2
+  echo "  Fedora:         sudo dnf install tmux" >&2
+  exit 1
+fi
+
 VERSION="${PICKUP_VERSION:-}"
 if [ -z "$VERSION" ]; then
   VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """pickup：终端会话接力工具。
 
-单列表格列出已注册运行时（Claude Code / Codex / OpenCode）的最近会话，左右切换来源、
-上下选行，回车后原生恢复，或通过高级操作交给其他运行时接力。
+单列表格列出已注册运行时（Claude Code / Codex / OpenCode / Kimi Code）的最近会话，左右切换来源、
+上下选行。回车把会话内嵌到右半屏（托管在后台 tmux，左侧列表退化为窄栏，可多会话并行切换）；
+按 e 则走经典全屏接管。跨运行时可通过高级操作交给其他运行时接力。tmux 为硬依赖。
 
 注意：默认启动交互式终端 TUI（curses），需要真实终端，不能被自动化脚本或
 大模型直接调用。非真实终端环境（管道、脚本、Agent 调用）会自动退化为 JSON
@@ -34,17 +35,25 @@ import curses
 import fcntl
 import json
 import os
+import re
+import select
+import shutil
+import signal
 import subprocess
 import sys
+import termios
 import threading
 import time
+import traceback
+import tty
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_api
+import embed
 import keepalive
 import titles
 from models import ConversationMessage, LaunchRequest, NewSessionRequest, format_message_time, session_key
@@ -188,18 +197,22 @@ PAIR_KEY = 8           # 底部快捷键提示中的按键名
 
 DIM_EXTRA_ATTR = curses.A_DIM  # 由 _init_colors 按终端能力覆盖，见其中说明
 
+DEFAULT_COLORS_OK = False  # use_default_colors 是否成功；embed.PairPool 据此决定 -1 能否直接用
+
 
 def _init_colors() -> None:
     """绑定颜色对；终端不支持彩色时静默跳过，退化为单色显示。"""
-    global DIM_EXTRA_ATTR
+    global DIM_EXTRA_ATTR, DEFAULT_COLORS_OK
     if not curses.has_colors():
         return
     curses.start_color()
     try:
         curses.use_default_colors()
         bg = -1
+        DEFAULT_COLORS_OK = True
     except curses.error:
         bg = curses.COLOR_BLACK
+        DEFAULT_COLORS_OK = False
 
     # 前景色不能写死 ANSI 亮色，也不能只靠 A_DIM，否则在浅色/白色背景终端上几乎
     # 不可读（用户实测反馈）。两类坑：
@@ -394,6 +407,11 @@ class SessionStore:
         self.dirty = threading.Event()
         self.cache = titles.load_cache()
         self.generating: set[str] = set()  # 仍是临时兜底、等待后台进程产出的会话键（转圈圈）
+        # 本进程内嵌托管的 会话键 -> tmux 会话名。_embed_open 在启动成功的瞬间就写入，
+        # 比 annotate() 的 pid 祖先链匹配更快、更确定：运行时还没来得及注册 pid 文件
+        # （或像某些 fake CLI 一样根本不注册）时，后台重扫替换会话字典后仍能立刻恢复
+        # keepalive_name，避免 x 拒绝关闭、回车误开竞争进程。
+        self.hosted: dict[str, str] = {}
         # 值是 (读取时的历史文件 mtime, 消息列表)；文件 mtime 变化就重读，
         # 修掉"同一次 pickup 内 / 关闭预览重开还是旧内容"的问题。
         self.conversations: dict[str, tuple[float | None, list[ConversationMessage]]] = {}
@@ -438,6 +456,15 @@ class SessionStore:
             for bucket in scanned.values():
                 for session in bucket:
                     key = session_key(session)
+                    # annotate 没匹配上时，用本进程的内嵌托管记录兜底（见 __init__ 注释）；
+                    # 托管会话已死则清掉记录，让状态回到真实的「已结束」
+                    if "keepalive_name" not in session:
+                        hosted_name = self.hosted.get(key)
+                        if hosted_name:
+                            if embed.is_alive(hosted_name):
+                                session["keepalive_name"] = hosted_name
+                            else:
+                                self.hosted.pop(key, None)
                     title, _ = titles.resolve_initial_title(session, self.cache)
                     self.display_titles[key] = title
                     # 没有可用缓存标题（纯临时兜底）才打转圈圈，等待后台进程产出。
@@ -511,9 +538,117 @@ class UIState:
     source: str
     idx: int = 0
     top: int = 0
-    focus: str = "list"  # "sidebar" | "list"
+    focus: str = "list"  # "sidebar" | "list" | "pane"（"pane" 表示内嵌面板持有键盘）
     proj_idx: int = 0    # 0 = 全部项目（不过滤）
     sb_top: int = 0
+
+
+# 内嵌面板（右侧面板显示托管 tmux 会话）的布局常量：左栏固定宽度、面板最小宽高，
+# 终端小于分栏下限时不允许进入内嵌（回车退化为 execvp 全屏接管）。
+EMBED_LEFT_BAND = 44
+EMBED_MIN_PANE_W = 40
+EMBED_MIN_HEIGHT = 10
+
+
+@dataclass
+class EmbedUI:
+    """内嵌面板状态：右侧显示的托管 tmux 会话名、最新解析画面与面板尺寸。"""
+
+    active: bool = False           # 分栏布局是否开启
+    enabled: bool = False          # embed.available() 的一次性判定结果
+    name: str | None = None        # 当前面板聚焦的 tmux 会话名（pickup-* 命名空间）
+    session_key: str | None = None  # 对应的列表会话键，用于状态列"面板中"标注
+    dead: bool = False             # 聚焦会话的进程已退出
+    grid: list | None = None       # 最近一次解析出的单元格画面（embed.parse_screen）
+    generation: int = 0            # grid 版本号：绘制段缓存与主循环跳帧都以它为准
+    spans: list | None = None      # 按 generation 缓存的绘制段 [(y, x, text, attr)]
+    spans_gen: int = -1
+    size: tuple[int, int] = (0, 0)  # 面板当前宽高（字符），变化时同步 resize 托管会话
+    cursor: tuple[int, int, bool] | None = None  # (x, y, 是否可见)
+    copy_mode: bool = False        # 本地跟踪：pane 是否处于我们经滚轮发起的 copy-mode
+    mouse_any: bool = False        # pane 内程序是否申请了鼠标上报（申请则滚轮直达程序）
+    mouse_sgr: bool = False        # 鼠标上报是否为 SGR 1006 编码
+    mouse_report: bool = True      # 全局鼠标上报开关（m 键切换；关闭后恢复终端原生框选）
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    poke: threading.Event = field(default_factory=threading.Event)  # 输入/输出事件后立即补抓一帧
+
+
+# 外层终端 OSC 10/11 应答原文（main() 启动时探测），供 _embed_focus 经 refresh-client -r
+# 注入托管 pane——pane 内 agent 的深/浅主题自动检测因此拿到真实终端背景。
+_OSC_REPORT: bytes | None = None
+
+
+def _probe_osc_colours(timeout: float = 1.2) -> bytes | None:
+    """启动时向外层终端查询前景/背景色（OSC 10/11），返回应答原文字节串。
+
+    tmux 默认不应答 pane 内的 OSC 11 查询（实测：agent 在 pane 里查询石沉大海，
+    深/浅主题检测只能瞎猜）；tmux 3.5a+ 的 refresh-client -r 允许把真实终端的
+    应答转注入 pane，这里先趁 curses 接管前向用户终端要到应答原文。
+    pickup 自己跑在 tmux 里时，学 Claude Code 的做法同时发 DCS passthrough 包装
+    的查询——外层 tmux 开 allow-passthrough 时可穿透直达真实终端；裸查询部分由
+    外层 tmux 用其 client 缓存值应答（3.4+）。非 TTY、终端不应答（超时）时返回
+    None。测试钩子：PICKUP_OSC_REPORT（hex 编码）。
+    """
+    hook = os.environ.get("PICKUP_OSC_REPORT", "")
+    if hook:
+        try:
+            return bytes.fromhex(hook)
+        except ValueError:
+            pass  # 钩子内容非法时按未设置处理，继续真实探测
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+    buf = bytearray()
+    try:
+        tty.setraw(fd)
+        os.write(sys.stdout.fileno(), b"\x1b]10;?\a\x1b]11;?\a")
+        if os.environ.get("TMUX"):
+            # 内层 ESC 双写是 tmux DCS passthrough 的转义规则（Claude Code 同款）
+            os.write(sys.stdout.fileno(),
+                     b"\x1bPtmux;\x1b\x1b]10;?\x07\x1b\\"
+                     b"\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and buf.count(b"rgb:") < 2:
+            r, _, _ = select.select([fd], [], [], max(0.05, deadline - time.monotonic()))
+            if not r:
+                break
+            buf += os.read(fd, 256)
+    except OSError:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    # 只保留 OSC 10/11 应答段，混入的用户按键等杂字节一律丢弃；passthrough 应答
+    # 绕行真实终端通常晚于外层 tmux 的缓存应答，拼接在后，tmux 解析时后者生效
+    parts = re.findall(rb"\x1b\](?:10|11);[^\x07\x1b]+(?:\x07|\x1b\\)", bytes(buf))
+    return b"".join(parts) or None
+
+
+def _log_embed_error(where: str, exc: BaseException) -> None:
+    """内嵌后台线程的异常记录：curses 界面下 stderr 不可见，写文件留证（截断防涨爆）。"""
+    try:
+        path = os.path.join(os.path.dirname(titles.CACHE_FILE), "embed-error.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
+            os.truncate(path, 0)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')} [{where}] "
+                     f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass  # 日志写不进去就放弃，绝不能让日志本身把后台线程弄死
+
+
+def _embed_list_width(full_width: int, height: int, emb: EmbedUI) -> int:
+    """内嵌激活且终端够大时，左侧列表被压缩到的宽度；否则返回全宽（面板不显示，
+    但已托管的会话在后台 tmux 里继续跑，终端拉大后面板自动回来）。"""
+    if not emb.active:
+        return full_width
+    if full_width < EMBED_LEFT_BAND + EMBED_MIN_PANE_W or height < EMBED_MIN_HEIGHT:
+        return full_width
+    return EMBED_LEFT_BAND
 
 
 def _visible_sessions(store: SessionStore, ui: UIState, sidebar_visible: bool) -> list[dict]:
@@ -592,13 +727,19 @@ def _draw_sidebar(
         stdscr.addnstr(2 + row, 0, line, sb_w, attr)
 
 
-def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
+def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0,
+          emb: EmbedUI | None = None, pool: "embed.PairPool | None" = None) -> None:
     stdscr.erase()
-    height, width = stdscr.getmaxyx()
+    height, full_width = stdscr.getmaxyx()
 
     # 终端太小时跳过绘制，避免 addnstr 写到边界外崩溃
-    if height < 7 or width < 20:
+    if height < 7 or full_width < 20:
         return
+
+    # 内嵌激活且终端够大时，左侧列表被压缩到固定宽度，右侧区域交给会话面板；
+    # 项目侧边栏是否出现由现有窄宽度逻辑按压缩后的宽度自行判定
+    width = _embed_list_width(full_width, height, emb) if emb is not None else full_width
+    pane_visible = width != full_width
 
     dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
 
@@ -643,21 +784,28 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
     display_titles, generating = store.snapshot()
     spin = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
 
-    # 列宽分配：# / 标题 / 目录 / 时间 / 大小 / 状态
+    # 列宽分配：# / 标题 / 目录 / 时间 / 大小 / 状态。
+    # 内嵌分栏的窄栏（compact）改走卡片式多行布局：序号/目录/大小列全部让位，
+    # 标题独占一行，状态+时间放第二行——多会话并行时这是最不能丢的信息
+    compact = pane_visible
     col_num, col_title, col_dir, col_time, col_size, col_status = _column_widths(main_w)
 
-    header = COL_GAP.join((
-        _fit_cell("#", col_num),
-        _fit_cell("标题", col_title),
-        _fit_cell("目录", col_dir),
-        _fit_cell("时间", col_time),
-        _fit_cell_right("大小", col_size),
-        _fit_cell("状态", col_status),
-    ))
+    if compact:
+        header = _fit_cell(" 标题", main_w)
+    else:
+        header = COL_GAP.join((
+            _fit_cell("#", col_num),
+            _fit_cell("标题", col_title),
+            _fit_cell("目录", col_dir),
+            _fit_cell("时间", col_time),
+            _fit_cell_right("大小", col_size),
+            _fit_cell("状态", col_status),
+        ))
     stdscr.addnstr(2, x0, header, main_w, dim | curses.A_BOLD)
     stdscr.addnstr(3, x0, "─" * main_w, main_w, dim)
 
-    list_height = height - 6  # 顶部4行 + 底部分隔1行 + 帮助1行
+    per_session_rows = 2 if compact else 1
+    list_height = max(1, (height - 6) // per_session_rows)  # 顶部4行 + 底部分隔1行 + 帮助1行
     idx, top = ui.idx, ui.top
     if not sessions:
         message = "(该项目在当前来源没有会话，Tab 切换来源查看)" if sb_w and ui.proj_idx > 0 else "(无会话)"
@@ -677,14 +825,10 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
             current = i == idx
             selected = current and list_focused  # 只有列表持有焦点时才用反白
             is_gen = key in generating
-            prefix = "▸" if current else " "
-            num = _fit_cell(f"{prefix}{i + 1}", col_num)
-            dir_col = _fit_cell(s["cwd_display"], col_dir)
-            time_col = _fit_cell(_format_relative_time(s["mtime"]), col_time)
-            size_col = _fit_cell_right(_format_size(s["size_kb"]), col_size)
             is_keepalive = bool(s.get("keepalive_name"))
             status_text = "后台运行中" if is_keepalive else ("进行中" if s["live"] else "已结束")
-            status_col = _fit_cell(status_text, col_status)
+            if emb is not None and emb.active and not emb.dead and key == emb.session_key:
+                status_text = "面板中"
 
             if selected:
                 base_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
@@ -694,7 +838,35 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 base_attr = curses.A_NORMAL
             status_attr = base_attr if current else _status_attr(s["live"] or is_keepalive)
 
-            y = 4 + row
+            y = 4 + row * per_session_rows
+
+            if compact:
+                # 卡片式：第一行 ▸+标题（生成中拆转圈圈），第二行 状态 · 相对时间；
+                # _fit_cell 按宽度补齐空格，选中行两行都铺满高亮底色
+                prefix = "▸ " if current else "  "
+                stdscr.addnstr(y, x0, prefix, 2, base_attr if current else curses.A_NORMAL)
+                tx = x0 + 2
+                if is_gen:
+                    stdscr.addnstr(y, tx, spin + " ", 2, base_attr if current else spinner_attr)
+                    tx += 2
+                    title_attr = base_attr if current else dim
+                else:
+                    title_attr = base_attr if current else curses.A_NORMAL
+                title_cell = _fit_cell(title, main_w - (tx - x0))
+                stdscr.addnstr(y, tx, title_cell, main_w - (tx - x0), title_attr)
+                status_line = _fit_cell(
+                    f"  {status_text} · {_format_relative_time(s['mtime'])}", main_w,
+                )
+                stdscr.addnstr(y + 1, x0, status_line, main_w, base_attr if current else status_attr)
+                continue
+
+            prefix = "▸" if current else " "
+            num = _fit_cell(f"{prefix}{i + 1}", col_num)
+            dir_col = _fit_cell(s["cwd_display"], col_dir)
+            time_col = _fit_cell(_format_relative_time(s["mtime"]), col_time)
+            size_col = _fit_cell_right(_format_size(s["size_kb"]), col_size)
+            status_col = _fit_cell(status_text, col_status)
+
             x = x0
 
             # 标题列：生成中时拆成「转圈圈(2列宽) + 暗色临时标题」
@@ -717,8 +889,8 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                     (title_col, base_attr),
                 ]
 
-            for cell, attr in (
-                *title_segments,
+            segments: list[tuple[str, int]] = list(title_segments)
+            segments += [
                 (COL_GAP, base_attr),
                 (dir_col, base_attr if current else dim),
                 (COL_GAP, base_attr),
@@ -727,7 +899,8 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 (size_col, base_attr if current else dim),
                 (COL_GAP, base_attr),
                 (status_col, status_attr),
-            ):
+            ]
+            for cell, attr in segments:
                 cell_width = max(0, width - 1 - x)
                 if cell_width <= 0:
                     break
@@ -741,13 +914,30 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
         key_attr = curses.color_pair(PAIR_KEY) | curses.A_BOLD
         x = 0
         current_keepalive = bool(sessions) and 0 <= idx < len(sessions) and bool(sessions[idx].get("keepalive_name"))
-        enter_label = " 接回   " if current_keepalive else " 原生恢复   "
+        embed_on = emb is not None and emb.enabled
+        if emb is not None and emb.active:
+            enter_label = " 聚焦   " if current_keepalive else " 打开   "
+        else:
+            enter_label = " 接回   " if current_keepalive else (" 打开   " if embed_on else " 原生恢复   ")
         if sidebar_focused:
             help_entries = (
                 ("↑↓", " 选项目   "),
                 ("→", " 回列表   "),
                 ("n", " 新建   "),
                 ("Tab", " 切来源   "),
+                ("q", " 退出"),
+            )
+        elif emb is not None and emb.active:
+            # 分栏布局下左栏只有 ~44 列，放不下的条目由面板提示行补充
+            help_entries = (
+                ("↑↓", " 选择   "),
+                ("Enter", enter_label),
+                ("e", " 全屏   "),
+                ("c", " 关面板   "),
+                ("Space", " 预览   "),
+                ("a", " 高级   "),
+                ("n", " 新建   "),
+                *((("x", " 关闭后台   "),) if current_keepalive else ()),
                 ("q", " 退出"),
             )
         elif sb_w:
@@ -759,7 +949,9 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 ("Enter", enter_label),
                 ("a", " 高级操作   "),
                 ("n", " 新建   "),
+                *((("e", " 全屏   "),) if embed_on else ()),
                 *((("x", " 关闭后台   "),) if current_keepalive else ()),
+                ("m", " 鼠标:开   " if (emb is None or emb.mouse_report) else " 鼠标:关   "),
                 ("q", " 退出"),
             )
         else:
@@ -770,7 +962,9 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
                 ("Enter", enter_label),
                 ("a", " 高级操作   "),
                 ("n", " 新建   "),
+                *((("e", " 全屏   "),) if embed_on else ()),
                 *((("x", " 关闭后台   "),) if current_keepalive else ()),
+                ("m", " 鼠标:开   " if (emb is None or emb.mouse_report) else " 鼠标:关   "),
                 ("q", " 退出"),
             )
         for keys, label in help_entries:
@@ -786,7 +980,128 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0) -> None:
             x += _text_width(label)
     except curses.error:
         pass  # 边界写入失败时忽略，不崩溃
+
+    if pane_visible:
+        _draw_embed_pane(stdscr, emb, pool, ui, width, full_width, height)
+
+    # 面板聚焦时把硬件光标锚定到面板内：有 agent 光标就精确跟随（输入法预览框
+    # 会浮在 agent 输入框处），还没抓到光标也锚到面板左上角——总之不能停在最后
+    # 绘制的底部帮助行，否则终端输入法的预编辑窗口会出现在屏幕最下面。
+    # 光标可见性跟随 agent 的 cursor_flag；即使不可见，ncurses refresh 仍会更新
+    # 硬件光标位置寄存器，输入法预览定位不受影响。
+    cursor_shown = False
+    if pane_visible and ui.focus == "pane":
+        with emb.lock:
+            cursor = emb.cursor
+        if cursor is not None:
+            cx, cy, visible = cursor
+        else:
+            cx, cy, visible = 0, 0, False
+        pane_x0 = width + 1
+        cy = max(0, min(cy, height - 3))
+        cx = max(0, min(cx, full_width - 2 - pane_x0))
+        try:
+            curses.curs_set(1 if visible else 0)
+            stdscr.move(cy, pane_x0 + cx)
+            cursor_shown = True
+        except curses.error:
+            pass
+    if not cursor_shown:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
     stdscr.refresh()
+
+
+def _grid_to_spans(grid: list, pane_w: int, pool: "embed.PairPool") -> list[tuple[int, int, str, int]]:
+    """把单元格网格编译成 (y, x, text, attr) 绘制段；跳过纯空白默认底色的区段。
+
+    每个画面 generation 只编译一次（池化 attr 逐格查询是全流程最贵的逐格操作），
+    之后每帧原样重放 addnstr，物理重绘去重由 ncurses refresh() 的内部 diff 负责。
+    """
+    blank_attr = pool.attr(embed.Cell())
+    spans: list[tuple[int, int, str, int]] = []
+    for y, row in enumerate(grid):
+        x = 0
+        limit = min(len(row), pane_w)
+        while x < limit:
+            if row[x].wide_cont:
+                x += 1
+                continue
+            attr = pool.attr(row[x])
+            cx = x
+            chars = []
+            while cx < limit and pool.attr(row[cx]) == attr:
+                if not row[cx].wide_cont:
+                    chars.append(row[cx].ch)
+                cx += 1
+            text = "".join(chars)
+            if text and (attr != blank_attr or text.strip()):
+                spans.append((y, x, text, attr))
+            x = cx
+    return spans
+
+
+def _draw_embed_pane(stdscr, emb: EmbedUI, pool: "embed.PairPool", ui: UIState,
+                     left_w: int, full_width: int, height: int) -> None:
+    """在左栏右侧绘制内嵌面板：竖分隔线、托管会话画面（按 generation 缓存重放）、底部提示行。"""
+    dim = curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
+    x0 = left_w + 1
+    pane_w = max(1, full_width - 1 - x0)
+    pane_h = max(1, height - 2)  # 内容区 0..height-3；height-2 分隔；height-1 面板提示
+
+    for y in range(0, height - 1):
+        stdscr.addnstr(y, left_w, "│", 1, dim)
+
+    # 面板尺寸变化：同步托管会话的 tmux 窗口大小、作废绘制段缓存并立刻补抓一帧
+    if (pane_w, pane_h) != emb.size:
+        emb.size = (pane_w, pane_h)
+        emb.spans_gen = -1
+        if emb.name and not emb.dead:
+            embed.resize(emb.name, pane_w, pane_h)
+        emb.poke.set()
+
+    with emb.lock:
+        grid = emb.grid
+        dead = emb.dead
+        name = emb.name
+        generation = emb.generation
+        spans = emb.spans if emb.spans_gen == generation else None
+
+    def _center_message(text: str) -> None:
+        mx = x0 + max(0, (pane_w - _text_width(text)) // 2)
+        stdscr.addnstr(max(1, height // 2 - 1), mx, text, max(0, full_width - 1 - mx), dim)
+
+    try:
+        if name is None or grid is None:
+            _center_message("连接中…")
+        elif dead:
+            _center_message("会话已结束（回车打开其他会话，c 关闭面板）")
+        else:
+            if spans is None:
+                spans = _grid_to_spans(grid, pane_w, pool)
+                with emb.lock:
+                    if emb.generation == generation:
+                        emb.spans = spans
+                        emb.spans_gen = generation
+            for y, x, text, attr in spans:
+                if y >= pane_h:
+                    break
+                stdscr.addnstr(y, x0 + x, text, max(0, full_width - 1 - x0 - x), attr)
+    except curses.error:
+        pass  # 尺寸瞬变期越界写入失败时静默，下一帧自然收敛
+
+    pane_focused = ui.focus == "pane"
+    hint = "C-\\ 回列表 · 按键直接发往会话" if pane_focused else "回车 聚焦会话 · c 关闭面板"
+    try:
+        stdscr.addnstr(height - 2, x0, "─" * pane_w, pane_w, dim)
+        hint_fitted = _fit_cell(hint, max(0, pane_w - 1)).rstrip()
+        if hint_fitted:
+            hint_attr = (curses.color_pair(PAIR_KEY) | curses.A_BOLD) if pane_focused else dim
+            stdscr.addnstr(height - 1, x0, hint_fitted, len(hint_fitted), hint_attr)
+    except curses.error:
+        pass
 
 
 def _draw_preview(
@@ -845,7 +1160,7 @@ def _draw_preview(
     footer_y = height - 2
     stdscr.addnstr(footer_y, 0, "─" * (width - 1), width - 1, dim)
     mouse_hint = "m 关闭鼠标滚轮" if mouse_enabled else "m 开启鼠标滚轮（当前可框选复制）"
-    hint = f"↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  {mouse_hint}  Enter 恢复  a 接力  n 新建  Space/q 关闭"
+    hint = f"↑↓/j/k 滚动  PgUp/PgDn 翻页  Home/End 首尾  {mouse_hint}  Enter 恢复  e 全屏  a 接力  n 新建  Space/q 关闭"
     # hint 的真实显示宽度（含中文，约 100 列）常年超过终端宽度；addnstr 的第四个参数按字符数
     # 截断而不是按显示列数，宽字符会让实际写入列数超过 n。footer 又是屏幕最后一行，一旦写到
     # 最后一列会触发 ncurses 的“右下角写入”保护性异常（addnwstr() returned ERR）直接崩掉整个
@@ -877,9 +1192,19 @@ def _preview_mouse_scroll_delta() -> int | None:
     return None
 
 
-def _apply_preview_mousemask(enabled: bool) -> None:
-    """开关预览页的鼠标滚轮上报；关闭后终端会恢复原生的鼠标框选/复制。"""
-    mask = (curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0)) if enabled else 0
+def _apply_mousemask(enabled: bool) -> None:
+    """开关鼠标上报；关闭后终端恢复原生框选/复制。
+
+    订阅集包含滚轮与左键按下/抬起/拖动：这些事件必须先订阅到，`_pane_mouse`
+    才能拿到并按区域路由（转发滚轮 / 丢弃其余）；未订阅的鼠标序列会被 ncurses
+    整个吞掉（实测确认不会漏进键盘通道变成垃圾按键），那拖拽/点击事件就连
+    「快速丢弃」的机会都没有，全卡在队列里。
+    """
+    mask = 0
+    if enabled:
+        mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
+                | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
+                | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
     try:
         curses.mousemask(mask)
     except curses.error:
@@ -893,13 +1218,18 @@ def _show_preview(
     session: dict,
     title: str,
     sidebar_visible: bool,
-) -> LaunchRequest | NewSessionRequest | None:
-    """打开全屏聊天记录；回车原生恢复，空格或 q 关闭，`a`/`n` 等会话级快捷键与列表页一致。
+    mouse_report: bool = True,
+) -> tuple[LaunchRequest | NewSessionRequest, bool] | None:
+    """打开全屏聊天记录；回车恢复（内嵌可用时内嵌打开），e 强制全屏接管，空格或 q 关闭，
+    `a`/`n` 等会话级快捷键与列表页一致。
+
+    返回值是 (启动请求, 是否强制全屏) 二元组，调用方据此决定内嵌打开还是交给
+    main() 走 execvp；None 表示用户只关闭了预览、不产生启动。
 
     默认开启鼠标滚轮上报，按 `m` 可临时关闭以用回终端原生的鼠标框选/复制（开启鼠标
     上报期间，终端会把所有鼠标事件——包括拖拽选中——都发给本程序，原生框选会失效，
     这是终端鼠标协议的固有限制，不是可以只订阅滚轮事件就绕开的）。退出预览页（含所有
-    提前 return 路径）必须关闭鼠标上报，否则会连带影响主列表页/侧边栏的鼠标选中。
+    提前 return 路径）恢复主循环的滚轮上报——主列表页/内嵌面板的滚轮同样依赖它。
 
     实时刷新：`_run` 已把 stdscr 设为 200ms 超时非阻塞 getch，这里复用同一节奏——每约
     1 秒检查一次会话历史文件是否有新写入（`store.get_conversation` 内部按 mtime 判断，
@@ -911,15 +1241,18 @@ def _show_preview(
     session_id = str(session.get("id") or "")
     scroll = 10 ** 9  # 聊天预览默认定位到最近一轮
     max_scroll = 0
-    mouse_enabled = True
-    _apply_preview_mousemask(mouse_enabled)
+    mouse_enabled = mouse_report
+    _apply_mousemask(mouse_enabled)
     frame = 0
     POLL_EVERY = 5  # 200ms * 5 ≈ 1s，与主列表页的标题缓存轮询同频
+    redraw = True
     try:
         while True:
-            scroll, max_scroll = _draw_preview(
-                stdscr, messages, title, runtime_name, session_id, mouse_enabled, scroll,
-            )
+            if redraw:
+                scroll, max_scroll = _draw_preview(
+                    stdscr, messages, title, runtime_name, session_id, mouse_enabled, scroll,
+                )
+            redraw = True  # 下一帧默认恢复绘制；鼠标非滚轮事件会把它按掉
             try:
                 ch = stdscr.getch()
             except curses.error:
@@ -937,7 +1270,10 @@ def _show_preview(
                 return None
             if ch in (10, 13, curses.KEY_ENTER):
                 stdscr.clear()
-                return LaunchRequest(session, ui.source, title)
+                return LaunchRequest(session, ui.source, title), False
+            if ch == ord("e"):
+                stdscr.clear()
+                return LaunchRequest(session, ui.source, title), True
             if ch in (curses.KEY_UP, ord("k")):
                 scroll = max(0, scroll - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
@@ -954,16 +1290,18 @@ def _show_preview(
                 delta = _preview_mouse_scroll_delta()
                 if delta is not None:
                     scroll = max(0, scroll + delta)
+                else:
+                    redraw = False  # 拖拽/点击事件流：不滚动也不整帧重绘（防重绘风暴）
             elif ch == ord("m"):
                 mouse_enabled = not mouse_enabled
-                _apply_preview_mousemask(mouse_enabled)
+                _apply_mousemask(mouse_enabled)
             else:
                 result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
                 if result is not _ACTION_STAY and result is not _ACTION_PASS:
                     stdscr.clear()
-                    return result
+                    return result, False
     finally:
-        _apply_preview_mousemask(False)
+        _apply_mousemask(mouse_report)  # 恢复主循环的全局鼠标状态，预览页内的 m 切换不带走
 
 
 def _draw_runtime_menu(stdscr, store: SessionStore, title: str, action_for, selected: int) -> None:
@@ -1121,6 +1459,7 @@ def _session_action(
         if _confirm_kill_keepalive(stdscr, store.get_title(session)):
             keepalive.kill(keepalive_name)
             session.pop("keepalive_name", None)
+            store.hosted.pop(session_key(session), None)
         stdscr.clear()
         return _ACTION_STAY
     if ch == ord("n"):
@@ -1138,12 +1477,26 @@ def _session_action(
     return _ACTION_PASS
 
 
-def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | None:
+def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSessionRequest | None:
     curses.curs_set(0)
     _init_colors()
+    # raw 而非默认 cbreak：C-\(0x1C)/C-c 必须作为普通按键读入——pane 聚焦时
+    # C-c/C-z 等控制键要原样透传给托管会话，不能让它们变成杀掉/挂起 pickup 的信号
+    curses.raw()
     stdscr.keypad(True)  # 关键：没有这行，方向键的 ESC 序列不会被解码成 KEY_LEFT/RIGHT/UP/DOWN，
     # 裸 ESC(27) 会被退出键判断提前吃掉，导致方向键失灵
     stdscr.timeout(200)  # 非阻塞 getch，留出空间检测后台标题刷新
+    # 开启终端 bracketed paste：pane 聚焦时粘贴内容被 \e[200~ ... \e[201~ 包住，
+    # 可干净识别后经 paste buffer 一次性注入会话（main() 在 wrapper 返回后关闭该模式）
+    sys.stdout.write("\x1b[?2004h")
+    sys.stdout.flush()
+    # 开启滚轮上报：pane 内滚轮驱动 copy-mode 回滚或直达申请了鼠标的程序，
+    # 列表页滚轮滚动会话选择。期间终端原生框选失效（鼠标协议固有限制），
+    # 主流终端可用修饰键拖拽（Option/Shift+拖拽）绕过。
+    _apply_mousemask(True)
+
+    pool = embed.PairPool(first=16, use_default=DEFAULT_COLORS_OK)
+    emb = EmbedUI(enabled=embed_ok)
 
     runtime_ids = store.registry.ids
     source = next((runtime_id for runtime_id in runtime_ids if store.sessions[runtime_id]), runtime_ids[0])
@@ -1151,8 +1504,9 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
 
     def _sync_top() -> None:
         """更新 ui.top 与可见区对齐，保持会话列表状态和实际渲染同步。"""
-        height, _ = stdscr.getmaxyx()
-        list_height = max(1, height - 6)
+        height, full_w = stdscr.getmaxyx()
+        per = 2 if _embed_list_width(full_w, height, emb) != full_w else 1
+        list_height = max(1, (height - 6) // per)
         if ui.idx < ui.top:
             ui.top = ui.idx
         elif ui.idx >= ui.top + list_height:
@@ -1203,6 +1557,310 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
 
     # getch 超时为 200ms，每 5 帧（约 1 秒）轮询一次缓存文件，拾取后台进程产出的新标题。
     POLL_EVERY = 5
+
+    # ---- 内嵌面板机制：画面抓取、按键转发、打开/聚焦托管会话 ----
+
+    def _capture_loop() -> None:
+        """抓取聚焦托管会话的画面与交互状态；emb.poke 触发立即补帧。
+
+        控制通道存活时事件驱动（通道把 %output 转成 poke，回显零轮询等待），辅以
+        2s 慢速兜底轮询防事件丢失；通道死亡/不可用时退回 200ms 传统轮询。
+        %output 风暴经 MIN_INTERVAL 限速，避免高频抓帧的 fork 风暴。
+        守护线程随进程退出自然结束，与 _background_refresh 同一模式。"""
+        MIN_INTERVAL = 0.04   # 事件驱动下的最小抓帧间隔（刷屏限速）
+        IDLE_FALLBACK = 2.0   # 有控制通道时的兜底轮询间隔
+        POLL_INTERVAL = 0.2   # 无控制通道时的传统轮询间隔
+        misses = 0
+        last_text: str | None = None
+        last_name: str | None = None  # 聚焦会话切换检测：换会话必须重置 last_text，
+        # 否则切回一个画面静止的会话时 capture 文本与 last_text 相同、跳过解析，
+        # emb.grid 永远是 _embed_focus 重置的 None——面板一直停在「连接中…」
+        last_capture = 0.0
+        while True:
+            interval = POLL_INTERVAL
+            try:
+                name = emb.name if emb.active else None
+                if name != last_name:
+                    last_name = name
+                    last_text = None
+                    misses = 0
+                if name is not None:
+                    channel = embed.active_channel(name)
+                    gap = time.monotonic() - last_capture
+                    if 0 < gap < MIN_INTERVAL:
+                        time.sleep(MIN_INTERVAL - gap)
+                    text = embed.capture(name)
+                    last_capture = time.monotonic()
+                    if text is None:
+                        # capture 失败常常只是 tmux 瞬时超时；必须连续失败且
+                        # has-session 确认不存在才判定死亡，避免焦点被误抢、状态抖动
+                        misses += 1
+                        if misses >= 3 and not embed.is_alive(name):
+                            with emb.lock:
+                                emb.dead = True
+                            store.dirty.set()
+                    else:
+                        misses = 0
+                        if text != last_text:
+                            # 画面真的变了才解析/重绘：8k 单元格的解析是全流程最贵的
+                            # Python 操作，agent 空闲时（无输出）整条链路到这就停
+                            w, h = emb.size
+                            grid = embed.parse_screen(text, w, h) if (w, h) != (0, 0) else None
+                            state = embed.pane_state(name) if ui.focus == "pane" else None
+                            with emb.lock:
+                                if grid is not None:
+                                    emb.grid = grid
+                                    # last_text 只在真正解析入 grid 时记录：_embed_focus
+                                    # 后 emb.size 尚未就绪的窗口期抓到文本会得 grid=None，
+                                    # 若此时就标记 last_text，静止会话下一轮 capture 文本
+                                    # 相同便永远跳过解析——面板卡在「连接中…」（用户实报）
+                                    last_text = text
+                                emb.dead = False
+                                if state is not None:
+                                    emb.cursor = state[:3]
+                                    emb.mouse_any, emb.mouse_sgr = state[3], state[4]
+                                emb.generation += 1
+                            store.dirty.set()
+                        elif ui.focus == "pane":
+                            # 画面没变但光标/鼠标模式可能变了（方向键移动光标不回显）
+                            state = embed.pane_state(name)
+                            if state is not None:
+                                with emb.lock:
+                                    if state[:3] != emb.cursor:
+                                        emb.cursor = state[:3]
+                                        store.dirty.set()
+                                    emb.mouse_any, emb.mouse_sgr = state[3], state[4]
+                    interval = IDLE_FALLBACK if channel is not None else POLL_INTERVAL
+            except Exception as exc:
+                # 抓帧线程绝不能死：任何未料异常记录后继续，线程一旦静默退出，
+                # 面板就永远停在「连接中…」且无任何线索
+                _log_embed_error("capture-loop", exc)
+                time.sleep(0.5)  # 异常风暴时限速，避免日志狂写
+            emb.poke.wait(interval)
+            emb.poke.clear()
+
+    threading.Thread(target=_capture_loop, daemon=True).start()
+
+    def _pane_size_now() -> tuple[int, int]:
+        height, width = stdscr.getmaxyx()
+        return max(20, width - EMBED_LEFT_BAND - 2), max(4, height - 2)
+
+    def _embed_usable_here() -> bool:
+        if not emb.enabled:
+            return False
+        height, width = stdscr.getmaxyx()
+        return width >= EMBED_LEFT_BAND + EMBED_MIN_PANE_W and height >= EMBED_MIN_HEIGHT
+
+    def _embed_focus(name: str, skey: str | None) -> None:
+        """把面板聚焦到某个已在保活 socket 上的托管会话（不新建进程）。"""
+        emb.name = name
+        emb.active = True
+        emb.dead = False
+        emb.grid = None
+        emb.cursor = None
+        emb.copy_mode = False
+        emb.session_key = skey
+        emb.size = (0, 0)  # 触发下一帧重算尺寸并 resize 托管窗口
+        ui.focus = "pane"
+        # 控制通道：%output 直接转成「该抓帧了」信号；切换会话时自动关旧开新
+        channel = embed.open_channel(name, on_output=emb.poke.set)
+        # 终端背景色注入：此后 pane 内 agent 的 OSC 11 查询由 tmux 按真实值应答
+        if channel is not None and _OSC_REPORT and embed.supports_theme_report():
+            embed.report_theme(channel, _OSC_REPORT)
+        emb.poke.set()
+
+    def _embed_open(request: LaunchRequest | NewSessionRequest) -> None:
+        """把启动请求内嵌打开：已托管的会话直接聚焦画面，否则先包进保活 socket 再聚焦。"""
+        same_runtime = isinstance(request, LaunchRequest) and (
+            request.session.get("source") == request.target_runtime_id
+        )
+        if isinstance(request, LaunchRequest):
+            existing = request.session.get("keepalive_name") if same_runtime else None
+            if existing:
+                _embed_focus(existing, session_key(request.session))
+                return
+            plan = store.registry.build_launch_plan(request)
+            ident = request.session["id"] if same_runtime else keepalive.new_session_ident()
+        else:
+            plan = store.registry.build_new_session_plan(request)
+            ident = keepalive.new_session_ident()
+        try:
+            name = embed.host_session(plan, request.target_runtime_id, ident, *_pane_size_now())
+        except (embed.EmbedError, LaunchError):
+            curses.beep()
+            return
+        if same_runtime:
+            # 状态列/x 键立刻生效，不等 3 秒后的后台重扫；同时记入托管表，
+            # 供 annotate 匹配不上的场景兜底（见 SessionStore.__init__ 注释）
+            request.session["keepalive_name"] = name
+            store.hosted[session_key(request.session)] = name
+        _embed_focus(name, session_key(request.session) if same_runtime else None)
+
+    pending_input = bytearray()
+
+    def _flush_pending() -> None:
+        if pending_input and emb.name:
+            embed.send_literal(emb.name, pending_input.decode("utf-8", errors="replace"))
+        pending_input.clear()
+
+    def _drain_input(first: int) -> None:
+        """可打印字节（含 UTF-8 高位字节）攒批后一次 send-keys -l：快速连打/IME 提交
+        时字符成串到达，排干输入缓冲攒成一批，避免每键一个 tmux 子进程。"""
+        pending_input.append(first)
+        stdscr.timeout(0)
+        try:
+            while len(pending_input) < 4096:
+                nxt = stdscr.getch()
+                if nxt == -1:
+                    break
+                if 32 <= nxt <= 255 and nxt != 127:
+                    pending_input.append(nxt)
+                else:
+                    curses.ungetch(nxt)
+                    break
+        finally:
+            stdscr.timeout(200)
+        _flush_pending()
+
+    def _read_paste_payload() -> None:
+        """读取 bracketed paste 正文（\e[200~ 之后、\e[201~ 之前），整段注入会话。"""
+        payload = bytearray()
+        stdscr.timeout(1000)
+        try:
+            while True:
+                c = stdscr.getch()
+                if c == -1:
+                    break  # 粘贴流异常中断：已读到的内容照常注入
+                if c > 255:
+                    continue  # 功能键混进粘贴流：丢弃，不破坏字节序
+                payload.append(c)
+                if payload[-6:] == b"\x1b[201~":
+                    del payload[-6:]
+                    break
+        finally:
+            stdscr.timeout(200)
+        if emb.name:
+            embed.paste(emb.name, payload.decode("utf-8", errors="replace"))
+
+    def _forward_escape() -> None:
+        """ESC 开头的输入分流：bracketed paste 标记 / 裸 Escape / Alt+键。"""
+        stdscr.timeout(40)
+        try:
+            nxt = stdscr.getch()
+            if nxt == -1:
+                embed.send_key(emb.name, "Escape")
+                return
+            if nxt == ord("["):
+                seq = bytearray()
+                c = -1
+                while len(seq) < 8:
+                    c = stdscr.getch()
+                    if c == -1 or c == ord("~"):
+                        break
+                    seq.append(c)
+                if bytes(seq) == b"200" and c == ord("~"):
+                    _read_paste_payload()
+                    return
+                # 其他 CSI 序列：近似补发 Escape + 已读字节（罕见路径，不追求完美）
+                embed.send_key(emb.name, "Escape")
+                if seq:
+                    embed.send_literal(emb.name, "[" + seq.decode("ascii", errors="replace"))
+                return
+            # Alt+键：发 Escape 再把后随按键按正常路径转发（tmux 端等效 M-x）
+            embed.send_key(emb.name, "Escape")
+            if 32 <= nxt <= 255 and nxt != 127:
+                _drain_input(nxt)
+            else:
+                translated = embed.translate_key(nxt)
+                if translated is not None:
+                    embed.send_key(emb.name, translated[1])
+        finally:
+            stdscr.timeout(200)
+
+    def _pane_mouse() -> bool:
+        """pane 聚焦时的鼠标事件总入口；返回 True 表示改了 UI 状态（左栏滚动）需要重绘。
+
+        区域隔离路由：
+        - pane 内 + agent 申请了鼠标（mouse_any+sgr）：滚轮/按下/拖拽/抬起全事件
+          编码 SGR 1006 直达 agent（它自己处理选词/滚动）；
+        - pane 内 + agent 未申请鼠标：滚轮 copy-mode 翻历史，按下/拖拽/抬起快速丢弃
+          （原生选择与鼠标上报协议互斥，选词用 m 键关上报或 e 全屏）；
+        - pane 外（左栏）：滚轮滚会话列表；其余忽略。
+        事件流只转发或丢弃、绝不触发整帧重绘——这是拖拽不卡死的关键：画面更新
+        一律由 capture/poke 驱动。
+        """
+        try:
+            _, mx, my, _, bstate = curses.getmouse()
+        except curses.error:
+            return False
+        wheel_up = bool(bstate & curses.BUTTON4_PRESSED)
+        wheel_down = bool(bstate & getattr(curses, "BUTTON5_PRESSED", 0))
+        height_now, full_width = stdscr.getmaxyx()
+        pane_x0 = EMBED_LEFT_BAND + 1
+        pane_h = max(1, height_now - 2)
+        pane_visible = _embed_list_width(full_width, height_now, emb) != full_width
+        if not pane_visible or mx < pane_x0 or my >= pane_h:
+            if wheel_up or wheel_down:
+                sessions_now = _visible_sessions(store, ui, _sidebar_width(store.projects(), EMBED_LEFT_BAND) > 0)
+                if sessions_now:
+                    delta = -PREVIEW_MOUSE_SCROLL_LINES if wheel_up else PREVIEW_MOUSE_SCROLL_LINES
+                    ui.idx = max(0, min(ui.idx + delta, len(sessions_now) - 1))
+                    return True
+            return False
+        if not emb.name or emb.dead:
+            return False
+        if emb.mouse_any and emb.mouse_sgr:
+            if wheel_up or wheel_down:
+                # 只转发滚轮：单事件无配对，协议行为稳定。点击/拖拽不转发——
+                # ncurses 会把快速连续的 press+release 合并成 CLICK（未订阅即整个
+                # 丢弃）、press+drag 合并成 motion，行为碎片化到无法承诺语义；
+                # 点击交互与框选复制用 m 关上报或 e 全屏
+                button = 64 if wheel_up else 65
+                embed.send_literal(
+                    emb.name,
+                    embed.sgr_mouse_sequence(button, mx - pane_x0 + 1, my + 1),
+                )
+            return False
+        if wheel_up or wheel_down:
+            if not emb.copy_mode:
+                embed.copy_mode_enter(emb.name)
+                emb.copy_mode = True
+            embed.copy_mode_scroll(emb.name, up=wheel_up)
+            emb.poke.set()
+        return False
+
+    def _forward_pane_key(ch: int) -> None:
+        """pane 聚焦时的按键总入口：除 C-\ 已在主循环拦截外，全部发往托管会话。"""
+        if not emb.name or emb.dead:
+            return
+        # 滚轮翻历史进入的 copy-mode：任何按键先退出再把键发给程序（tmux 原生
+        # copy-mode 会吃掉普通键，用户接着打字时字符会丢，体验上像「键盘失灵」）
+        if emb.copy_mode and ch != curses.KEY_MOUSE:
+            embed.copy_mode_cancel(emb.name)
+            emb.copy_mode = False
+        if 32 <= ch <= 255 and ch != 127:
+            _drain_input(ch)
+        elif ch == 27:
+            _forward_escape()
+        elif ch in (curses.KEY_RESIZE, curses.KEY_MOUSE):
+            return  # resize 由绘制路径处理；鼠标统一走主循环的 _pane_mouse
+        else:
+            translated = embed.translate_key(ch)
+            if translated is not None:
+                embed.send_key(emb.name, translated[1])
+        emb.poke.set()
+
+    def _suspend_self() -> None:
+        """列表/侧栏里的 C-z：把 pickup 自己挂起；回前台后恢复 raw 模式与按键解码。"""
+        curses.def_prog_mode()
+        curses.endwin()
+        os.kill(os.getpid(), signal.SIGSTOP)
+        curses.reset_prog_mode()
+        stdscr.keypad(True)
+        stdscr.timeout(200)
+
+    # getch 超时为 200ms，每 5 帧（约 1 秒）轮询一次缓存文件，拾取后台进程产出的新标题。
+    POLL_EVERY = 5
     REFRESH_INTERVAL = 3.0  # 秒，后台重扫会话列表的间隔
 
     def _background_refresh() -> None:
@@ -1224,31 +1882,57 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
     _remember_selection(_sidebar_width(store.projects(), _initial_width) > 0)
 
     frame = 0
+    had_key = True
+    last_emb_gen = -2
+    last_size: tuple[int, int] | None = None
 
     while True:
         if frame % POLL_EVERY == 0:
             store.poll_cache_updates()
 
-        _, width = stdscr.getmaxyx()
+        height_now, full_width = stdscr.getmaxyx()
+        width = _embed_list_width(full_width, height_now, emb)
         sidebar_visible = _sidebar_width(store.projects(), width) > 0
         if not sidebar_visible and ui.focus == "sidebar":
             # 终端被拖窄导致侧边栏隐藏：焦点强制回列表；proj_idx 保留但过滤旁路，拉宽后自动恢复
             ui.focus = "list"
+        if emb.dead and ui.focus == "pane":
+            ui.focus = "list"  # 面板里的会话进程退出：焦点弹回列表，占位文案由绘制路径给出
 
-        if store.dirty.is_set():
+        dirty = store.dirty.is_set()
+        if dirty:
             store.dirty.clear()
             _relocate_after_refresh(sidebar_visible)
 
-        _draw(stdscr, store, ui, frame)
+        # 没事发生就整帧跳过重绘：无按键、无 dirty、面板 generation 没变、终端尺寸没变、
+        # 也没有标题在转圈时，上一帧的内容保持不动。以前每 200ms 全量重绘一次（含
+        # 8k 单元格的面板区），是 pane 聚焦时输入延迟的主要来源之一
+        _, generating_now = store.snapshot()
+        with emb.lock:
+            emb_gen = emb.generation if emb.active else -1
+        size_now = (height_now, full_width)
+        if (
+            had_key or dirty or generating_now or frame == 0
+            or emb_gen != last_emb_gen or size_now != last_size
+        ):
+            _draw(stdscr, store, ui, frame, emb, pool)
+            last_emb_gen = emb_gen
+            last_size = size_now
+        had_key = False
         frame += 1
 
+        # pane 聚焦时把 getch 超时压到 50ms：capture 线程抓到回显只能靠超时自然醒来
+        # （200ms 意味着回显平均白等 100ms），这是内嵌输入延迟里最大的一项；
+        # 50ms 仍足以让 ncurses 拼完被 SSH 拆开的转义序列。列表/侧栏聚焦时维持 200ms。
+        stdscr.timeout(50 if ui.focus == "pane" else 200)
         try:
             ch = stdscr.getch()
         except curses.error:
             continue
 
         if ch == -1:
-            continue  # timeout，回去重绘以便标题刷新生效
+            continue  # timeout，有变化时下一帧自然会画
+        had_key = True
 
         sessions = _visible_sessions(store, ui, sidebar_visible)
         ui.idx = max(0, min(ui.idx, len(sessions) - 1)) if sessions else 0
@@ -1257,9 +1941,26 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
         # 注意：不能把裸 ESC(27) 也绑定为退出键。stdscr.timeout(200) 让 getch
         # 处于非阻塞模式，这种模式下 ncurses 无法安全等待去判断"单独的 ESC"和
         # "方向键转义序列的开头"，会把序列的第一个字节直接当成裸 ESC 返回，
-        # 导致方向键失灵。所以退出键只留 q。
-        if ch == ord("q"):
+        # 导致方向键失灵。所以退出键只留 q（pane 聚焦时 ESC 会透传给会话）。
+        if ui.focus == "pane":
+            if ch == 28:  # C-\：焦点回列表，托管会话在后台 tmux 里继续跑
+                if emb.copy_mode:
+                    embed.copy_mode_cancel(emb.name)
+                    emb.copy_mode = False
+                ui.focus = "list"
+            elif ch == curses.KEY_MOUSE:
+                # 鼠标事件不置 had_key：拖拽/移动事件流仅转发或丢弃，若每个事件都
+                # 触发整帧重绘，拖拽瞬间变成重绘风暴（实测卡死的根源）
+                had_key = _pane_mouse()
+            else:
+                _forward_pane_key(ch)
+        elif ch == ord("q"):
             return None
+        elif ch == 3:
+            # raw 模式下 C-c 只是字节 3 而不再是 SIGINT；列表/侧栏里维持"退出 pickup"的习惯
+            return None
+        elif ch == 26:
+            _suspend_self()  # C-z 挂起 pickup 自己（pane 聚焦时已在上面的分支透传给会话）
         elif ch == ord("\t"):
             current = runtime_ids.index(ui.source)
             ui.source = runtime_ids[(current + 1) % len(runtime_ids)]
@@ -1283,7 +1984,20 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
                 # a 在侧边栏没有具体会话，_session_action 会 beep 拒绝；n 靠选中的项目目录新建
                 result = _session_action(ch, stdscr, store, ui, None, sidebar_visible)
                 if result is not _ACTION_STAY and result is not _ACTION_PASS:
-                    return result
+                    if _embed_usable_here():
+                        _embed_open(result)
+                    else:
+                        return result
+            elif ch == curses.KEY_MOUSE:
+                delta = _preview_mouse_scroll_delta()
+                if delta is not None:
+                    ui.proj_idx = max(0, min(ui.proj_idx + delta, len(store.projects())))
+                had_key = delta is not None
+            elif ch == ord("m"):
+                # 切换全局鼠标上报：关闭后恢复终端原生框选/复制（开启期间原生
+                # 框选被程序吃掉是协议固有限制）；pane 聚焦时 m 原样发给会话
+                emb.mouse_report = not emb.mouse_report
+                _apply_mousemask(emb.mouse_report)
             # KEY_LEFT：已经是侧边栏端点，停住不动（Tab 仍可循环切换来源）
         else:  # ui.focus == "list"
             if ch in (curses.KEY_UP, ord("k")):
@@ -1311,18 +2025,54 @@ def _run(stdscr, store: SessionStore) -> LaunchRequest | NewSessionRequest | Non
                 if sessions:
                     session = sessions[ui.idx]
                     title = store.get_title(session)
-                    result = _show_preview(stdscr, store, ui, session, title, sidebar_visible)
-                    if result is not None:
-                        return result
+                    preview_result = _show_preview(stdscr, store, ui, session, title, sidebar_visible,
+                                                   mouse_report=emb.mouse_report)
+                    if preview_result is not None:
+                        request, force_fullscreen = preview_result
+                        if not force_fullscreen and _embed_usable_here():
+                            _embed_open(request)
+                        else:
+                            return request
             elif ch in (10, 13, curses.KEY_ENTER):
                 if sessions:
                     session = sessions[ui.idx]
+                    request = LaunchRequest(session, ui.source, store.get_title(session))
+                    if _embed_usable_here():
+                        _embed_open(request)
+                    else:
+                        return request
+            elif ch == ord("e"):
+                # 全屏接管：保留给需要鼠标交互/大屏细看/整段复制的场景（execvp 路径不变）
+                if sessions:
+                    session = sessions[ui.idx]
                     return LaunchRequest(session, ui.source, store.get_title(session))
+            elif ch == ord("c") and emb.active:
+                # 关闭分栏回到全宽列表；托管会话在后台 tmux 里继续跑，回车可再接回
+                emb.active = False
+                emb.name = None
+                emb.grid = None
+                emb.cursor = None
+                emb.copy_mode = False
+                emb.session_key = None
+                embed.close_channel()
+            elif ch == curses.KEY_MOUSE:
+                # 列表页滚轮：上下滚动会话选择（拖拽/点击等其余事件快速丢弃，
+                # 不触发重绘，避免事件流形成重绘风暴）
+                delta = _preview_mouse_scroll_delta()
+                if delta is not None and sessions:
+                    ui.idx = max(0, min(ui.idx + delta, len(sessions) - 1))
+                had_key = delta is not None
+            elif ch == ord("m"):
+                emb.mouse_report = not emb.mouse_report
+                _apply_mousemask(emb.mouse_report)
             else:
                 session = sessions[ui.idx] if sessions else None
                 result = _session_action(ch, stdscr, store, ui, session, sidebar_visible)
                 if result is not _ACTION_STAY and result is not _ACTION_PASS:
-                    return result
+                    if _embed_usable_here():
+                        _embed_open(result)
+                    else:
+                        return result
 
         # 光标移动、切换来源或切换项目都可能改变可见区，统一在这里对齐渲染滚动位置
         _sync_top()
@@ -1446,12 +2196,25 @@ def _spawn_title_daemon(limit: int) -> None:
         pass  # 拉起失败仅退化为「只显示临时兜底标题」，不影响主流程
 
 
+def _require_tmux() -> None:
+    """pickup 的会话托管/内嵌面板/断线保活全部建立在 tmux 之上，属于硬依赖；
+    缺失时明确报错并给出安装提示，不静默降级出残废功能。"""
+    if shutil.which("tmux") is None:
+        print(
+            "pickup 需要 tmux 才能运行，请先安装"
+            "（macOS: brew install tmux；Debian/Ubuntu: sudo apt install tmux）。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
     """处理 `pickup [--no-keepalive] <runtime> [参数…]` 直启透传子命令。
 
     参数原样交给底层运行时（`registry.build_passthrough_plan` 只垫上默认全自动放行参数，
     用户已显式带了就不重复），默认包进后台保活，`--no-keepalive` 可临时关闭。
     """
+    _require_tmux()
     no_keepalive = argv and argv[0] == "--no-keepalive"
     rest = argv[1:] if no_keepalive else argv
     runtime_id, user_args = rest[0], rest[1:]
@@ -1534,6 +2297,8 @@ def main() -> None:
         _output_json(registry, args.limit)
         return
 
+    _require_tmux()
+
     keepalive_on = keepalive.enabled(args.no_keepalive)
     if keepalive_on:
         keepalive.reap_idle()  # 顺带回收空闲太久没人管的后台保活会话，不常驻额外进程
@@ -1550,7 +2315,24 @@ def main() -> None:
     # TUI 通过轮询缓存文件拾取它逐批写入的标题。
     _spawn_title_daemon(args.limit)
 
-    chosen = curses.wrapper(_run, store)
+    # 趁 curses 接管前探测外层终端的前景/背景色（OSC 10/11）：内嵌面板聚焦时经
+    # refresh-client -r 注入托管 pane，让 pane 内 agent 的深/浅主题检测拿到真实值
+    global _OSC_REPORT
+    _OSC_REPORT = _probe_osc_colours()
+    if os.environ.get("PICKUP_DEBUG"):
+        print(f"[pickup debug] 外层终端 OSC 10/11 探测: {_OSC_REPORT!r} "
+              f"(tmux={'是' if os.environ.get('TMUX') else '否'}, "
+              f"refresh -r 支持={'是' if embed.supports_theme_report() else '否'})",
+              file=sys.stderr)
+
+    chosen = curses.wrapper(_run, store, embed.available(args.no_keepalive))
+    # 兜底关闭内嵌控制通道：pane 聚焦时打开的 `tmux -C attach` 控制 client 只有
+    # c 键关分栏才会关，q 退出/回车全屏接管等退出路径不经那条分支——不在这里统一
+    # 兜底就会把孤儿控制 client 留在保活服务端上。close_channel 无通道时是空操作。
+    embed.close_channel()
+    # 关闭 bracketed paste 模式，把终端原样还给后续的 execvp 或 shell
+    sys.stdout.write("\x1b[?2004l")
+    sys.stdout.flush()
     if chosen is None:
         return
 

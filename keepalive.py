@@ -24,7 +24,8 @@ import titles
 from models import LaunchPlan
 
 SOCKET_NAME = "pickup-keepalive"
-SESSION_PREFIX = "sc-"
+SESSION_PREFIX = "pickup-"
+LEGACY_SESSION_PREFIX = "sc-"  # 项目改名 sessionContinue → pickup 前的旧会话名前缀
 _DEFAULT_IDLE_HOURS = 24.0
 _SUBPROCESS_TIMEOUT = 1.5
 _MAX_ANCESTOR_DEPTH = 20
@@ -74,11 +75,16 @@ def _ensure_config_file() -> str:
     return path
 
 
+def _env_disabled(*names: str) -> bool:
+    """任一环境变量被置 0 即视为禁用；新名 PICKUP_* 与旧名 SC_* 都认。"""
+    return any((os.environ.get(name) or "").strip() == "0" for name in names)
+
+
 def enabled(disabled_flag: bool = False) -> bool:
     """保活默认开启；命令行开关、环境变量或已身处 tmux/screen 中时关闭。"""
     if disabled_flag:
         return False
-    if (os.environ.get("SC_KEEPALIVE") or "").strip() == "0":
+    if _env_disabled("PICKUP_KEEPALIVE", "SC_KEEPALIVE"):
         return False
     if os.environ.get("TMUX") or os.environ.get("STY"):
         return False
@@ -103,6 +109,9 @@ def wrap_plan(plan: LaunchPlan, runtime_id: str, ident: str) -> LaunchPlan:
     if plan.cwd:
         argv += ["-c", plan.cwd]
     argv += [
+        "-e", f"PICKUP_RUNTIME={runtime_id}",
+        "-e", f"PICKUP_SESSION_ID={ident}",
+        # 旧变量名继续注入，兼容改名前外部可能的读取方
         "-e", f"SC_RUNTIME={runtime_id}",
         "-e", f"SC_SESSION_ID={ident}",
         "--",
@@ -134,7 +143,7 @@ def _list_tmux_sessions(fields: str) -> list[list[str]]:
     rows = []
     for line in out.splitlines():
         parts = line.split("|")
-        if not parts or not parts[0].startswith(SESSION_PREFIX):
+        if not parts or not parts[0].startswith((SESSION_PREFIX, LEGACY_SESSION_PREFIX)):
             continue
         rows.append(parts)
     return rows
@@ -198,7 +207,7 @@ def annotate(sessions) -> None:
 
 
 def _idle_threshold_hours() -> float:
-    raw = os.environ.get("SC_KEEPALIVE_IDLE_HOURS")
+    raw = os.environ.get("PICKUP_KEEPALIVE_IDLE_HOURS") or os.environ.get("SC_KEEPALIVE_IDLE_HOURS")
     if raw is None:
         return _DEFAULT_IDLE_HOURS
     try:
@@ -223,7 +232,7 @@ def kill(name: str) -> bool:
 
 
 def reap_idle(now: float | None = None) -> list[str]:
-    """关闭空闲超过阈值（默认 24 小时，`SC_KEEPALIVE_IDLE_HOURS=0` 禁用）的保活会话。
+    """关闭空闲超过阈值（默认 24 小时，`PICKUP_KEEPALIVE_IDLE_HOURS=0` 禁用）的保活会话。
 
     会话历史仍在各自运行时的磁盘记录里，关闭的只是 tmux 后台进程，不丢数据。
     """

@@ -17,3 +17,4 @@ env/
 *.key
 .DS_Store
 .codebase-memory/
+.doc-init-*.json

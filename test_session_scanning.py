@@ -15,7 +15,7 @@ import scan_claude
 import scan_codex
 import scan_kimi
 import scan_opencode
-import sc
+import pickup
 import agent_api
 import titles
 from models import ConversationMessage, Handoff, LaunchPlan
@@ -1603,14 +1603,14 @@ class TuiLayoutTests(unittest.TestCase):
         claude_runtime.id = "claude"
         claude_runtime.display_name = "Claude"
         claude_runtime.scan_sessions.return_value = [session]
-        registry = sc.RuntimeRegistry((claude_runtime,))
-        with mock.patch.object(sc.titles, "load_cache", return_value={}):
-            store = sc.SessionStore(limit=20, registry=registry)
+        registry = pickup.RuntimeRegistry((claude_runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
             store.load()
 
         # 启动时无缓存：展示临时兜底标题，并标记为等待后台进程生成（转圈圈）。
         self.assertEqual(store.get_title(session), "这是一条很长的兜底标题")
-        self.assertIn(sc.session_key(session), store.generating)
+        self.assertIn(pickup.session_key(session), store.generating)
 
     def test_poll_cache_updates_clears_spinner_when_title_arrives(self) -> None:
         session = {
@@ -1627,19 +1627,19 @@ class TuiLayoutTests(unittest.TestCase):
         claude_runtime.id = "claude"
         claude_runtime.display_name = "Claude"
         claude_runtime.scan_sessions.return_value = [session]
-        registry = sc.RuntimeRegistry((claude_runtime,))
-        key = sc.session_key(session)
+        registry = pickup.RuntimeRegistry((claude_runtime,))
+        key = pickup.session_key(session)
 
-        with mock.patch.object(sc.titles, "load_cache", return_value={}):
-            store = sc.SessionStore(limit=20, registry=registry)
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
             store.load()
         self.assertIn(key, store.generating)
 
         # 模拟后台进程把标题写进缓存：轮询应拾取它、刷新展示标题并停掉转圈圈。
         fresh_cache = {key: {"fp": titles._fingerprint(session), "title": "后台生成的标题"}}
         with (
-            mock.patch.object(sc.SessionStore, "_cache_file_mtime", return_value=999.0),
-            mock.patch.object(sc.titles, "load_cache", return_value=fresh_cache),
+            mock.patch.object(pickup.SessionStore, "_cache_file_mtime", return_value=999.0),
+            mock.patch.object(pickup.titles, "load_cache", return_value=fresh_cache),
         ):
             store.poll_cache_updates()
 
@@ -1662,16 +1662,16 @@ class TuiLayoutTests(unittest.TestCase):
         runtime.id = "claude"
         runtime.display_name = "Claude"
         runtime.scan_sessions.return_value = [session]
-        runtime.load_conversation.return_value = [sc.ConversationMessage("user", "问题")]
-        registry = sc.RuntimeRegistry((runtime,))
+        runtime.load_conversation.return_value = [pickup.ConversationMessage("user", "问题")]
+        registry = pickup.RuntimeRegistry((runtime,))
 
-        with mock.patch.object(sc.titles, "load_cache", return_value={}):
-            store = sc.SessionStore(limit=20, registry=registry)
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
             store.load()
 
         runtime.load_conversation.assert_not_called()
-        self.assertEqual(store.get_conversation(session), [sc.ConversationMessage("user", "问题")])
-        self.assertEqual(store.get_conversation(session), [sc.ConversationMessage("user", "问题")])
+        self.assertEqual(store.get_conversation(session), [pickup.ConversationMessage("user", "问题")])
+        self.assertEqual(store.get_conversation(session), [pickup.ConversationMessage("user", "问题")])
         runtime.load_conversation.assert_called_once_with(session)
 
     def test_conversation_cache_invalidates_when_history_file_mtime_changes(self) -> None:
@@ -1696,13 +1696,13 @@ class TuiLayoutTests(unittest.TestCase):
             runtime.display_name = "Claude"
             runtime.scan_sessions.return_value = [session]
             runtime.load_conversation.side_effect = [
-                [sc.ConversationMessage("assistant", "旧内容")],
-                [sc.ConversationMessage("assistant", "新内容")],
+                [pickup.ConversationMessage("assistant", "旧内容")],
+                [pickup.ConversationMessage("assistant", "新内容")],
             ]
-            registry = sc.RuntimeRegistry((runtime,))
+            registry = pickup.RuntimeRegistry((runtime,))
 
-            with mock.patch.object(sc.titles, "load_cache", return_value={}):
-                store = sc.SessionStore(limit=20, registry=registry)
+            with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+                store = pickup.SessionStore(limit=20, registry=registry)
                 store.load()
 
             self.assertEqual(store.get_conversation(session)[0].text, "旧内容")
@@ -1718,63 +1718,63 @@ class TuiLayoutTests(unittest.TestCase):
 
     def test_format_relative_time_thresholds(self) -> None:
         now = 1_000_000.0
-        self.assertEqual(sc._format_relative_time(now - 5, now), "刚刚")
-        self.assertEqual(sc._format_relative_time(now + 100, now), "刚刚")  # 时钟漂移/未来
-        self.assertEqual(sc._format_relative_time(now - 120, now), "2分钟前")
-        self.assertEqual(sc._format_relative_time(now - 3 * 3600, now), "3小时前")
+        self.assertEqual(pickup._format_relative_time(now - 5, now), "刚刚")
+        self.assertEqual(pickup._format_relative_time(now + 100, now), "刚刚")  # 时钟漂移/未来
+        self.assertEqual(pickup._format_relative_time(now - 120, now), "2分钟前")
+        self.assertEqual(pickup._format_relative_time(now - 3 * 3600, now), "3小时前")
         # 超过一天退回绝对日期时间（沿用 MM-DD HH:MM）
         old = now - 3 * 86400
         self.assertEqual(
-            sc._format_relative_time(old, now),
-            sc.datetime.fromtimestamp(old).strftime("%m-%d %H:%M"),
+            pickup._format_relative_time(old, now),
+            pickup.datetime.fromtimestamp(old).strftime("%m-%d %H:%M"),
         )
 
     def test_fit_cell_uses_terminal_display_width(self) -> None:
-        self.assertEqual(sc._text_width("标题"), 4)
-        self.assertEqual(sc._fit_cell("标题", 6), "标题  ")
-        self.assertEqual(sc._fit_cell("标题很长", 5), "标题 ")
-        self.assertEqual(sc._text_width(sc._fit_cell("✅完成", 8)), 8)
+        self.assertEqual(pickup._text_width("标题"), 4)
+        self.assertEqual(pickup._fit_cell("标题", 6), "标题  ")
+        self.assertEqual(pickup._fit_cell("标题很长", 5), "标题 ")
+        self.assertEqual(pickup._text_width(pickup._fit_cell("✅完成", 8)), 8)
 
     def test_preview_renders_messages_as_chronological_chat(self) -> None:
         messages = [
-            sc.ConversationMessage("user", "请分析启动速度"),
-            sc.ConversationMessage("assistant", "主要耗时来自历史扫描"),
-            sc.ConversationMessage("user", "再增加聊天记录预览"),
-            sc.ConversationMessage("assistant", "已经完成实现和验证"),
+            pickup.ConversationMessage("user", "请分析启动速度"),
+            pickup.ConversationMessage("assistant", "主要耗时来自历史扫描"),
+            pickup.ConversationMessage("user", "再增加聊天记录预览"),
+            pickup.ConversationMessage("assistant", "已经完成实现和验证"),
         ]
 
-        lines = sc._preview_lines(messages, "Codex", 16)
+        lines = pickup._preview_lines(messages, "Codex", 16)
         text_lines = [line for _, line, _ in lines]
 
         self.assertEqual(text_lines[0], "● 你")
         self.assertIn("◆ Codex", text_lines)
         self.assertEqual(text_lines.count("● 你"), 2)
         self.assertEqual(text_lines.count("◆ Codex"), 2)
-        self.assertTrue(all(sc._text_width(line) <= 16 for line in text_lines))
+        self.assertTrue(all(pickup._text_width(line) <= 16 for line in text_lines))
 
     def test_preview_lines_show_timestamp_suffix_only_when_available(self) -> None:
         ts = 1_780_000_000.0
         messages = [
-            sc.ConversationMessage("user", "带时间戳的消息", ts),
-            sc.ConversationMessage("assistant", "老格式缺时间戳的消息"),
+            pickup.ConversationMessage("user", "带时间戳的消息", ts),
+            pickup.ConversationMessage("assistant", "老格式缺时间戳的消息"),
         ]
 
-        lines = sc._preview_lines(messages, "Claude", 40)
+        lines = pickup._preview_lines(messages, "Claude", 40)
         role_lines = [(kind, line, suffix) for kind, line, suffix in lines if kind in ("user", "assistant")]
 
         self.assertEqual(role_lines[0][1], "● 你")
-        self.assertIn(sc.format_message_time(ts), role_lines[0][2])
+        self.assertIn(pickup.format_message_time(ts), role_lines[0][2])
         self.assertEqual(role_lines[1][1], "◆ Claude")
         self.assertEqual(role_lines[1][2], "")
 
     def test_preview_uses_full_terminal_and_clears_before_returning(self) -> None:
         screen = mock.Mock()
         screen.getmaxyx.return_value = (24, 80)
-        messages = [sc.ConversationMessage("user", "问题")]
+        messages = [pickup.ConversationMessage("user", "问题")]
 
         full_id = "abc12345-1111-2222-3333-444444444444"
-        with mock.patch.object(sc.curses, "color_pair", return_value=0):
-            sc._draw_preview(screen, messages, "标题", "Claude", full_id, True, 0)
+        with mock.patch.object(pickup.curses, "color_pair", return_value=0):
+            pickup._draw_preview(screen, messages, "标题", "Claude", full_id, True, 0)
 
         screen.erase.assert_called_once_with()
         positions = {(call.args[0], call.args[1]) for call in screen.addnstr.call_args_list}
@@ -1788,104 +1788,121 @@ class TuiLayoutTests(unittest.TestCase):
         store.get_conversation.return_value = messages
         store.registry.get.return_value.display_name = "Claude"
         session = {"source": "claude", "id": full_id, "short_id": "abc12345"}
-        ui = sc.UIState(source="claude")
+        ui = pickup.UIState(source="claude")
         screen.getch.return_value = ord("q")
-        with mock.patch.object(sc, "_draw_preview", return_value=(0, 0)) as draw:
-            result = sc._show_preview(screen, store, ui, session, "标题", False)
+        with mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)) as draw:
+            result = pickup._show_preview(screen, store, ui, session, "标题", False)
         draw.assert_called_once_with(screen, messages, "标题", "Claude", full_id, True, 10 ** 9)
         self.assertIsNone(result)
         screen.clear.assert_called_once_with()
 
         screen.clear.reset_mock()
         screen.getch.return_value = 10
-        with mock.patch.object(sc, "_draw_preview", return_value=(0, 0)):
-            result = sc._show_preview(screen, store, ui, session, "标题", False)
-        self.assertEqual(result, sc.LaunchRequest(session, "claude", "标题"))
+        with mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)):
+            result = pickup._show_preview(screen, store, ui, session, "标题", False)
+        self.assertEqual(result, (pickup.LaunchRequest(session, "claude", "标题"), False))
+        screen.clear.assert_called_once_with()
+
+        # e 强制全屏接管：第二个返回值必须为 True，调用方据此跳过内嵌、走 execvp
+        screen.clear.reset_mock()
+        screen.getch.return_value = ord("e")
+        with mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)):
+            result = pickup._show_preview(screen, store, ui, session, "标题", False)
+        self.assertEqual(result, (pickup.LaunchRequest(session, "claude", "标题"), True))
         screen.clear.assert_called_once_with()
 
     def test_preview_mouse_scroll_delta_maps_wheel_direction(self) -> None:
-        with mock.patch.object(sc.curses, "getmouse", return_value=(0, 0, 0, 0, sc.curses.BUTTON4_PRESSED)):
-            self.assertEqual(sc._preview_mouse_scroll_delta(), -sc.PREVIEW_MOUSE_SCROLL_LINES)
+        with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, pickup.curses.BUTTON4_PRESSED)):
+            self.assertEqual(pickup._preview_mouse_scroll_delta(), -pickup.PREVIEW_MOUSE_SCROLL_LINES)
 
-        with mock.patch.object(sc.curses, "getmouse", return_value=(0, 0, 0, 0, sc.curses.BUTTON5_PRESSED)):
-            self.assertEqual(sc._preview_mouse_scroll_delta(), sc.PREVIEW_MOUSE_SCROLL_LINES)
+        with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, pickup.curses.BUTTON5_PRESSED)):
+            self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
 
-        with mock.patch.object(sc.curses, "getmouse", return_value=(0, 0, 0, 0, 0)):
-            self.assertIsNone(sc._preview_mouse_scroll_delta())
+        with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, 0)):
+            self.assertIsNone(pickup._preview_mouse_scroll_delta())
 
-        with mock.patch.object(sc.curses, "getmouse", side_effect=sc.curses.error("no event")):
-            self.assertIsNone(sc._preview_mouse_scroll_delta())
+        with mock.patch.object(pickup.curses, "getmouse", side_effect=pickup.curses.error("no event")):
+            self.assertIsNone(pickup._preview_mouse_scroll_delta())
 
     def test_preview_scrolls_on_mouse_wheel_and_resets_mousemask_on_exit(self) -> None:
         screen = mock.Mock()
         screen.getmaxyx.return_value = (24, 80)
-        messages = [sc.ConversationMessage("user", "问题")]
+        messages = [pickup.ConversationMessage("user", "问题")]
         store = mock.Mock()
         store.get_conversation.return_value = messages
         store.registry.get.return_value.display_name = "Claude"
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
-        ui = sc.UIState(source="claude")
+        ui = pickup.UIState(source="claude")
 
         screen.getch.side_effect = [curses.KEY_MOUSE, ord("q")]
         with (
-            mock.patch.object(sc, "_draw_preview", return_value=(5, 10)) as draw,
-            mock.patch.object(sc.curses, "mousemask") as mousemask,
-            mock.patch.object(sc, "_preview_mouse_scroll_delta", return_value=sc.PREVIEW_MOUSE_SCROLL_LINES),
+            mock.patch.object(pickup, "_draw_preview", return_value=(5, 10)) as draw,
+            mock.patch.object(pickup.curses, "mousemask") as mousemask,
+            mock.patch.object(pickup, "_preview_mouse_scroll_delta", return_value=pickup.PREVIEW_MOUSE_SCROLL_LINES),
         ):
-            sc._show_preview(screen, store, ui, session, "标题", False)
+            pickup._show_preview(screen, store, ui, session, "标题", False)
 
-        # 进入时开启鼠标上报、退出时必须关闭（含正常退出路径），否则终端原生的鼠标选中会失效。
-        mousemask.assert_any_call(curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
-        mousemask.assert_called_with(0)
+        # 进入时开启滚轮上报；退出时恢复主循环的滚轮上报（主列表页/内嵌面板同样依赖它），
+        # 不再清零——清零会让退出预览后主列表的滚轮滚动失效。
+        # 掩码与 pickup._apply_mousemask 一致：滚轮 + 左键按下/抬起（面板内点击丢弃需要
+        # 先订阅到事件，不订阅会被 ncurses 队列层直接滤掉）
+        wheel_mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
+                      | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
+                      | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+        mousemask.assert_any_call(wheel_mask)
+        mousemask.assert_called_with(wheel_mask)
         # 第二次绘制应该带着鼠标滚轮增量后的滚动位置。
         second_call_scroll = draw.call_args_list[1].args[-1]
-        self.assertEqual(second_call_scroll, 5 + sc.PREVIEW_MOUSE_SCROLL_LINES)
+        self.assertEqual(second_call_scroll, 5 + pickup.PREVIEW_MOUSE_SCROLL_LINES)
 
     def test_preview_m_key_toggles_mouse_capture_off_then_on(self) -> None:
         screen = mock.Mock()
         screen.getmaxyx.return_value = (24, 80)
-        messages = [sc.ConversationMessage("user", "问题")]
+        messages = [pickup.ConversationMessage("user", "问题")]
         store = mock.Mock()
         store.get_conversation.return_value = messages
         store.registry.get.return_value.display_name = "Claude"
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
-        ui = sc.UIState(source="claude")
+        ui = pickup.UIState(source="claude")
 
         screen.getch.side_effect = [ord("m"), ord("m"), ord("q")]
         with (
-            mock.patch.object(sc, "_draw_preview", return_value=(0, 0)) as draw,
-            mock.patch.object(sc.curses, "mousemask") as mousemask,
+            mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)) as draw,
+            mock.patch.object(pickup.curses, "mousemask") as mousemask,
         ):
-            sc._show_preview(screen, store, ui, session, "标题", False)
+            pickup._show_preview(screen, store, ui, session, "标题", False)
 
-        default_mask = curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0)
-        # 进入开、按 m 关、再按 m 开、退出关：mousemask 调用序列必须完整反映这四步。
+        default_mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
+                        | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
+                        | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
+        # 进入开、按 m 关、再按 m 开、退出恢复：退出时恢复主循环的滚轮上报（默认掩码）而非清零，
+        # mousemask 调用序列必须完整反映这四步。
         self.assertEqual(
             [call.args[0] for call in mousemask.call_args_list],
-            [default_mask, 0, default_mask, 0],
+            [default_mask, 0, default_mask, default_mask],
         )
         # footer 提示随开关状态切换文案，用户能看出当前能不能用鼠标原生框选。
         mouse_enabled_flags = [call.args[5] for call in draw.call_args_list]
         self.assertEqual(mouse_enabled_flags, [True, False, True])
 
     def test_directory_column_gets_more_space_on_normal_terminals(self) -> None:
-        col_num, col_title, col_dir, col_time, col_size, col_status = sc._column_widths(120)
+        col_num, col_title, col_dir, col_time, col_size, col_status = pickup._column_widths(120)
 
         self.assertEqual((col_num, col_time, col_size, col_status), (4, 17, 11, 10))
         self.assertGreaterEqual(col_title, 10)
         self.assertGreaterEqual(col_dir, 30)
         self.assertEqual(
-            sum((col_num, col_title, col_dir, col_time, col_size, col_status)) + len(sc.COL_GAP) * 5,
+            sum((col_num, col_title, col_dir, col_time, col_size, col_status)) + len(pickup.COL_GAP) * 5,
             119,
         )
 
 
 class ProjectSidebarTests(unittest.TestCase):
     def test_normalize_cwd_trailing_slash_and_empty(self) -> None:
-        self.assertEqual(sc._normalize_cwd("/a/b/"), "/a/b")
-        self.assertEqual(sc._normalize_cwd(""), "")
-        self.assertEqual(sc._normalize_cwd(None), "")
-        self.assertEqual(sc._normalize_cwd("/"), "")
+        self.assertEqual(pickup._normalize_cwd("/a/b/"), "/a/b")
+        self.assertEqual(pickup._normalize_cwd(""), "")
+        self.assertEqual(pickup._normalize_cwd(None), "")
+        self.assertEqual(pickup._normalize_cwd("/"), "")
 
     def test_project_groups_sorted_by_count_then_latest_mtime(self) -> None:
         sessions_by_source = {
@@ -1896,7 +1913,7 @@ class ProjectSidebarTests(unittest.TestCase):
                 {"cwd": "/a/z", "mtime": 1},
             ],
         }
-        groups = sc._project_groups(sessions_by_source)
+        groups = pickup._project_groups(sessions_by_source)
         keys = [g["cwd_key"] for g in groups]
 
         # 会话数最多的项目排第一；会话数相同的项目按最近会话时间倒序。
@@ -1909,7 +1926,7 @@ class ProjectSidebarTests(unittest.TestCase):
             "claude": [{"cwd": "/a/x", "mtime": 1}],
             "codex": [{"cwd": "/a/x", "mtime": 2}],
         }
-        groups = sc._project_groups(sessions_by_source)
+        groups = pickup._project_groups(sessions_by_source)
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["count"], 2)
@@ -1917,21 +1934,21 @@ class ProjectSidebarTests(unittest.TestCase):
 
     def test_project_groups_labels_empty_and_root_cwd_as_unknown(self) -> None:
         sessions_by_source = {"claude": [{"cwd": "", "mtime": 1}, {"cwd": "/", "mtime": 2}]}
-        groups = sc._project_groups(sessions_by_source)
+        groups = pickup._project_groups(sessions_by_source)
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["cwd_key"], "")
-        self.assertEqual(groups[0]["label"], sc.UNKNOWN_PROJECT_LABEL)
+        self.assertEqual(groups[0]["label"], pickup.UNKNOWN_PROJECT_LABEL)
         self.assertEqual(groups[0]["count"], 2)
 
     def test_disambiguate_adds_parent_only_on_conflict(self) -> None:
-        labels = sc._disambiguate_labels(["/a/x/cli", "/b/y/app"])
+        labels = pickup._disambiguate_labels(["/a/x/cli", "/b/y/app"])
         self.assertEqual(labels["/a/x/cli"], "cli")
         self.assertEqual(labels["/b/y/app"], "app")
 
     def test_disambiguate_climbs_multiple_levels(self) -> None:
         # 两个同名 cli 目录连上一级目录名也相同，需要继续向上爬升才能唯一区分。
-        labels = sc._disambiguate_labels(["/a/p/cli", "/b/p/cli"])
+        labels = pickup._disambiguate_labels(["/a/p/cli", "/b/p/cli"])
         self.assertEqual(labels["/a/p/cli"], "a/p/cli")
         self.assertEqual(labels["/b/p/cli"], "b/p/cli")
         self.assertNotEqual(labels["/a/p/cli"], labels["/b/p/cli"])
@@ -1941,38 +1958,38 @@ class ProjectSidebarTests(unittest.TestCase):
             {"cwd": "/a/x/cli", "mtime": 1},
             {"cwd": "/b/y/cli", "mtime": 2},
         ]
-        filtered = sc._filter_sessions(sessions, "/a/x/cli")
+        filtered = pickup._filter_sessions(sessions, "/a/x/cli")
 
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["cwd"], "/a/x/cli")
 
     def test_filter_sessions_none_key_returns_unfiltered(self) -> None:
         sessions = [{"cwd": "/a/x", "mtime": 1}]
-        self.assertEqual(sc._filter_sessions(sessions, None), sessions)
+        self.assertEqual(pickup._filter_sessions(sessions, None), sessions)
 
     def test_sidebar_width_hidden_below_threshold(self) -> None:
         projects = [{"label": "cli", "count": 5}]
-        self.assertEqual(sc._sidebar_width(projects, sc.SIDEBAR_HIDE_THRESHOLD - 1), 0)
-        self.assertGreater(sc._sidebar_width(projects, sc.SIDEBAR_HIDE_THRESHOLD), 0)
+        self.assertEqual(pickup._sidebar_width(projects, pickup.SIDEBAR_HIDE_THRESHOLD - 1), 0)
+        self.assertGreater(pickup._sidebar_width(projects, pickup.SIDEBAR_HIDE_THRESHOLD), 0)
 
     def test_sidebar_width_adapts_and_clamps(self) -> None:
         narrow_projects = [{"label": "cli", "count": 3}]
-        width = sc._sidebar_width(narrow_projects, 200)
-        self.assertGreaterEqual(width, sc.SIDEBAR_MIN_WIDTH)
-        self.assertLessEqual(width, sc.SIDEBAR_MAX_WIDTH)
+        width = pickup._sidebar_width(narrow_projects, 200)
+        self.assertGreaterEqual(width, pickup.SIDEBAR_MIN_WIDTH)
+        self.assertLessEqual(width, pickup.SIDEBAR_MAX_WIDTH)
 
         # 超长（含中文全角）项目名不应把侧边栏撑破上限。
         long_label_projects = [{"label": "一个非常非常长的中文项目名字用来测试截断上限", "count": 999}]
-        self.assertEqual(sc._sidebar_width(long_label_projects, 200), sc.SIDEBAR_MAX_WIDTH)
+        self.assertEqual(pickup._sidebar_width(long_label_projects, 200), pickup.SIDEBAR_MAX_WIDTH)
 
     def test_truncate_left_keeps_tail_display_width(self) -> None:
         text = "x0c/pickup/cli"
-        truncated = sc._truncate_left(text, 10)
+        truncated = pickup._truncate_left(text, 10)
 
-        self.assertLessEqual(sc._text_width(truncated), 10)
+        self.assertLessEqual(pickup._text_width(truncated), 10)
         self.assertTrue(truncated.endswith("cli"))
         self.assertTrue(truncated.startswith("…"))
-        self.assertEqual(sc._truncate_left("cli", 10), "cli")  # 不超宽时原样返回
+        self.assertEqual(pickup._truncate_left("cli", 10), "cli")  # 不超宽时原样返回
 
     def test_visible_sessions_filters_by_selected_project(self) -> None:
         sessions = [{"cwd": "/a/x"}, {"cwd": "/a/y"}]
@@ -1983,13 +2000,13 @@ class ProjectSidebarTests(unittest.TestCase):
             {"cwd_key": "/a/y", "label": "y", "count": 1, "latest_mtime": 1},
         ]
 
-        filtered = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=1), sidebar_visible=True)
+        filtered = pickup._visible_sessions(store, pickup.UIState(source="claude", proj_idx=1), sidebar_visible=True)
         self.assertEqual(filtered, [sessions[0]])
 
-        unfiltered = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=0), sidebar_visible=True)
+        unfiltered = pickup._visible_sessions(store, pickup.UIState(source="claude", proj_idx=0), sidebar_visible=True)
         self.assertEqual(unfiltered, sessions)
 
-        hidden = sc._visible_sessions(store, sc.UIState(source="claude", proj_idx=1), sidebar_visible=False)
+        hidden = pickup._visible_sessions(store, pickup.UIState(source="claude", proj_idx=1), sidebar_visible=False)
         self.assertEqual(hidden, sessions)
 
     def _store_with_projects(self, projects: list[dict]) -> mock.Mock:
@@ -1999,31 +2016,31 @@ class ProjectSidebarTests(unittest.TestCase):
 
     def test_new_session_cwd_prefers_selected_project_over_session(self) -> None:
         store = self._store_with_projects([{"cwd_key": "/proj/a", "label": "a"}])
-        ui = sc.UIState(source="claude", proj_idx=1)
+        ui = pickup.UIState(source="claude", proj_idx=1)
         session = {"cwd": "/proj/other"}
 
-        self.assertEqual(sc._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/a")
+        self.assertEqual(pickup._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/a")
 
     def test_new_session_cwd_falls_back_to_session_cwd_when_all_projects(self) -> None:
         store = self._store_with_projects([{"cwd_key": "/proj/a", "label": "a"}])
-        ui = sc.UIState(source="claude", proj_idx=0)
+        ui = pickup.UIState(source="claude", proj_idx=0)
         session = {"cwd": "/proj/session"}
 
-        self.assertEqual(sc._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/session")
+        self.assertEqual(pickup._new_session_cwd(store, ui, session, sidebar_visible=True), "/proj/session")
 
     def test_new_session_cwd_none_without_project_or_session(self) -> None:
         store = self._store_with_projects([])
-        ui = sc.UIState(source="claude", proj_idx=0)
+        ui = pickup.UIState(source="claude", proj_idx=0)
 
-        self.assertIsNone(sc._new_session_cwd(store, ui, None, sidebar_visible=True))
-        self.assertIsNone(sc._new_session_cwd(store, ui, None, sidebar_visible=False))
+        self.assertIsNone(pickup._new_session_cwd(store, ui, None, sidebar_visible=True))
+        self.assertIsNone(pickup._new_session_cwd(store, ui, None, sidebar_visible=False))
 
     def test_new_session_cwd_unknown_project_returns_none(self) -> None:
         # cwd_key == "" 表示"(未知目录)"分组，没有真实路径可用。
-        store = self._store_with_projects([{"cwd_key": "", "label": sc.UNKNOWN_PROJECT_LABEL}])
-        ui = sc.UIState(source="claude", proj_idx=1)
+        store = self._store_with_projects([{"cwd_key": "", "label": pickup.UNKNOWN_PROJECT_LABEL}])
+        ui = pickup.UIState(source="claude", proj_idx=1)
 
-        self.assertIsNone(sc._new_session_cwd(store, ui, {"cwd": "/should/not/use"}, sidebar_visible=True))
+        self.assertIsNone(pickup._new_session_cwd(store, ui, {"cwd": "/should/not/use"}, sidebar_visible=True))
 
 
 class SessionActionTests(unittest.TestCase):
@@ -2031,76 +2048,76 @@ class SessionActionTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.store = mock.Mock()
-        self.beep_patch = mock.patch.object(sc.curses, "beep")
+        self.beep_patch = mock.patch.object(pickup.curses, "beep")
         self.beep = self.beep_patch.start()
         self.addCleanup(self.beep_patch.stop)
 
     def test_unhandled_key_passes_through(self) -> None:
-        ui = sc.UIState(source="claude")
-        result = sc._session_action(ord("z"), mock.Mock(), self.store, ui, None, False)
-        self.assertIs(result, sc._ACTION_PASS)
+        ui = pickup.UIState(source="claude")
+        result = pickup._session_action(ord("z"), mock.Mock(), self.store, ui, None, False)
+        self.assertIs(result, pickup._ACTION_PASS)
 
     def test_a_without_session_beeps_and_stays(self) -> None:
-        ui = sc.UIState(source="claude")
-        result = sc._session_action(ord("a"), mock.Mock(), self.store, ui, None, False)
-        self.assertIs(result, sc._ACTION_STAY)
+        ui = pickup.UIState(source="claude")
+        result = pickup._session_action(ord("a"), mock.Mock(), self.store, ui, None, False)
+        self.assertIs(result, pickup._ACTION_STAY)
         self.beep.assert_called_once()
 
     def test_a_with_session_opens_relay_menu(self) -> None:
-        ui = sc.UIState(source="claude")
+        ui = pickup.UIState(source="claude")
         session = {"source": "claude", "id": "s1"}
         self.store.get_title.return_value = "标题"
-        with mock.patch.object(sc, "_choose_target_runtime", return_value="codex") as choose:
-            result = sc._session_action(ord("a"), mock.Mock(), self.store, ui, session, False)
+        with mock.patch.object(pickup, "_choose_target_runtime", return_value="codex") as choose:
+            result = pickup._session_action(ord("a"), mock.Mock(), self.store, ui, session, False)
         choose.assert_called_once_with(mock.ANY, self.store, "claude")
-        self.assertEqual(result, sc.LaunchRequest(session, "codex", "标题"))
+        self.assertEqual(result, pickup.LaunchRequest(session, "codex", "标题"))
 
     def test_a_cancelled_menu_stays(self) -> None:
-        ui = sc.UIState(source="claude")
+        ui = pickup.UIState(source="claude")
         session = {"source": "claude", "id": "s1"}
-        with mock.patch.object(sc, "_choose_target_runtime", return_value=None):
-            result = sc._session_action(ord("a"), mock.Mock(), self.store, ui, session, False)
-        self.assertIs(result, sc._ACTION_STAY)
+        with mock.patch.object(pickup, "_choose_target_runtime", return_value=None):
+            result = pickup._session_action(ord("a"), mock.Mock(), self.store, ui, session, False)
+        self.assertIs(result, pickup._ACTION_STAY)
 
     def test_n_without_directory_beeps_and_stays(self) -> None:
-        ui = sc.UIState(source="claude")
-        with mock.patch.object(sc, "_new_session_cwd", return_value=None):
-            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, False)
-        self.assertIs(result, sc._ACTION_STAY)
+        ui = pickup.UIState(source="claude")
+        with mock.patch.object(pickup, "_new_session_cwd", return_value=None):
+            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, None, False)
+        self.assertIs(result, pickup._ACTION_STAY)
         self.beep.assert_called_once()
 
     def test_n_on_list_focus_uses_current_tab_without_popup(self) -> None:
-        ui = sc.UIState(source="claude", focus="list")
+        ui = pickup.UIState(source="claude", focus="list")
         session = {"cwd": "/proj/a"}
         with (
-            mock.patch.object(sc, "_new_session_cwd", return_value="/proj/a"),
-            mock.patch.object(sc, "usable_cwd", side_effect=lambda cwd: cwd),
-            mock.patch.object(sc, "_pick_runtime_for_new_session") as pick,
+            mock.patch.object(pickup, "_new_session_cwd", return_value="/proj/a"),
+            mock.patch.object(pickup, "usable_cwd", side_effect=lambda cwd: cwd),
+            mock.patch.object(pickup, "_pick_runtime_for_new_session") as pick,
         ):
-            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, session, False)
+            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, session, False)
         pick.assert_not_called()
-        self.assertEqual(result, sc.NewSessionRequest("claude", "/proj/a"))
+        self.assertEqual(result, pickup.NewSessionRequest("claude", "/proj/a"))
 
     def test_n_on_sidebar_focus_opens_runtime_picker(self) -> None:
-        ui = sc.UIState(source="claude", focus="sidebar", proj_idx=1)
+        ui = pickup.UIState(source="claude", focus="sidebar", proj_idx=1)
         with (
-            mock.patch.object(sc, "_new_session_cwd", return_value="/proj/a"),
-            mock.patch.object(sc, "usable_cwd", side_effect=lambda cwd: cwd),
-            mock.patch.object(sc, "_pick_runtime_for_new_session", return_value="codex") as pick,
+            mock.patch.object(pickup, "_new_session_cwd", return_value="/proj/a"),
+            mock.patch.object(pickup, "usable_cwd", side_effect=lambda cwd: cwd),
+            mock.patch.object(pickup, "_pick_runtime_for_new_session", return_value="codex") as pick,
         ):
-            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
+            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
         pick.assert_called_once_with(mock.ANY, self.store, "claude")
-        self.assertEqual(result, sc.NewSessionRequest("codex", "/proj/a"))
+        self.assertEqual(result, pickup.NewSessionRequest("codex", "/proj/a"))
 
     def test_n_on_sidebar_focus_cancelled_picker_stays(self) -> None:
-        ui = sc.UIState(source="claude", focus="sidebar", proj_idx=1)
+        ui = pickup.UIState(source="claude", focus="sidebar", proj_idx=1)
         with (
-            mock.patch.object(sc, "_new_session_cwd", return_value="/proj/a"),
-            mock.patch.object(sc, "usable_cwd", side_effect=lambda cwd: cwd),
-            mock.patch.object(sc, "_pick_runtime_for_new_session", return_value=None),
+            mock.patch.object(pickup, "_new_session_cwd", return_value="/proj/a"),
+            mock.patch.object(pickup, "usable_cwd", side_effect=lambda cwd: cwd),
+            mock.patch.object(pickup, "_pick_runtime_for_new_session", return_value=None),
         ):
-            result = sc._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
-        self.assertIs(result, sc._ACTION_STAY)
+            result = pickup._session_action(ord("n"), mock.Mock(), self.store, ui, None, True)
+        self.assertIs(result, pickup._ACTION_STAY)
 
 
 class DirectLaunchTests(unittest.TestCase):
@@ -2117,14 +2134,14 @@ class DirectLaunchTests(unittest.TestCase):
         registry = self._registry_returning(plan)
 
         with (
-            mock.patch.object(sc, "keepalive") as keepalive_mock,
-            mock.patch.object(sc, "execute_launch") as execute_launch,
+            mock.patch.object(pickup, "keepalive") as keepalive_mock,
+            mock.patch.object(pickup, "execute_launch") as execute_launch,
         ):
             keepalive_mock.enabled.return_value = True
             keepalive_mock.new_session_ident.return_value = "xxxx"
             keepalive_mock.wrap_plan.return_value = wrapped
 
-            sc._dispatch_direct_launch(["claude", "把测试修到全绿"], registry)
+            pickup._dispatch_direct_launch(["claude", "把测试修到全绿"], registry)
 
         registry.build_passthrough_plan.assert_called_once_with("claude", ["把测试修到全绿"])
         keepalive_mock.enabled.assert_called_once_with(False)
@@ -2136,12 +2153,12 @@ class DirectLaunchTests(unittest.TestCase):
         registry = self._registry_returning(plan)
 
         with (
-            mock.patch.object(sc, "keepalive") as keepalive_mock,
-            mock.patch.object(sc, "execute_launch") as execute_launch,
+            mock.patch.object(pickup, "keepalive") as keepalive_mock,
+            mock.patch.object(pickup, "execute_launch") as execute_launch,
         ):
             keepalive_mock.enabled.return_value = False
 
-            sc._dispatch_direct_launch(["--no-keepalive", "codex", "resume"], registry)
+            pickup._dispatch_direct_launch(["--no-keepalive", "codex", "resume"], registry)
 
         registry.build_passthrough_plan.assert_called_once_with("codex", ["resume"])
         keepalive_mock.enabled.assert_called_once_with(True)
@@ -2153,13 +2170,13 @@ class DirectLaunchTests(unittest.TestCase):
         registry = self._registry_returning(plan)
 
         with (
-            mock.patch.object(sc, "keepalive") as keepalive_mock,
-            mock.patch.object(sc, "execute_launch", side_effect=sc.LaunchError("未找到 claude 命令")),
+            mock.patch.object(pickup, "keepalive") as keepalive_mock,
+            mock.patch.object(pickup, "execute_launch", side_effect=pickup.LaunchError("未找到 claude 命令")),
         ):
             keepalive_mock.enabled.return_value = False
 
             with self.assertRaises(SystemExit) as ctx:
-                sc._dispatch_direct_launch(["claude"], registry)
+                pickup._dispatch_direct_launch(["claude"], registry)
 
         self.assertEqual(ctx.exception.code, 1)
 

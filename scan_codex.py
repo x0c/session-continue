@@ -2,7 +2,7 @@
 """扫描 Codex 会话历史（~/.codex/sessions/），输出统一会话结构。
 
 移植自 agentsync 的 codex-session-continue/scripts/list_sessions.py，
-去掉了 CLI/表格输出，只保留 scan_sessions() 供 sc.py 消费。
+去掉了 CLI/表格输出，只保留 scan_sessions() 供 pickup.py 消费。
 """
 
 from __future__ import annotations

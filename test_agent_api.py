@@ -389,11 +389,11 @@ class RuntimeContinuationPlanTests(unittest.TestCase):
 
 
 class SubprocessIntegrationTests(unittest.TestCase):
-    """通过真实子进程验证 sc.py 的旧接口回归和非 TTY 自动降级；较慢，单独分组。"""
+    """通过真实子进程验证 pickup.py 的旧接口回归和非 TTY 自动降级；较慢，单独分组。"""
 
     def _run(self, args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "sc.py", *args],
+            [sys.executable, "pickup.py", *args],
             cwd=str(Path(__file__).resolve().parent),
             capture_output=True,
             text=True,
