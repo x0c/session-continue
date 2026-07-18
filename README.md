@@ -107,8 +107,14 @@ JSON output includes runtime, session ID, title, working directory, update time,
 Code sessions appear in one list rather than separate runtime tabs. Each two-line card shows
 `project: title` first, then runtime, status, and the right-aligned update time. The right half
 always follows the selection: hosted sessions render their live terminal, while history that is not
-currently hosted shows an instant summary without starting a process.
+currently hosted shows an instant summary without starting a process. Once the list is shown its
+order is stable — cards never jump around when their content updates; only genuinely new sessions
+appear, always prepended at the top.
 
+- The first row is a pinned `＋ 新建会话` (new session) item that never scrolls away: press
+  `Enter` on it to pick a project directory and an agent runtime, and the blank session starts
+  hosted in the right-hand pane, ready for input. `n` does the same without prompts, using the
+  current project filter (or the selected session's directory) and the current runtime.
 - `Enter` resumes the selected session in the right-hand pane, or gives keyboard focus to its
   already-hosted live terminal. Moving the selection alone never starts an agent.
 - Click a session card to do the same thing as `Enter`; click an empty part of the left list to
@@ -148,20 +154,23 @@ currently hosted shows an instant summary without starting a process.
 
 `pickup claude [args...]`, `pickup codex [args...]`, `pickup opencode [args...]`, and
 `pickup kimi [args...]` start a brand-new session
-directly, skipping the TUI. Everything after the runtime name is passed through unchanged to the
+directly. In a real terminal they open the same sidebar TUI with the new session already hosted in
+the right-hand pane, so the fresh agent is one `Esc` away from your full history; outside a real
+terminal (piped/scripted) or with `--no-keepalive` they take over the terminal the classic way
+instead. Everything after the runtime name is passed through unchanged to the
 underlying command; `pickup` only prepends the runtime's auto-approve flag
 (`--dangerously-skip-permissions` for Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex,
 `-y` for Kimi)
-unless you already included it yourself, and wraps the launch in
-[Keep-Alive](#keep-alive-survive-ssh-disconnects) by default.
+unless you already included it yourself, and hosts the session with
+[Keep-Alive](#keep-alive-survive-ssh-disconnects) either way.
 
 ```bash
-pickup claude                       # blank auto-approved Claude session, kept alive in the background
+pickup claude                       # blank auto-approved Claude session, hosted in the sidebar TUI
 pickup claude Fix the failing tests # same, with a first instruction passed straight to claude
-pickup codex resume                 # `codex resume`, auto-approved and kept alive
-pickup opencode                     # blank OpenCode TUI session, kept alive in the background
-pickup kimi                         # blank auto-approved Kimi session, kept alive in the background
-pickup --no-keepalive claude        # direct launch without the background tmux wrapper
+pickup codex resume                 # `codex resume`, auto-approved and hosted in the TUI
+pickup opencode                     # blank OpenCode TUI session, hosted in the TUI
+pickup kimi                         # blank auto-approved Kimi session, hosted in the TUI
+pickup --no-keepalive claude        # classic full-terminal launch without the background tmux wrapper
 ```
 
 OpenCode is the exception: its `--dangerously-skip-permissions` flag is only accepted under
@@ -230,8 +239,9 @@ agent workflows.
 | `p` | Pin or unpin the right-hand detail pane |
 | `Space` | Open full-screen conversation preview |
 | `Home` / `End` | Jump in preview |
-| `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background) |
+| `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background); on the pinned first row `＋ 新建会话`, start the new-session flow instead |
 | `a` | Open advanced handoff actions |
+| `n` | New blank session in the current project with the current runtime (no prompts) |
 | `x` | Close a backgrounded (keep-alive) session, with confirmation |
 | `Esc` | Close preview/dialog or quit |
 

@@ -103,18 +103,19 @@
 
 ### 统一会话时间线与右栏跟随
 
-- `SessionStore.all_sessions()` 把全部运行时会话合并后按 `mtime` 倒序；TUI 的唯一列表入口是 `_visible_sessions(store, ui)`，不能再直接读取某个运行时桶，否则会重新引入顶部按运行时分组。
+- `SessionStore.all_sessions()` 合并全部运行时会话后按 `SessionStore._order` 返回**稳定顺序**：首次展示按 mtime 倒序（各适配器扫描依旧按 mtime 倒序返回，是初始顺序的唯一来源），之后已有会话位置固定——后台重扫只更新内容、不再整体重排（用户实报：运行中会话一有消息更新就跳到顶上，刚要看的位置全乱）；新出现的会话按 mtime 倒序插到最前。TUI 的唯一列表入口是 `_visible_sessions(store, ui)`，不能再直接读取某个运行时桶，否则会重新引入顶部按运行时分组。
+- **列表虚拟索引 0 是顶部固定的「＋ 新建会话」项**（钉在滚动区之上，占 `NEW_SESSION_ITEM_ROWS` 行），1 起才是会话：默认选中最近的会话（保持「进 pickup 直接回车 = 恢复最近会话」的习惯），`ui.idx`/`ui.top`/鼠标点击换算全部按虚拟索引；重扫后的重定位（`_remember_selection`/`_relocate_after_refresh`）对会话记住会话键、对固定项什么都不做。回车（或点击）该项走 `_new_session_flow`：`_pick_project`（已知项目按会话数倒序 + 「当前目录」兜底，通用单选弹窗 `_pick_menu`）→ `_pick_runtime_for_new_session`，确认后的 `NewSessionRequest` 经 `_embed_open` 托管进右栏。`n` 仍是不弹窗的快捷路径（当前筛选/所选会话目录 + 当前运行时），两者并存。
 - 列表固定两行卡片：第一行是“项目名: 标题”，第二行是“状态 · 运行时”，相对时间右对齐。项目名从完整 cwd 取末级目录；筛选匹配仍必须按归一化后的完整 cwd，不能按展示名匹配。
 - 项目筛选不占常驻空间：`UIState.project_key=None` 代表全部项目，`f` 在全部项目与项目组之间循环。新建会话优先使用当前筛选项目，否则使用所选会话的 cwd；运行时默认取所选会话所属运行时。
-- 右栏默认随选择变化：托管会话显示 tmux 现场但不抢键盘；未托管或已结束会话只显示扫描期已提取的标题、状态和最近问答，禁止为了预览而读取完整历史或自动启动 Agent。Enter 才恢复/操作，`p` 固定当前右栏后允许继续浏览其它会话。
-- 鼠标点击左栏空白处只把焦点还给列表；点击一条会话等价于 Enter。右栏操作态可用两次 `\\` 在 280ms 内返回列表；第一个 `\\` 在窗口结束前不转发，未形成双击时再原样补发给 Agent。`Ctrl-\\` 仅保留兼容。
+- 右栏默认随选择变化：托管会话显示 tmux 现场但不抢键盘；未托管或已结束会话只显示扫描期已提取的标题、状态和最近问答，禁止为了预览而读取完整历史或自动启动 Agent。Enter 才恢复/操作，`p` 固定当前右栏后允许继续浏览其它会话。**键盘已交给面板（`ui.focus == "pane"`，Enter 明确聚焦）时不跟随**：新建/直启的空白会话没有列表会话键，跟随会立刻把刚聚焦的画面换回所选会话的静态详情——这是 `_follow_selection` 的第一条提前返回；焦点弹回列表（C-\、会话退出、面板被拖窄隐藏）后恢复跟随。
+- 鼠标点击左栏空白处只把焦点还给列表；点击一条会话等价于 Enter，点击固定「＋ 新建会话」项等价于对该项回车（同样进 `_new_session_flow`）。右栏操作态可用两次 `\\` 在 280ms 内返回列表；第一个 `\\` 在窗口结束前不转发，未形成双击时再原样补发给 Agent。`Ctrl-\\` 仅保留兼容。
 
 ### 会话级快捷键与预览页一致性（`_session_action`）
 
 - 列表页和预览页（Space 打开）共用同一个分发点 `sc._session_action(ch, stdscr, store, ui, session, sidebar_visible)`，返回三态之一：一个启动请求（冒泡给调用方退出 TUI 执行）、`_ACTION_STAY`（按键已处理——弹窗被取消或 beep 拒绝，调用方留在当前视图重绘）、`_ACTION_PASS`（不是会话级动作键，调用方自行处理导航/滚动）。**新增会话级快捷键只需要在这一个函数里加分支**，列表页和预览页会自动同时生效，禁止在两处分别写一份重复的按键判断。
-- `n`（新建空白会话）：工作目录由 `sc._new_session_cwd` 解析——侧边栏选中具体项目时用该项目路径，否则退回光标所在会话的 `cwd`；两者都拿不到，或解析出的目录在本机不存在（`usable_cwd` 校验），一律 `curses.beep()` 后停留，不弹窗、不报错。运行时选择：焦点在 Claude/Codex 标签页时直接用当前标签对应的运行时，不弹窗；焦点在侧边栏（只选中了项目、没有具体运行时上下文）时弹 `_pick_runtime_for_new_session` 菜单，默认高亮当前标签对应的运行时。预览页里 `ui.focus` 恒为 `"list"`（只能从列表进入预览），所以预览页按 `n` 永远直接用当前标签、不弹窗。
+- `n`（新建空白会话）：工作目录由 `sc._new_session_cwd` 解析——当前项目筛选优先，否则退回光标所在会话的 `cwd`；两者都拿不到，或解析出的目录在本机不存在（`usable_cwd` 校验），一律 `curses.beep()` 后停留，不弹窗、不报错。运行时直接用 `ui.source`，不弹窗；需要选项目/运行时时走列表顶部固定的「＋ 新建会话」项（见「统一会话时间线与右栏跟随」节），完整选择流程只有那一个入口。预览页里 `ui.focus` 恒为 `"list"`（只能从列表进入预览），预览页按 `n` 同样不弹窗。
 - `a`（跨运行时接力）在侧边栏焦点或预览页里没有具体会话上下文时（`session is None`）同样只是 beep，不弹菜单。
-- 运行时选择弹窗底层复用同一个 `sc._pick_runtime(stdscr, store, title, action_for, default_index)`：`_choose_target_runtime`（接力）和 `_pick_runtime_for_new_session`（新建）只是传不同标题、不同每项说明文案和不同默认选中项的薄封装，不要再各写一份绘制+按键循环。
+- 运行时选择弹窗底层复用同一个 `sc._pick_runtime(stdscr, store, title, action_for, default_index)`：`_choose_target_runtime`（接力）和 `_pick_runtime_for_new_session`（新建）只是传不同标题、不同每项说明文案和不同默认选中项的薄封装，不要再各写一份绘制+按键循环。项目选择等其它单选弹窗走通用 `_pick_menu`/`_draw_pick_menu`（条目可滚动），同样不要各写一份。
 
 ## 运行时边界
 
@@ -157,12 +158,12 @@
 - **会话名前缀 `pickup-`，旧前缀 `sc-` 保留匹配**：项目改名 sessionContinue → pickup 之前创建的 `sc-*` 保活会话可能仍在用户机器上跑，`_list_tmux_sessions` 同时匹配两种前缀，annotate/回收对存量会话继续生效；新建会话一律用 `pickup-` 前缀。注入托管会话的环境变量同理：`PICKUP_RUNTIME`/`PICKUP_SESSION_ID` 为新名，`SC_RUNTIME`/`SC_SESSION_ID` 继续注入兜底。
 - **无前缀脱离键 `Ctrl-\`**：`keepalive.tmux.conf` 里 `bind-key -n C-\\ detach-client`（`-n` 表示不需要 prefix 就能触发）。选它是因为 tmux 接管终端后处于 raw 模式，`Ctrl-\` 不会像普通终端那样触发本地 `SIGQUIT`；标准 `Ctrl-b d` 始终保留作为备用。新增/改绑定前确认没有和目标运行时 CLI 自身的快捷键冲突。
 - **已知边缘案例**：`attach-session` 发起瞬间目标会话恰好自然退出（tmux 报错退出），`pickup` 不做特殊重试，用户重新打开一次 `pickup` 即可（这时该会话已经不再显示"后台运行中"，回车会走正常原生恢复路径）。
-- **`pickup claude`/`pickup codex` 直启子命令是保活的第三个调用点**：`pickup.py` 的 `_dispatch_direct_launch` 同样调 `keepalive.enabled()`/`keepalive.wrap_plan()`，和 TUI 的 `_launch()` 复用同一套开关语义（`--no-keepalive`、`PICKUP_KEEPALIVE=0`）。直启没有"已有保活会话"这个概念（每次都是全新会话，`ident` 用 `keepalive.new_session_ident()` 现生成），所以不需要像 `_launch()` 那样先尝试 `attach_plan`。
+- **直启子命令（`pickup claude` 等）默认不再直接 execvp，而是带着 `_DirectLaunch`（plan + runtime_id + ident）进 TUI**：真实终端且内嵌可用时，`_run` 在主循环前经 `embed.host_session` 把新会话托管进保活 socket 并聚焦右栏——保活包裹因此走 embed 路径（与界面内「新建会话」同一个调用点）。只有非真实终端、`--no-keepalive` 或内嵌不可用（无 tmux/被环境变量禁用）时才退回旧路径 `keepalive.enabled()`/`keepalive.wrap_plan()` + `execute_launch`（`wrap_plan` 的第三个调用点，与 TUI 的 `_launch()` 复用同一套开关语义）。直启没有"已有保活会话"这个概念（每次都是全新会话，`ident` 用 `keepalive.new_session_ident()` 现生成），所以不需要像 `_launch()` 那样先尝试 `attach_plan`。
 
 ## 内嵌面板（embed.py）
 
 - **定位**：与 `keepalive.py` 平级的运行时无关层。keepalive 管「把启动计划包进 tmux 保活」，embed 管「不 attach——用 `capture-pane` 拿画面、`send-keys` 送按键」，让 TUI 回车后退化成左侧会话列表（固定 ~44 列，复用现有窄终端降级逻辑，项目侧栏由 `_sidebar_width` 按压缩后宽度自动判定）+ 右侧会话现场。与保活共用 `tmux -L pickup-keepalive` socket 和 `pickup-*`/`sc-*` 命名空间：`e` 键全屏接管（execvp attach）、`keepalive.annotate()` 状态标注、`reap_idle()` 空闲回收、`x` 关闭后台，对内嵌会话全部照旧生效。适配器不感知本模块。
-- **窄栏是卡片式多行布局**：内嵌分栏时左侧列表每个会话占两行（`per_session_rows = 2`）——序号/目录/大小列全部让位，标题独占一行，状态（后台运行中/面板中/进行中/已结束）+ 相对时间放第二行。可见会话数在 `_draw` 与 `_sync_top` 两处都按行数折算，改每个会话占几行时两处必须同步。
+- **窄栏是卡片式多行布局**：内嵌分栏时左侧列表每个会话占 `SESSION_CARD_ROWS = 3` 行（标题、状态、卡片间空行）——序号/目录/大小列全部让位，标题独占一行，状态（运行中(托管)/运行中/已结束）+ 相对时间放第二行。顶部固定「＋ 新建会话」项占 `NEW_SESSION_ITEM_ROWS = 2` 行，钉在滚动区之上不参与滚动；可见会话数在 `_draw`、`_sync_top`、`_scroll_list_viewport` 三处都按行数折算，改每个会话占几行时三处必须同步。
 - **输入延迟的五道闸**：① **控制模式通道**（`embed.ControlChannel`）：聚焦 pane 时开常驻 `tmux -C attach` 子进程，send-keys/copy-mode/resize/refresh 经 stdin 写命令消灭每键一次 fork（写管道 <1ms vs fork ~15ms）；pane 有输出时服务端推 `%output` 事件，读线程转成 capture 线程的 poke，回显不再等轮询；`%pause`（3.2+ pause-after 流控）自动回 `refresh -A '%N:continue'`。**命令纪律**（tmuxy 项目对 3.3a/3.5a 的实测）：控制 client attach 期间外部并发执行修改类命令可能 crash 服务端，修改类命令在通道存活时必须全走通道（`_modify`/send 系列通道优先、死亡自动回退 fork）；capture-pane/display-message 只读查询与 send-keys -l 注入 SGR 鼠标序列走外部 fork 安全；paste 因多行文本无法进控制命令行协议，保留外部 set-buffer。控制 client attach **不会**把窗口缩成自身尺寸（next-3.7 实测 132x40 保持不变），keepalive 配置的 `window-size latest`+`aggressive-resize on` 无需为它调整。② 没事发生不画；③ 画面文本没变就不 `parse_screen`；④ 绘制段按 generation 缓存重放；⑤ pane 聚焦时 getch 超时 50ms。capture 线程在 `%output` 风暴下按 40ms 最小间隔限速，通道存活时兜底轮询 2s、否则 200ms。死亡判定要求连续 3 次 capture 失败且 `has-session` 确认，防 tmux 瞬时超时把焦点从 pane 偷走。**延迟测量口径**（端到端自测内置）：L1 = 注入按键 → 内层 pane 出现回显（转发链），L2 = 注入按键 → 外层 TUI 画面出现回显（含抓帧+渲染）；控制通道落地后本机实测 L1 20-190ms（随负载波动）、L2-L1 仅 17-70ms（旧架构固定 +100~300ms）。
 - **光标锚定（IME 预览位置修复）**：pane 聚焦时每帧把外层硬件光标 move 到 pane 内 agent 光标处（`pane_state` 随抓画面一并取 `cursor_x/y/flag`），可见性跟 agent 的 cursor_flag；还没抓到光标也锚到 pane 左上角——总之不能停在最后绘制的底部帮助行。原因：终端输入法的预编辑窗口跟随外层终端的光标位置寄存器（即使光标不可见，ncurses refresh 也会更新位置），不锚定时中文输入法的候选框出现在屏幕最底部而不是 agent 输入框处。
 - **托管状态双通道**：`keepalive.annotate()` 靠 pid 祖先链匹配（跨进程有效），`SessionStore.hosted` 记本进程内刚内嵌的会话（比 pid 注册快、对不注册 pid 的程序也有效）；`_merge_scanned` 先 annotate，没匹配上的用 hosted 兜底并校验存活。`x` 关闭时两处都要清。**已知残留风险（2026-07 真实实例）**：高负载/竞争下 `keepalive_name` 标注可能瞬时丢失（annotate 匹配失败 + hosted 的 `is_alive` 超时误报同时发生），此时回车会走 `_embed_open` 新建出第二个同会话进程——保活 socket 上出现过 `sc-kimi-session_`（旧命名）与 `pickup-kimi-session_`（新命名）并存、两个进程抢同一份会话文件的真实案例；同一竞争还会导致 `x` 的确认弹窗不出现（端到端自测偶发过一次，加状态抓取后未复现）。根治方向（未做）：回车新建前若同名/同会话已有存活托管，强制复用而不是新建。
@@ -189,7 +190,7 @@
 
 ## 直启子命令（`pickup claude` / `pickup codex` / `pickup opencode` / `pickup kimi`）
 
-- **定位**：`main()` 里在 agent_api 分发分支之后、TUI 的 argparse 之前再加一个前置分支——`sys.argv[1]`（跳过可选的前置 `--no-keepalive`）命中 `registry.ids` 就整体转发给 `_dispatch_direct_launch`，不进入下面的 TUI/`--json` 参数体系。这个顺序刻意和 agent_api 的分发方式对称：两者都是"整个命令行属于另一套子系统，不该被 TUI 的 argparse 解析"。
+- **定位**：`main()` 里在 agent_api 分发分支之后、TUI 的 argparse 之前再加一个前置分支——`sys.argv[1]`（跳过可选的前置 `--no-keepalive`）命中 `registry.ids` 就整体转发给 `_dispatch_direct_launch`，不进入下面的 TUI/`--json` 参数体系。这个顺序刻意和 agent_api 的分发方式对称：两者都是"整个命令行属于另一套子系统，不该被 TUI 的 argparse 解析"。分发后默认进 TUI 侧边栏模式托管新会话（见「会话保活」节对应条目），非真实终端 / `--no-keepalive` / 内嵌不可用时才 execvp 全屏接管。
 - **为什么是纯透传 + 只垫危险参数，不像 TUI 里的 `build_resume_plan` 之类还塞了 codex 的 `-c model_reasoning_effort="high"`**：直启的诉求是"我知道我要传什么参数给底层 CLI，只是不想每次手打一长串跳过审批的危险参数"，属于用户对透传语义有明确预期的场景；额外静默塞入其它默认配置（哪怕是好意）会让用户没法确定"这次命令实际执行了什么"，所以 `registry.build_passthrough_plan` 只处理 `auto_approve_args`，不碰运行时的其它默认参数。
 - **危险参数改成运行时类属性 `auto_approve_args`**（`runtime/base.py` 声明、`runtime/claude.py`/`runtime/codex.py` 各赋值一次），原本在每个适配器的 `build_resume_plan`/`build_continue_plan`/`build_new_plan`/`build_new_session_plan` 四处各写一遍字面量字符串，现在四处和直启共用同一份声明。新增运行时想接入直启子命令，只需要declare 这个类属性（不声明则默认空元组，直启不会额外加任何参数）。
 - **`OpenCodeRuntime` 是这个模式下的一个刻意例外**：它的危险参数（`--dangerously-skip-permissions`）只在 `opencode run` 子命令下真实生效，裸命令（`pickup opencode` 直启透传的默认形态）带上会直接报错退出（实测确认，非猜测）。这个 flag 因此没有放进 `auto_approve_args`（该属性对 OpenCode 显式设为空元组），而是只硬编码在 `build_continue_plan` 内部——`pickup opencode`（裸直启）不会被自动垫上这个参数，这是有意为之，不是遗漏。详见「OpenCode 扫描」节最后一条。新增运行时如果也存在"危险参数只在特定子命令下有效"的情况，应参照这个处理方式，不要为了凑统一模式硬塞进 `auto_approve_args` 导致裸命令被打坏。

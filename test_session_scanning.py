@@ -2057,6 +2057,102 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertFalse(pickup._is_scrollback_return_event(0, 0))
         self.assertFalse(pickup._is_scrollback_return_event(pickup.curses.BUTTON1_PRESSED, 3))
 
+    def test_all_sessions_keep_stable_order_and_prepend_new_on_refresh(self) -> None:
+        """列表展示出来后已有会话位置固定：内容更新（mtime 变新）不再跳到顶上；
+        后台重扫只把新出现的会话按 mtime 倒序插到最前。"""
+        def make_session(session_id: str, mtime: float) -> dict:
+            return {
+                "source": "claude",
+                "id": session_id,
+                "short_id": session_id,
+                "mtime": mtime,
+                "size_bytes": 1,
+                "size_kb": 1,
+                "native_title": None,
+                "fallback_title": f"会话{session_id}",
+            }
+
+        first = [make_session("a", 3), make_session("b", 2), make_session("c", 1)]
+        # 第二轮：b 有了新消息（mtime 顶到最新），d 是全新会话
+        second = [make_session("b", 100), make_session("d", 50), make_session("a", 3), make_session("c", 1)]
+        claude_runtime = mock.Mock()
+        claude_runtime.id = "claude"
+        claude_runtime.display_name = "Claude"
+        claude_runtime.scan_sessions.side_effect = [first, second]
+        registry = pickup.RuntimeRegistry((claude_runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+            self.assertEqual([s["id"] for s in store.all_sessions()], ["a", "b", "c"])
+
+            changed = store.refresh()
+
+        self.assertTrue(changed)  # 新会话 d 出现，集合确实变了
+        # d 插到最前；a/b/c 保持首次展示时的相对位置，b 内容更新但不移动
+        self.assertEqual([s["id"] for s in store.all_sessions()], ["d", "a", "b", "c"])
+        self.assertEqual(store.all_sessions()[2]["mtime"], 100)
+
+    def test_run_hosts_direct_launch_plan_and_focuses_pane(self) -> None:
+        """直启子命令带进 TUI 的启动计划：进主循环前托管进保活 socket 并聚焦右栏。"""
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 160)
+        store = mock.Mock()
+        store.registry.ids = ["claude"]
+        store.sessions = {"claude": []}
+        store.dirty = threading.Event()
+        store.snapshot.return_value = ({}, False)
+        direct = pickup._DirectLaunch(LaunchPlan(("claude", "--dangerously-skip-permissions"), None),
+                                      "claude", "xxxx")
+
+        screen.getch.side_effect = [27, -1, 28, 27, -1]
+        with (
+            mock.patch.object(pickup.curses, "curs_set"),
+            mock.patch.object(pickup.curses, "raw"),
+            mock.patch.object(pickup, "_init_colors"),
+            mock.patch.object(pickup, "_apply_mousemask"),
+            mock.patch.object(pickup.embed, "PairPool"),
+            mock.patch.object(pickup, "_draw"),
+            mock.patch.object(pickup, "_visible_sessions", return_value=[]),
+            mock.patch.object(pickup.embed, "host_session", return_value="pickup-claude-xxxx") as host,
+            mock.patch.object(pickup.embed, "open_channel", return_value=None),
+            mock.patch.object(pickup.embed, "resize"),
+            mock.patch.object(pickup.embed, "send_key"),
+            mock.patch.object(pickup.threading, "Thread"),
+        ):
+            self.assertIsNone(pickup._run(screen, store, True, direct))
+
+        host.assert_called_once_with(direct.plan, "claude", "xxxx", 114, 22)
+
+    def test_run_direct_launch_host_failure_beeps_and_stays_in_list(self) -> None:
+        """直启托管失败不退出 TUI：响铃记日志，用户留在列表可换会话重试。"""
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 160)
+        store = mock.Mock()
+        store.registry.ids = ["claude"]
+        store.sessions = {"claude": []}
+        store.dirty = threading.Event()
+        store.snapshot.return_value = ({}, False)
+        direct = pickup._DirectLaunch(LaunchPlan(("claude",), None), "claude", "xxxx")
+
+        screen.getch.side_effect = [27, -1]
+        with (
+            mock.patch.object(pickup.curses, "curs_set"),
+            mock.patch.object(pickup.curses, "raw"),
+            mock.patch.object(pickup.curses, "beep") as beep,
+            mock.patch.object(pickup, "_init_colors"),
+            mock.patch.object(pickup, "_apply_mousemask"),
+            mock.patch.object(pickup.embed, "PairPool"),
+            mock.patch.object(pickup, "_draw"),
+            mock.patch.object(pickup, "_visible_sessions", return_value=[]),
+            mock.patch.object(pickup.embed, "host_session",
+                              side_effect=pickup.embed.EmbedError("tmux 异常")),
+            mock.patch.object(pickup, "_log_embed_error"),
+            mock.patch.object(pickup.threading, "Thread"),
+        ):
+            self.assertIsNone(pickup._run(screen, store, True, direct))
+
+        beep.assert_called_once()
+
     def test_main_routes_wheel_from_list_focus_to_left_list_scroll(self) -> None:
         """左侧滚轮滚列表视口，不能暗中切换当前选中的会话。"""
         screen = mock.Mock()
@@ -2091,7 +2187,8 @@ class TuiLayoutTests(unittest.TestCase):
             self.assertIsNone(pickup._run(screen, store, False))
 
         getmouse.assert_called_once_with()
-        self.assertIn((0, 3), drawn_states)
+        # 虚拟索引 0 是顶部固定「新建会话」项：选中最近的会话（idx 1）不动，只有视口滚到 3
+        self.assertIn((1, 3), drawn_states)
 
     def test_main_routes_raw_sgr_wheel_to_left_list_scroll(self) -> None:
         """ncurses 未转成 KEY_MOUSE 的 SGR 滚轮也必须滚动左侧列表。"""
@@ -2125,24 +2222,57 @@ class TuiLayoutTests(unittest.TestCase):
         ):
             self.assertIsNone(pickup._run(screen, store, False))
 
-        self.assertIn((0, 3), drawn_states)
+        # 同上：idx 1 是最近的会话（0 是固定新建项），滚轮只动视口
+        self.assertIn((1, 3), drawn_states)
 
-    def test_mousemask_forces_sgr_wheel_encoding_for_macos_compatibility(self) -> None:
-        """不依赖旧 ncurses 缺失的 Button5，主动请求 SGR 1006。"""
+    def test_mousemask_requests_sgr_1006_only_on_legacy_platforms(self) -> None:
+        """SGR 1006 只在 BUTTON5 不可用的旧平台手动请求。
+
+        新版 ncurses 自己协商并解码 KEY_MOUSE；全平台强开 1006 会把终端上报
+        格式切成 ncurses 不认的编码，点击/滚轮全部失灵（2026-07-19 双机实报
+        回归）。这条断言两个方向都锁死。
+        """
+        # 旧平台（BUTTON5 存在但为 0x0）：手动请求 + 对称撤销
         stdout = mock.Mock()
         with (
+            mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 0, create=True),
             mock.patch.object(pickup.curses, "mousemask"),
             mock.patch.object(pickup.curses, "mouseinterval"),
             mock.patch.object(pickup.sys, "stdout", stdout),
         ):
             pickup._apply_mousemask(True)
             pickup._apply_mousemask(False)
-
         self.assertEqual(
             [call.args[0] for call in stdout.write.call_args_list],
             ["\x1b[?1000h\x1b[?1006h", "\x1b[?1006l\x1b[?1000l"],
         )
         self.assertEqual(stdout.flush.call_count, 2)
+
+        # 新平台（BUTTON5 可用）：绝不碰终端的鼠标编码模式
+        stdout = mock.Mock()
+        with (
+            mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True),
+            mock.patch.object(pickup.curses, "mousemask"),
+            mock.patch.object(pickup.curses, "mouseinterval"),
+            mock.patch.object(pickup.sys, "stdout", stdout),
+        ):
+            pickup._apply_mousemask(True)
+            pickup._apply_mousemask(False)
+        stdout.write.assert_not_called()
+
+    def test_sgr_synth_bstate_maps_raw_buttons_to_key_mouse_equivalents(self) -> None:
+        """原始 SGR 路径必须与 KEY_MOUSE 路由等价：各按钮号的合成映射锁死。"""
+        self.assertEqual(pickup._sgr_synth_bstate(64, True), pickup.curses.BUTTON4_PRESSED)
+        self.assertIsNone(pickup._sgr_synth_bstate(64, False))
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 0, create=True):
+            self.assertEqual(pickup._sgr_synth_bstate(65, True), pickup.curses.BUTTON2_PRESSED)
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True):
+            self.assertEqual(pickup._sgr_synth_bstate(65, True), 1 << 20)
+        self.assertEqual(pickup._sgr_synth_bstate(0, True), pickup.curses.BUTTON1_PRESSED)
+        self.assertEqual(pickup._sgr_synth_bstate(0, False), pickup.curses.BUTTON1_RELEASED)
+        self.assertEqual(pickup._sgr_synth_bstate(32, True),
+                         pickup.curses.REPORT_MOUSE_POSITION)
+        self.assertIsNone(pickup._sgr_synth_bstate(2, True))  # 右键之类直接丢弃
 
     def test_runtime_picker_esc_cancels(self) -> None:
         """所有选择弹窗也必须统一用 Esc 返回。"""
@@ -2164,7 +2294,8 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
 
-        screen.getch.side_effect = [curses.KEY_MOUSE, 27]
+        # 结尾的 -1 模拟裸 Esc 后没有后续字节（Esc 分流会多读一次以识别 SGR 滚轮）
+        screen.getch.side_effect = [curses.KEY_MOUSE, 27, -1]
         with (
             mock.patch.object(pickup, "_draw_preview", return_value=(5, 10)) as draw,
             mock.patch.object(pickup.curses, "mousemask") as mousemask,
@@ -2197,7 +2328,8 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
 
-        screen.getch.side_effect = [ord("m"), ord("m"), 27]
+        # 结尾的 -1 模拟裸 Esc 后没有后续字节（Esc 分流会多读一次以识别 SGR 滚轮）
+        screen.getch.side_effect = [ord("m"), ord("m"), 27, -1]
         with (
             mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)) as draw,
             mock.patch.object(pickup.curses, "mousemask") as mousemask,
@@ -2430,6 +2562,67 @@ class SessionActionTests(unittest.TestCase):
         self.assertEqual(result, pickup.NewSessionRequest("codex", "/proj/a"))
 
 
+class NewSessionFlowTests(unittest.TestCase):
+    """顶部固定「新建会话」项的选择流程：先选项目目录，再选运行时。"""
+
+    def test_pick_menu_esc_cancels(self) -> None:
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        screen.getch.return_value = 27
+        with mock.patch.object(pickup, "_draw_pick_menu"):
+            self.assertIsNone(pickup._pick_menu(screen, "标题", [("甲", ""), ("乙", "")]))
+
+    def test_pick_project_lists_known_projects_and_current_dir(self) -> None:
+        store = mock.Mock()
+        store.projects.return_value = [
+            {"cwd_key": "/work/alpha", "label": "alpha", "count": 3},
+            {"cwd_key": "/work/beta", "label": "beta", "count": 1},
+            {"cwd_key": "", "label": "未知项目", "count": 2},  # 未知目录不能作新会话 cwd，必须过滤
+        ]
+        ui = pickup.UIState(source="claude")
+        with (
+            mock.patch.object(pickup.os, "getcwd", return_value="/work/here"),
+            mock.patch.object(pickup, "_pick_menu", return_value=0) as pick,
+            mock.patch.object(pickup, "usable_cwd", side_effect=lambda cwd: cwd),
+        ):
+            result = pickup._pick_project(mock.Mock(), store, ui, None)
+        self.assertEqual(result, "/work/here")
+        entries = pick.call_args.args[2]
+        self.assertEqual([label for label, _ in entries], ["当前目录", "alpha", "beta"])
+
+    def test_pick_project_defaults_to_filtered_project(self) -> None:
+        store = mock.Mock()
+        store.projects.return_value = [{"cwd_key": "/work/alpha", "label": "alpha", "count": 1}]
+        ui = pickup.UIState(source="claude", project_key="/work/alpha")
+        with (
+            mock.patch.object(pickup.os, "getcwd", return_value="/work/here"),
+            mock.patch.object(pickup, "_pick_menu", return_value=None) as pick,
+        ):
+            self.assertIsNone(pickup._pick_project(mock.Mock(), store, ui, None))
+        # 默认高亮当前筛选的项目（排在注入的「当前目录」之后）
+        self.assertEqual(pick.call_args.args[3], 1)
+
+    def test_new_session_flow_picks_project_then_runtime(self) -> None:
+        ui = pickup.UIState(source="claude")
+        with (
+            mock.patch.object(pickup, "_pick_project", return_value="/work/alpha"),
+            mock.patch.object(pickup, "_pick_runtime_for_new_session", return_value="codex") as pick_runtime,
+        ):
+            result = pickup._new_session_flow(mock.Mock(), mock.Mock(), ui, None)
+        self.assertEqual(result, pickup.NewSessionRequest("codex", "/work/alpha"))
+        pick_runtime.assert_called_once()
+
+    def test_new_session_flow_cancelled_at_either_step(self) -> None:
+        ui = pickup.UIState(source="claude")
+        with mock.patch.object(pickup, "_pick_project", return_value=None):
+            self.assertIsNone(pickup._new_session_flow(mock.Mock(), mock.Mock(), ui, None))
+        with (
+            mock.patch.object(pickup, "_pick_project", return_value="/work/alpha"),
+            mock.patch.object(pickup, "_pick_runtime_for_new_session", return_value=None),
+        ):
+            self.assertIsNone(pickup._new_session_flow(mock.Mock(), mock.Mock(), ui, None))
+
+
 class DirectLaunchTests(unittest.TestCase):
     """`pickup claude [参数…]` / `pickup codex [参数…]` 直启透传子命令的分发逻辑。"""
 
@@ -2489,6 +2682,38 @@ class DirectLaunchTests(unittest.TestCase):
                 pickup._dispatch_direct_launch(["claude"], registry)
 
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_tty_with_embed_enters_tui_with_direct_launch_plan(self) -> None:
+        """真实终端 + 内嵌可用：直启进入 TUI 侧边栏模式，启动计划交给主循环托管，
+        不再走 execvp 全屏接管。"""
+        plan = LaunchPlan(("claude", "--dangerously-skip-permissions"), None)
+        registry = self._registry_returning(plan)
+
+        with (
+            mock.patch.object(pickup.sys, "stdin") as stdin_mock,
+            mock.patch.object(pickup.sys, "stdout") as stdout_mock,
+            mock.patch.object(pickup, "keepalive") as keepalive_mock,
+            mock.patch.object(pickup.embed, "available", return_value=True),
+            mock.patch.object(pickup, "SessionStore") as store_cls,
+            mock.patch.object(pickup, "_spawn_title_daemon"),
+            mock.patch.object(pickup, "_probe_osc_colours", return_value=None),
+            mock.patch.object(pickup.curses, "wrapper", return_value=None) as wrapper,
+            mock.patch.object(pickup.embed, "close_channel"),
+            mock.patch.object(pickup, "execute_launch") as execute_launch,
+        ):
+            stdin_mock.isatty.return_value = True
+            stdout_mock.isatty.return_value = True
+            keepalive_mock.new_session_ident.return_value = "xxxx"
+
+            pickup._dispatch_direct_launch(["claude"], registry)
+
+        store_cls.return_value.load.assert_called_once_with()
+        wrapper.assert_called_once()
+        args = wrapper.call_args.args
+        self.assertIs(args[0], pickup._run)
+        self.assertEqual(args[3], pickup._DirectLaunch(plan, "claude", "xxxx"))
+        execute_launch.assert_not_called()
+        keepalive_mock.wrap_plan.assert_not_called()
 
 
 class HandoffDigestTests(unittest.TestCase):
