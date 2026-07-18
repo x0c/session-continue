@@ -57,6 +57,8 @@ python3 -m unittest -v
 
 **涉及会话扫描、标题或会话预览（`load_conversation`）时，改完必须至少随机抽查 5 条真实会话验证，不能只靠手写的单测小样例过关。** 优先用真实终端打开预览页肉眼检查内容，或写一次性脚本批量跑 `load_conversation`/`scan_sessions` 扫描本机全部真实会话文件、断言没有异常（如空文本、字面量 `"None"`、角色标错、时间戳缺失或非单调）。本机 Claude/Codex 历史里曾各自藏着单测样例覆盖不到的真实格式坑（`stop_reason` 与文本内容无关、`origin.kind` 区分真人和系统事件、`payload` 字段值可能是 JSON `null` 而不是缺失），这类坑只有跑真实数据才会暴露，见「Claude 扫描」节的具体记录。
 
+**标题生成改动的自测硬要求：完成安装后必须直接运行真实 `pickup --generate-titles`，同时记录缓存条目数和待补会话数。** 若命令因已有后台补全进程持锁而立即返回，必须检查该进程及其 5 路生成子进程、持续观察缓存增长，不能把立即返回误判为未执行或完成；补全结束后再扫描确认只剩没有可提炼任务信息的会话，且这类会话不会继续排队。不得只验证 `pickup list`、源码函数或单测。
+
 ## 本机入口
 
 源码主模块已改名 `sc.py` → `pickup.py`（sessionContinue 时代残留清理）；`pickup` 命令可能是 pip 安装到 site-packages 的独立副本（`pip show pickup` 可见版本），不随源码目录更新。验证界面/行为改动时要确认跑的是当前源码：`cd cli && python3 pickup.py`，或先 `python3 -m pip install --user .` 重装；仍不生效时核对 `command -v pickup`、`pip show pickup` 和源码哈希，确认没有运行另一台机器或旧目录中的副本。

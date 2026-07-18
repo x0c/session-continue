@@ -550,6 +550,21 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         self.assertEqual(title, "真实问题标题")
         self.assertTrue(needs_gen)
 
+    def test_low_value_only_session_does_not_trigger_generation(self) -> None:
+        session = {
+            "source": "opencode",
+            "id": "only-greeting",
+            "mtime": 1,
+            "size_kb": 1,
+            "native_title": None,
+            "fallback_title": "在吗",
+        }
+
+        title, needs_gen = titles.resolve_initial_title(session, {})
+
+        self.assertEqual(title, "在吗")
+        self.assertFalse(needs_gen)
+
     def test_cached_title_survives_file_mtime_change(self) -> None:
         old_session = {
             "source": "claude",

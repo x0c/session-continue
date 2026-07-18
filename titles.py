@@ -134,6 +134,15 @@ def _is_machine_slug(text: str | None) -> bool:
     return bool(re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+){2,}", line))
 
 
+def _is_terminal_small_talk(text: str | None) -> bool:
+    """只有寒暄、没有任务信息的会话不值得反复请求模型生成标题。"""
+    line = _title_line(text)
+    if not line:
+        return False
+    compact = re.sub(r"[\s,，。.!！?？:：;；'\"`~～…\[\]()（）{}<>《》]+", "", line).lower()
+    return compact in {"在吗", "在", "好", "好的", "ok", "yes", "no"}
+
+
 def _is_low_value_title(text: str | None) -> bool:
     line = _title_line(text)
     if not line:
@@ -200,6 +209,12 @@ def _compact_title(text: str | None) -> str | None:
 
 
 def _temporary_title(session: dict) -> str | None:
+    raw_user_candidates = [
+        _normalize_title(session.get("fallback_title")),
+        _normalize_title(session.get("first_user_msg")),
+        _normalize_title(session.get("last_user_msg")),
+        _normalize_title(session.get("native_title")),
+    ]
     user_candidates = [
         _compact_title(session.get("fallback_title")),
         _compact_title(session.get("first_user_msg")),
@@ -207,8 +222,17 @@ def _temporary_title(session: dict) -> str | None:
         _compact_title(session.get("native_title")),
     ]
     user_candidates = [candidate for candidate in user_candidates if candidate]
+    meaningful_candidates = [candidate for candidate in user_candidates if not _is_low_value_title(candidate)]
+    if meaningful_candidates:
+        return min(meaningful_candidates, key=len)
     if user_candidates:
         return min(user_candidates, key=len)
+    low_value_candidates = [
+        candidate for candidate in raw_user_candidates
+        if candidate and _is_terminal_small_talk(candidate) and not _is_machine_slug(candidate)
+    ]
+    if low_value_candidates:
+        return min(low_value_candidates, key=len)
     return _compact_title(session.get("last_agent_msg"))
 
 
@@ -218,6 +242,7 @@ def resolve_initial_title(session: dict, cache: dict) -> tuple[str, bool]:
     策略：
     - 缓存命中生成标题 → 直接用，后续会话内容增长也不重新生成。
     - 缓存缺失或标题无效 → 显示临时兜底，并提交后台生成。
+    - 会话没有可提炼的任务信息 → 保留本地标题，不提交无意义的生成请求。
     - 原生标题只在兜底标题不可用时作为临时占位，不作为最终展示来源。
     """
     cached = _cached_entry(session, cache)
@@ -228,7 +253,7 @@ def resolve_initial_title(session: dict, cache: dict) -> tuple[str, bool]:
 
     temporary = _temporary_title(session)
     if temporary:
-        return temporary, True
+        return temporary, not _is_low_value_title(temporary)
 
     return "(待生成标题)", True
 
