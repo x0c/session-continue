@@ -117,9 +117,13 @@ switch between them without losing any of them:
   (tmux copy-mode) and any keystroke drops you back to the live view. Wheel over the left
   sidebar scrolls the session list. Mouse events never trigger a full redraw, so
   drag storms can't freeze the UI.
-- `m` (in the list/sidebar) toggles mouse reporting off and on — turn it off to get your
-  terminal's native drag-to-select back for copying text out of the pane (the two are
-  mutually exclusive by protocol); turn it back on to resume wheel forwarding.
+- Drag to select anywhere — pickup implements its own selection: drag with the left button
+  and the highlighted text is copied straight to your clipboard (OSC 52, works over SSH),
+  no keys needed. This is the copy path while mouse reporting is on (native selection is
+  taken over by the program).
+- `m` (in the list/sidebar) toggles mouse reporting off and on — turn it off when you want
+  your terminal's native drag-to-select for a longer copying session; turn it back on to
+  resume wheel forwarding and built-in drag-to-copy.
 - The terminal cursor is parked at the agent's own cursor position, so IME preedit popups
   (e.g. CJK input methods) appear right at the agent's input box, not at the bottom of the screen.
 - Dark/light theme detection inside panes is repaired on tmux ≥ 3.5a: `pickup` probes your real

@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import curses
 import fcntl
 import json
@@ -569,6 +570,11 @@ class EmbedUI:
     mouse_any: bool = False        # pane 内程序是否申请了鼠标上报（申请则滚轮直达程序）
     mouse_sgr: bool = False        # 鼠标上报是否为 SGR 1006 编码
     mouse_report: bool = True      # 全局鼠标上报开关（m 键切换；关闭后恢复终端原生框选）
+    sel_anchor: tuple[int, int] | None = None  # 拖拽进行中的起点（屏幕 0-based）
+    sel_start: tuple[int, int] | None = None   # 已完成选择的起点（高亮保留到下次操作）
+    sel_end: tuple[int, int] | None = None     # 已完成选择的终点
+    sel_zone: str | None = None    # 拖拽起点所在区域（"pane"/"list"）：选择范围钳制在
+    # 起点区域内，防止从 pane 拖过中线时把左侧列表的文字一起选进来（用户实报）
     lock: threading.Lock = field(default_factory=threading.Lock)
     poke: threading.Event = field(default_factory=threading.Event)  # 输入/输出事件后立即补抓一帧
 
@@ -984,6 +990,21 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0,
     if pane_visible:
         _draw_embed_pane(stdscr, emb, pool, ui, width, full_width, height)
 
+    # 拖拽选词高亮：流式区域（首行起点→行尾、中间整行、末行→终点）反显；
+    # chgat 只改属性不动文本，每帧随选择状态重画
+    if emb is not None and emb.sel_start is not None and emb.sel_end is not None:
+        (sx, sy), (ex, ey) = emb.sel_start, emb.sel_end
+        if (sy, sx) > (ey, ex):
+            sx, sy, ex, ey = ex, ey, sx, sy
+        for y in range(max(0, sy), min(ey, height - 1) + 1):
+            x0 = sx if y == sy else 0
+            x1 = ex if y == ey else full_width - 1
+            try:
+                stdscr.chgat(y, max(0, x0), max(1, min(x1, full_width - 1) - max(0, x0) + 1),
+                             curses.A_REVERSE)
+            except curses.error:
+                pass
+
     # 面板聚焦时把硬件光标锚定到面板内：有 agent 光标就精确跟随（输入法预览框
     # 会浮在 agent 输入框处），还没抓到光标也锚到面板左上角——总之不能停在最后
     # 绘制的底部帮助行，否则终端输入法的预编辑窗口会出现在屏幕最下面。
@@ -1196,14 +1217,16 @@ def _apply_mousemask(enabled: bool) -> None:
     """开关鼠标上报；关闭后终端恢复原生框选/复制。
 
     订阅集包含滚轮与左键按下/抬起/拖动：这些事件必须先订阅到，`_pane_mouse`
-    才能拿到并按区域路由（转发滚轮 / 丢弃其余）；未订阅的鼠标序列会被 ncurses
-    整个吞掉（实测确认不会漏进键盘通道变成垃圾按键），那拖拽/点击事件就连
-    「快速丢弃」的机会都没有，全卡在队列里。
+    才能拿到并按区域路由（转发滚轮 / 拖拽选词 / 丢弃其余）；未订阅的鼠标序列
+    会被 ncurses 整个吞掉（实测确认不会漏进键盘通道变成垃圾按键），那拖拽/点击
+    事件就连「快速丢弃」的机会都没有，全卡在队列里。REPORT_MOUSE_POSITION 让
+    拖拽过程（motion）也可达，选词高亮得以实时跟随。
     """
     mask = 0
     if enabled:
         mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
                 | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
+                | getattr(curses, "REPORT_MOUSE_POSITION", 0)
                 | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
     try:
         curses.mousemask(mask)
@@ -1423,11 +1446,16 @@ def _confirm_kill_keepalive(stdscr, label: str) -> bool:
     stdscr.addnstr(top + 3, left, "└" + "─" * (box_width - 2) + "┘", box_width, normal)
     stdscr.refresh()
 
-    try:
-        ch = stdscr.getch()
-    except curses.error:
-        ch = -1
-    return ch in (ord("y"), ord("Y"))
+    # stdscr 处于 200ms 非阻塞超时模式（_run 里 stdscr.timeout(200)）；getch() 超时
+    # 返回 -1 必须继续等待用户真正按键，不能当成"其他键取消"——否则确认框会在
+    # 200ms 后自动消失，用户实际上没有机会按 y 确认（真实故障，已复现）。
+    while True:
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            continue
+        if ch != -1:
+            return ch in (ord("y"), ord("Y"))
 
 
 def _session_action(
@@ -1777,17 +1805,63 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         finally:
             stdscr.timeout(200)
 
-    def _pane_mouse() -> bool:
-        """pane 聚焦时的鼠标事件总入口；返回 True 表示改了 UI 状态（左栏滚动）需要重绘。
+    def _copy_selection(start: tuple[int, int], end: tuple[int, int]) -> None:
+        """把流式选择区（start→end 跨行连续）的屏幕文本经 OSC 52 写入剪贴板。
 
-        区域隔离路由：
-        - pane 内 + agent 申请了鼠标（mouse_any+sgr）：滚轮/按下/拖拽/抬起全事件
-          编码 SGR 1006 直达 agent（它自己处理选词/滚动）；
-        - pane 内 + agent 未申请鼠标：滚轮 copy-mode 翻历史，按下/拖拽/抬起快速丢弃
-          （原生选择与鼠标上报协议互斥，选词用 m 键关上报或 e 全屏）；
-        - pane 外（左栏）：滚轮滚会话列表；其余忽略。
-        事件流只转发或丢弃、绝不触发整帧重绘——这是拖拽不卡死的关键：画面更新
-        一律由 capture/poke 驱动。
+        文本直接读 stdscr 当前内容（`inchnstr`），列表/pane/侧栏任何可见区域通吃；
+        OSC 52 经 SSH 透传到用户本地终端剪贴板（iTerm2/kitty/alacritty 均支持），
+        是鼠标上报开启期间（终端原生框选失效）的选词通道。
+        """
+        (sx, sy), (ex, ey) = start, end
+        if (sy, sx) > (ey, ex):
+            sx, sy, ex, ey = ex, ey, sx, sy
+        width = stdscr.getmaxyx()[1]
+        lines: list[str] = []
+        for y in range(sy, ey + 1):
+            x0 = sx if y == sy else 0
+            x1 = ex if y == ey else width - 1
+            cells = max(1, x1 - x0 + 1)
+            try:
+                # instr 的 n 按**字节**截断（实测：n=8 读到「↓ 选」就停，「择」
+                # 的 3 字节放不下）——按格数 ×4 过读保证宽字符完整，再按格宽截回
+                chunk = stdscr.instr(y, x0, cells * 4)
+            except curses.error:
+                continue
+            lines.append(_fit_cell(chunk.decode("utf-8", errors="replace"), cells).rstrip())
+        text = "\n".join(lines).strip("\n")
+        if text:
+            payload = base64.b64encode(text.encode()).decode()
+            sys.stdout.write(f"\x1b]52;c;{payload}\a")
+            sys.stdout.flush()
+
+    def _clamp_to_zone(mx: int, my: int) -> tuple[int, int]:
+        """把拖拽终点钳制在起点所在区域内（emb.sel_zone 在 press 时锁定）：
+        pane 区选词不越过分栏线进左栏，左栏选词不越进 pane；pane 不可见时不钳。"""
+        if emb.sel_zone is None:
+            return mx, my
+        height_now, full_width = stdscr.getmaxyx()
+        pane_x0 = EMBED_LEFT_BAND + 1
+        pane_h = max(1, height_now - 2)
+        pane_visible = _embed_list_width(full_width, height_now, emb) != full_width
+        if not pane_visible:
+            return mx, my
+        if emb.sel_zone == "pane":
+            return max(mx, pane_x0), min(my, pane_h - 1)
+        return min(mx, pane_x0 - 1), my
+
+    def _pane_mouse() -> bool:
+        """鼠标事件总入口；返回 True 表示改了 UI 状态需要重绘。
+
+        分发顺序：
+        1. 左键按下/拖动/抬起 → **拖拽选词**（全屏任意区域，pickup 内置）：
+           按下记起点、拖动实时更新高亮、抬起按流式区域复制到剪贴板（OSC 52）。
+           这是鼠标上报开启期间（终端原生框选被程序独占）的选词通道；
+           m 键关闭上报后事件不上报，原生框选自动接管，两者不冲突。
+        2. 滚轮 → 区域隔离路由：pane 内且 agent 申请了鼠标 → SGR 序列直达 agent；
+           否则 copy-mode 翻回滚历史；pane 外（左栏）滚会话列表。
+        3. 其余（悬停、点击）快速丢弃。
+        事件流只转发或丢弃、绝不触发整帧重绘（选词高亮除外）——这是拖拽
+        不卡死的关键：画面更新一律由 capture/poke 驱动。
         """
         try:
             _, mx, my, _, bstate = curses.getmouse()
@@ -1795,15 +1869,47 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
             return False
         wheel_up = bool(bstate & curses.BUTTON4_PRESSED)
         wheel_down = bool(bstate & getattr(curses, "BUTTON5_PRESSED", 0))
+
+        if bstate & curses.BUTTON1_PRESSED:
+            emb.sel_anchor = (mx, my)
+            emb.sel_start = None
+            emb.sel_end = None
+            # 起点锁定选区所在区域：pane 内起的拖不越进左栏，左栏起的拖不越进 pane
+            _h, _w = stdscr.getmaxyx()
+            _px0 = EMBED_LEFT_BAND + 1
+            _pv = _embed_list_width(_w, _h, emb) != _w
+            emb.sel_zone = "pane" if (_pv and mx >= _px0 and my < _h - 2) else "list"
+            return True  # 记起点并清旧高亮
+        if (bstate & getattr(curses, "REPORT_MOUSE_POSITION", 0)) and emb.sel_anchor is not None:
+            emb.sel_start = emb.sel_anchor
+            emb.sel_end = _clamp_to_zone(mx, my)
+            return True  # 高亮实时跟随
+        if bstate & curses.BUTTON1_RELEASED and emb.sel_anchor is not None:
+            start = emb.sel_anchor
+            emb.sel_anchor = None
+            end = _clamp_to_zone(mx, my)
+            if abs(end[0] - start[0]) + abs(end[1] - start[1]) >= 2:
+                emb.sel_start = start
+                emb.sel_end = end
+                _copy_selection(start, end)
+            else:
+                emb.sel_start = None  # 位移过小视为点击，不产生选区
+                emb.sel_end = None
+            return True
+
         height_now, full_width = stdscr.getmaxyx()
         pane_x0 = EMBED_LEFT_BAND + 1
         pane_h = max(1, height_now - 2)
         pane_visible = _embed_list_width(full_width, height_now, emb) != full_width
         if not pane_visible or mx < pane_x0 or my >= pane_h:
             if wheel_up or wheel_down:
+                # 滚轮跟焦点走：侧栏焦点滚项目、其余焦点滚会话列表
+                delta = -PREVIEW_MOUSE_SCROLL_LINES if wheel_up else PREVIEW_MOUSE_SCROLL_LINES
+                if ui.focus == "sidebar":
+                    ui.proj_idx = max(0, min(ui.proj_idx + delta, len(store.projects())))
+                    return True
                 sessions_now = _visible_sessions(store, ui, _sidebar_width(store.projects(), EMBED_LEFT_BAND) > 0)
                 if sessions_now:
-                    delta = -PREVIEW_MOUSE_SCROLL_LINES if wheel_up else PREVIEW_MOUSE_SCROLL_LINES
                     ui.idx = max(0, min(ui.idx + delta, len(sessions_now) - 1))
                     return True
             return False
@@ -1814,7 +1920,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                 # 只转发滚轮：单事件无配对，协议行为稳定。点击/拖拽不转发——
                 # ncurses 会把快速连续的 press+release 合并成 CLICK（未订阅即整个
                 # 丢弃）、press+drag 合并成 motion，行为碎片化到无法承诺语义；
-                # 点击交互与框选复制用 m 关上报或 e 全屏
+                # 点击交互用内置拖拽选词（pickup 层），agent 内鼠标交互用 e 全屏
                 button = 64 if wheel_up else 65
                 embed.send_literal(
                     emb.name,
@@ -1898,6 +2004,11 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
             ui.focus = "list"
         if emb.dead and ui.focus == "pane":
             ui.focus = "list"  # 面板里的会话进程退出：焦点弹回列表，占位文案由绘制路径给出
+        elif width == full_width and ui.focus == "pane":
+            # 终端被拖窄导致面板本身不可见（不同于会话已死）：焦点也必须弹回列表，
+            # 否则按键（包括 q）会被静默转发进这个看不见的托管会话，表现像键盘
+            # 失灵，只能靠 C-\ 逃生（真实故障，已复现）。拉宽后用户可再次回车聚焦。
+            ui.focus = "list"
 
         dirty = store.dirty.is_set()
         if dirty:
@@ -1933,6 +2044,9 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         if ch == -1:
             continue  # timeout，有变化时下一帧自然会画
         had_key = True
+        if ch != curses.KEY_MOUSE:
+            emb.sel_anchor = emb.sel_start = emb.sel_end = None  # 任意键盘输入清除选词高亮
+            emb.sel_zone = None
 
         sessions = _visible_sessions(store, ui, sidebar_visible)
         ui.idx = max(0, min(ui.idx, len(sessions) - 1)) if sessions else 0
@@ -1989,10 +2103,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                     else:
                         return result
             elif ch == curses.KEY_MOUSE:
-                delta = _preview_mouse_scroll_delta()
-                if delta is not None:
-                    ui.proj_idx = max(0, min(ui.proj_idx + delta, len(store.projects())))
-                had_key = delta is not None
+                had_key = _pane_mouse()  # 选词/滚轮统一入口（拖拽选词在全屏任意焦点可用）
             elif ch == ord("m"):
                 # 切换全局鼠标上报：关闭后恢复终端原生框选/复制（开启期间原生
                 # 框选被程序吃掉是协议固有限制）；pane 聚焦时 m 原样发给会话
@@ -2056,12 +2167,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                 emb.session_key = None
                 embed.close_channel()
             elif ch == curses.KEY_MOUSE:
-                # 列表页滚轮：上下滚动会话选择（拖拽/点击等其余事件快速丢弃，
-                # 不触发重绘，避免事件流形成重绘风暴）
-                delta = _preview_mouse_scroll_delta()
-                if delta is not None and sessions:
-                    ui.idx = max(0, min(ui.idx + delta, len(sessions) - 1))
-                had_key = delta is not None
+                had_key = _pane_mouse()  # 选词/滚轮统一入口（拖拽选词在全屏任意焦点可用）
             elif ch == ord("m"):
                 emb.mouse_report = not emb.mouse_report
                 _apply_mousemask(emb.mouse_report)
