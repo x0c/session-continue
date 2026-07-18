@@ -578,6 +578,7 @@ class EmbedUI:
     cursor: tuple[int, int, bool] | None = None  # (x, y, 是否可见)
     scroll_offset: int = 0         # 应用层滚动：相对 live 窗口向上回滚的行数（0=直播画面）
     history_size: int = 0          # pane 回滚行数（scroll_offset 的上限，pane_state 每轮刷新）
+    state_at: float = 0.0          # pane_state 最近刷新时刻（滚轮按需刷新的节流基准）
     mouse_any: bool = False        # pane 内程序是否申请了鼠标上报（申请则滚轮直达程序）
     mouse_sgr: bool = False        # 鼠标上报是否为 SGR 1006 编码
     mouse_report: bool = True      # 全局鼠标上报开关（m 键切换；关闭后恢复终端原生框选）
@@ -1722,6 +1723,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                                     emb.cursor = state[:3]
                                     emb.mouse_any, emb.mouse_sgr = state[3], state[4]
                                     emb.history_size = state[5]
+                                    emb.state_at = time.monotonic()
                                 emb.generation += 1
                             store.dirty.set()
                         elif ui.focus == "pane":
@@ -1734,6 +1736,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                                         store.dirty.set()
                                     emb.mouse_any, emb.mouse_sgr = state[3], state[4]
                                     emb.history_size = state[5]
+                                    emb.state_at = time.monotonic()
                     interval = IDLE_FALLBACK if channel is not None else POLL_INTERVAL
             except Exception as exc:
                 # 抓帧线程绝不能死：任何未料异常记录后继续，线程一旦静默退出，
@@ -2173,6 +2176,18 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         if not emb.name or emb.dead:
             return False
         if wheel_up or wheel_down:
+            # 从直播画面开始滚动的一刻按需刷新 pane 状态：history_size / 鼠标标志
+            # 平时只在 pane 聚焦时随抓帧刷新，列表聚焦下直接对右栏滚轮拿到的是
+            # 陈旧值（多为 0 或初始快照），回滚上限被钉死在几行不动（2026-07-19
+            # 用户实报「Codex 最多只能回滚三行」的根因）。0.3s 节流防止在无历史
+            # 的 pane 上快速滚动时每个事件都 fork 一次 tmux 查询。
+            if emb.scroll_offset == 0 and time.monotonic() - emb.state_at > 0.3:
+                state = embed.pane_state(emb.name)
+                if state is not None:
+                    emb.cursor = state[:3]
+                    emb.mouse_any, emb.mouse_sgr = state[3], state[4]
+                    emb.history_size = state[5]
+                emb.state_at = time.monotonic()
             # 直播画面 + agent 申请了 SGR 鼠标上报 → 转 SGR 序列直达 agent，
             # 让 agent 自己的 TUI 处理滚动（如 Claude 的交互式 TUI）。
             # 已翻进回滚历史或 agent 未申请鼠标时，仍由 pickup 统一维护应用层回滚。
