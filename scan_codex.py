@@ -268,14 +268,72 @@ def _build_session_info(path: str, index: dict[str, str]) -> dict | None:
     }
 
 
+def _live_uuids_from_proc_fd(pid_str: str) -> list[str]:
+    """Linux：遍历 /proc/<pid>/fd 逐个 readlink，从打开的文件里抽 rollout UUID。
+
+    不判断 fd 是读还是写模式（与改动前 lsof 实现的实际行为一致——旧实现同样
+    没有过滤 "w" 模式，任何打开的 rollout 文件都算命中）；调用失败静默返回空。
+    """
+    try:
+        fd_dir = f"/proc/{pid_str}/fd"
+        fd_names = os.listdir(fd_dir)
+    except OSError:
+        return []
+    uuids: list[str] = []
+    for fd_name in fd_names:
+        try:
+            target = os.readlink(os.path.join(fd_dir, fd_name))
+        except OSError:
+            continue
+        if "rollout-" not in target:
+            continue
+        uuid = _extract_uuid_from_filename(target)
+        if uuid:
+            uuids.append(uuid)
+    return uuids
+
+
+def _live_uuids_from_lsof(pids: list[str]) -> dict[str, int]:
+    """macOS 等无 /proc 的平台：一次合并 lsof 调用取代逐 pid fork。
+
+    `-n -P` 跳过 DNS 反解和端口名解析——本机实测这是 `lsof -p <单个pid>`
+    单次耗时 ~500ms 的主因，多进程时线性叠加，是首屏卡顿的根因之一。
+    `-Fpn` 只输出 pid 行（`p<pid>`）和文件名行（`n<name>`），逐行解析即可
+    重建 pid -> 打开文件的对应关系，不需要解析完整的人类可读表格输出。
+    """
+    live_ids: dict[str, int] = {}
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-n", "-P", "-Fpn", "-p", ",".join(pids)],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return live_ids
+    current_pid: int | None = None
+    for line in out.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "p":
+            try:
+                current_pid = int(value)
+            except ValueError:
+                current_pid = None
+        elif tag == "n" and current_pid is not None and "rollout-" in value:
+            uuid = _extract_uuid_from_filename(value)
+            if uuid:
+                live_ids[uuid] = current_pid
+    return live_ids
+
+
 def _live_session_ids() -> dict[str, int]:
     """返回进程仍存活的 Codex 会话 UUID -> pid 映射。
 
-    Codex 没有类似 Claude 的 pid 注册表，但活着的 codex 进程会以写模式持有
-    自己的 rollout JSONL（实测 lsof 输出形如
-    `codex 47372 … 45w … rollout-2026-07-04T16-03-52-<uuid>.jsonl`）。
-    先用 pgrep 拿到所有 codex 进程 pid，再逐个 lsof 从其打开的文件里抽 UUID，
-    顺手记下 pid，供 Agent 接口把「哪个会话在跑」精确到进程号。
+    Codex 没有类似 Claude 的 pid 注册表，但活着的 codex 进程会持有自己的
+    rollout JSONL 文件描述符。先用 pgrep 拿到所有 codex 进程 pid，再按平台
+    选择最快的路径抽取 UUID：Linux 直接读 /proc/<pid>/fd（近乎零成本），
+    其余平台（如 macOS）退回合并调用的 lsof（实测单次 ~500ms，逐 pid 调用
+    曾是首屏卡顿的主因，改为一次调用覆盖全部候选 pid）。
     任一环节缺工具或调用失败都静默降级为空集（判活失败时全部按已结束显示）。
     """
     live_ids: dict[str, int] = {}
@@ -285,25 +343,20 @@ def _live_session_ids() -> dict[str, int]:
         ).decode().split()
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return live_ids
+    if not pids:
+        return live_ids
 
-    for pid_str in pids:
-        try:
-            out = subprocess.check_output(
-                ["lsof", "-p", pid_str], stderr=subprocess.DEVNULL
-            ).decode(errors="replace")
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            continue
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        for line in out.splitlines():
-            if "rollout-" not in line:
+    if sys.platform.startswith("linux"):
+        for pid_str in pids:
+            try:
+                pid = int(pid_str)
+            except ValueError:
                 continue
-            uuid = _extract_uuid_from_filename(line)
-            if uuid:
+            for uuid in _live_uuids_from_proc_fd(pid_str):
                 live_ids[uuid] = pid
-    return live_ids
+        return live_ids
+
+    return _live_uuids_from_lsof(pids)
 
 
 def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:

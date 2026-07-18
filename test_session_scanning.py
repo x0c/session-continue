@@ -894,13 +894,44 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             scan_codex.SESSIONS_DIR = old_sessions_dir
             scan_codex.SESSION_INDEX = old_session_index
 
-    def test_live_session_ids_parses_uuid_from_lsof_rollout_line(self) -> None:
-        # 状态列判活：codex 进程持有自己的 rollout jsonl（写模式），从 lsof
-        # 输出的文件名里抽出会话 UUID 即视为存活。
+    def test_live_session_ids_parses_uuid_from_proc_fd_on_linux(self) -> None:
+        # Linux 判活：codex 进程持有自己的 rollout jsonl 文件描述符，遍历
+        # /proc/<pid>/fd 逐个 readlink 抽出会话 UUID 即视为存活。
+        uuid = "019f2c27-c9b0-7dc3-a600-8678bf0e8dcc"
+        rollout_path = (
+            f"/home/user/.codex/sessions/2026/07/04/rollout-2026-07-04T16-03-52-{uuid}.jsonl"
+        )
+
+        def fake_check_output(cmd, **kwargs):
+            if cmd[0] == "pgrep":
+                return b"47372\n"
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_listdir(path):
+            if path == "/proc/47372/fd":
+                return ["0", "1", "2", "45"]
+            raise AssertionError(f"unexpected listdir: {path}")
+
+        def fake_readlink(path):
+            if path == "/proc/47372/fd/45":
+                return rollout_path
+            raise OSError("not a symlink we care about")
+
+        with mock.patch("scan_codex.subprocess.check_output", side_effect=fake_check_output), \
+             mock.patch("scan_codex.sys.platform", "linux"), \
+             mock.patch("scan_codex.os.listdir", side_effect=fake_listdir), \
+             mock.patch("scan_codex.os.readlink", side_effect=fake_readlink):
+            live_ids = scan_codex._live_session_ids()
+
+        self.assertEqual(live_ids, {uuid: 47372})  # 判活的同时要能精确回填 pid
+
+    def test_live_session_ids_parses_uuid_from_lsof_on_macos(self) -> None:
+        # macOS（无 /proc）判活：一次合并 lsof -Fpn 调用覆盖全部候选 pid，
+        # 按 p<pid>/n<name> 字段行重建 pid -> 文件名对应关系。
         uuid = "019f2c27-c9b0-7dc3-a600-8678bf0e8dcc"
         lsof_output = (
-            f"codex     47372 geraltgraham   45w      REG     1,17  468333  651218417 "
-            f"/Users/geraltgraham/.codex/sessions/2026/07/04/"
+            "p47372\n"
+            f"n/Users/geraltgraham/.codex/sessions/2026/07/04/"
             f"rollout-2026-07-04T16-03-52-{uuid}.jsonl\n"
         )
 
@@ -908,10 +939,12 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
             if cmd[0] == "pgrep":
                 return b"47372\n"
             if cmd[0] == "lsof":
+                self.assertEqual(cmd, ["lsof", "-n", "-P", "-Fpn", "-p", "47372"])
                 return lsof_output.encode()
             raise AssertionError(f"unexpected command: {cmd}")
 
-        with mock.patch("scan_codex.subprocess.check_output", side_effect=fake_check_output):
+        with mock.patch("scan_codex.subprocess.check_output", side_effect=fake_check_output), \
+             mock.patch("scan_codex.sys.platform", "darwin"):
             live_ids = scan_codex._live_session_ids()
 
         self.assertEqual(live_ids, {uuid: 47372})  # 判活的同时要能精确回填 pid
@@ -1848,6 +1881,7 @@ class TuiLayoutTests(unittest.TestCase):
         # 先订阅到事件，不订阅会被 ncurses 队列层直接滤掉）
         wheel_mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
                       | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
+                      | getattr(curses, "REPORT_MOUSE_POSITION", 0)
                       | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
         mousemask.assert_any_call(wheel_mask)
         mousemask.assert_called_with(wheel_mask)
@@ -1874,6 +1908,7 @@ class TuiLayoutTests(unittest.TestCase):
 
         default_mask = (curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
                         | getattr(curses, "BUTTON1_POSITION_CHANGED", 0)
+                        | getattr(curses, "REPORT_MOUSE_POSITION", 0)
                         | curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
         # 进入开、按 m 关、再按 m 开、退出恢复：退出时恢复主循环的滚轮上报（默认掩码）而非清零，
         # mousemask 调用序列必须完整反映这四步。
