@@ -10,6 +10,7 @@
 - 标题生成只做批量调用。批量失败时保留临时标题，不逐条慢重试。
 - 标题生成后端已抽象为 `titlegen.py` 的 `TitleGenerator`（当前有 claude、codex 两个实现）。`titles.py` 只负责批量 prompt、JSON 解析和缓存，不感知具体 CLI；新增生成器只在 `titlegen.py` 加实现并注册进 `_GENERATORS`，禁止在 `titles.py` 里写 `subprocess` 调用。选择顺序：`PICKUP_TITLE_GENERATOR` 环境变量（旧名 `SC_TITLE_GENERATOR` 仍生效）→ 按注册顺序取第一个已安装的；`PICKUP_TITLE_MODEL`（旧名 `SC_TITLE_MODEL`）覆盖模型。缓存与生成器无关，换生成器不重算已有标题。
 - 自产噪音会话的过滤，每个可能被生成器落盘的运行时扫描器都要有：Claude 侧靠 `PROMPT_MARKER` 预探过滤（见「扫描性能」）；Codex 侧生成用 `codex exec --ephemeral` 不落盘，扫描过滤仅是兜底。接入没有 ephemeral 类开关的 CLI 后端（如 opencode run，每次调用必然真实落一条会话）时，对应扫描器的 `PROMPT_MARKER` 过滤是必需项，漏掉会让标题生成会话刷屏列表。
+- **`titles.save_cache` 是原子写（临时文件 + `os.replace`），不是直接覆写**：后台标题生成进程逐批写、TUI 每约 1 秒轮询读同一份 `titles.json`；直接 `open(..., "w")` 覆写会被并发读到半截 JSON（`load_cache` 解析失败静默退回 `{}`，界面标题短暂回退临时兜底、转圈圈重置）。改这个函数前确认没有退回裸覆写。
 
 ## 标题生成进程
 
@@ -17,6 +18,17 @@
 - `execute_launch` 会用 `os.execvp` 替换当前进程；按 `q` 退出也会结束 TUI 进程。TUI 内线程会在这些路径上丢失未完成标题。
 - 当前模型是：`_spawn_title_daemon` 拉起 `pickup --generate-titles` 后台进程，后台进程用缓存目录下的文件锁保证全机单实例；TUI 侧只读缓存并轮询缓存文件变化。
 - 后台进程内的生成器选择发生在 `refresh_titles`（`titlegen.resolve_generator`），本机一个 agent CLI 都没有时静默跳过，列表保持临时兜底标题；不要在 TUI 首屏路径做可用性探测。
+
+## 跨扫描器共享 helper（scan_common.py）
+
+四个扫描器（scan_claude.py/scan_codex.py/scan_opencode.py/scan_kimi.py）互不
+依赖运行时私有格式，但都需要几个完全相同的小工具：`shorten_cwd`（路径展示时
+把用户主目录替换成 `~`）、`parse_timestamp`（ISO8601 字符串转 epoch 秒）、
+`live_pids_by_process_name(process_name)`（OpenCode/Kimi 共用的"找同名存活进程
+→ 读其 cwd → 与会话工作目录匹配"判活兜底）。这些集中在 `scan_common.py`，
+避免四份重复实现各自演进出细微差异；新增第五个运行时扫描器时优先检查这里有
+没有能复用的 helper，不要先照抄再改。这个模块只放无状态纯函数，运行时私有的
+解析格式（JSONL 字段、SQLite 表结构等）仍留在各自的 scan_*.py 里。
 
 ## Claude 扫描
 
@@ -27,11 +39,13 @@
 - `titles.py` 的 `_compact_title` 里正则使用原始字符串。写 `\s`、`\S`、`\w`、`\d`、`\n` 时不要多打一层反斜杠；改这个函数前先用真实会话文本验证输出是完整可读片段。
 - **`load_conversation`（会话预览的正文来源）不能按 `stop_reason` 过滤要不要展示某条 assistant 文本。** 真实 JSONL 里一次 assistant 轮次的 `thinking`/`text`/`tool_use` 各是独立的顶层行，且共享同一个 `stop_reason`——哪怕这一行本身就是纯文本、只是后面紧跟着一次工具调用，它的 `stop_reason` 也是 `tool_use` 而不是 `end_turn`。之前的实现按 `stop_reason in (None, "end_turn")` 过滤 assistant 行，实测在一个 97 条真实消息的会话里把 88 条有真实文本内容的 assistant 消息整段丢了（包括工具调用前的说明、`AskUserQuestion` 之前的分析文字等），预览页看起来像是"Claude 跳过了回答"，其实是解析漏了。现在只要 `content` 里有非空 `text` block 就展示，不再看 `stop_reason`；`stop_reason is None` 分支保留给可能存在的历史遗留流式格式（增量快照，只在 flush 前取最后一份），和当前主流格式互不冲突。改这块逻辑前先用真实会话文件跑一遍 `load_conversation` 数消息条数，不要只信单测里手写的小样例。
 - **Monitor/task-notification 等系统注入事件在原始 JSONL 里也挂在 `type: "user"` 轮次下，`load_conversation` 必须整条丢弃，不能当成真人输入。** 区分信号是顶层 `origin.kind` 字段：真人手动输入是 `"human"`（或字段缺失，如老格式/`/plan` 等本地命令包装出的用户轮次），系统事件（Monitor 到点触发、task 通知）是 `"task-notification"`。消息历史只保留 Agent 和真人的对话，系统事件价值很低——最初的实现把它标成 `ConversationMessage("system", ...)` 单独渲染成"◇ 系统事件"展示出来，被用户否决（"什么系统消息都不要显示出来"），改成命中 `origin.kind not in (None, "human")` 就直接 `continue` 跳过，不进入返回结果。`ConversationMessage.role` 因此保持只有 `user`/`assistant` 两种，不要再引入第三种 role。新增其它 `origin.kind` 取值（目前本机全量历史只出现过 `human`/`task-notification` 两种）时按同一分类原则处理，不要默认归到 `user`。
+- **content part 的 `text` 字段、`snapshot`/`payload` 这类嵌套对象字段，同样可能是 JSON `null`（key 存在但值为 null），不是只有 Codex 才有这个坑。** `_extract_text`、`_entry_time` 的 `snapshot` 取值、`_build_session_info` 尾部循环取 assistant 文本、`load_conversation` 的 `text_parts` 列表推导式，都曾用裸 `part.get("text", "")`/`entry.get("snapshot", {})` 取值——这类写法的默认值只在 key **缺失**时生效，key 存在但值为 `null` 时会拿到 `None`，后续 `.strip()`/`.get(...)` 直接 `AttributeError` 崩掉整个扫描或预览（真实场景可复现，不是假设）。统一改成 `(x.get(key) or 默认值)` 的写法；新增任何从 Claude JSONL 嵌套字段取值的代码都要假设该字段可能是显式 `null`，不能只防"key 缺失"这一种情况。
 - **Codex 的 `event_msg.payload` 里字段值可能是 JSON `null`（key 存在但值为 null），`payload.get(key, "")` 的默认值只在 key 缺失时生效，取不到 null 场景，会拿到 `None` 再被 `str()` 变成字面量 `"None"` 混进正文。** 实测 `task_complete.last_agent_message` 为 null 很常见（任务结束但没有最终文本输出，比如被打断/答案已在更早轮次说完），预览页因此显示过多轮" ◆ Codex\nNone"。三处取值（`user_message.message`、`agent_message.message`、`task_complete.last_agent_message`）统一改成 `payload.get(key) or ""`，`or` 会把 `None` 也兜成空字符串再被后续的 `if text:` 过滤掉。改 `scan_codex.py` 任何从 payload 取文本的地方都要用这个写法，不要用 `.get(key, "")`。
 
 ## Codex 扫描
 
 - **Codex 自身的多智能体（swarm/subagent）任务会把每个子代理线程各自写成一份独立的 `rollout-*.jsonl` 文件，扫描时必须过滤掉，不能当作用户发起的顶层会话列出。** 真实故障：一个真实会话（`session_meta.payload.thread_source` 缺失或为 `"user"`）执行多智能体任务时，会派生出好几个子代理线程（`thread_source: "subagent"`，`forked_from_id`/`parent_thread_id` 指向父会话，`agent_nickname` 是 Codex 随机取的代号），这些子代理线程 fork 时继承了父会话开头的历史，因此它们文件里"第一条用户消息"（也就是列表兜底标题的来源）和父会话完全相同。`_find_all_session_files` 对 `~/.codex/sessions/` 下所有 `.jsonl` 一视同仁地扫描，没读 `thread_source` 字段时，这些子代理文件会和父会话一起出现在列表里，表现为同一段任务描述反复出现好几条、目录和时间都很接近，用户会误以为是"同一个会话被重复列出"的 bug，实际是把 Codex 内部子任务线程误当成了独立会话。修法是在 `_build_session_info` 读 `session_meta` 时顺带取 `payload.get("thread_source")`，`scan_sessions` 里 `thread_source == "subagent"` 直接 `continue` 跳过，和过滤空会话、死 cwd 会话放在同一批前置检查里。
+- **判活（`_live_session_ids`）曾对每个存活 codex 进程各发一次 `lsof -p`，是首屏超过 1s 硬指标的真实根因**：本机实测单次 `lsof -p <pid>` 耗时约 500ms，2 个 codex 进程就吃掉近 1 秒，进程越多越慢。改为按平台分流：Linux 直接遍历 `/proc/<pid>/fd` 逐个 `os.readlink` 找 `rollout-` 文件（近乎零成本，不 fork 子进程）；macOS 等无 `/proc` 的平台改为一次合并调用 `lsof -n -P -Fpn -p <pid1>,<pid2>,...` 覆盖全部候选 pid（`-n -P` 跳过 DNS/端口名解析——这是原实现单次 `lsof -p` 慢的另一诱因；`-Fpn` 只输出 `p<pid>`/`n<name>` 两类字段行，逐行按 `p` 切换当前 pid、遇到含 `rollout-` 的 `n` 行才抽 UUID）。两条路径都不判断 fd 是读还是写模式，与改动前 lsof 实现的实际行为一致（旧实现同样没有过滤 `w` 模式，只要 `rollout-` 出现在 lsof 输出里就算命中）。
 
 ## OpenCode 扫描
 
@@ -57,11 +71,13 @@
 - **硬性指标：`pickup` 首屏（进程启动到 TUI 首次渲染）延迟必须 ≤1s。** `main()` 里 `store.load()`（→ `registry.scan_all()`）是同步阻塞首屏的调用，扫描没跑完屏幕就是空的；这个指标和验证方式记在 `AGENTS.md`「验证要求」，`test_session_scanning.py` 的 `StartupLatencyTests` 是配套的回归闸门。
 - `scan_claude.py`/`scan_codex.py` 的 `scan_sessions()` 接受 `limit`，但早期实现会先对全部历史会话文件做完整的头尾 JSONL 解析，再 `results[:limit]` 截断——不管 `limit` 多小都要扫完全部历史（本机曾实测 796+1074 个文件耗时 ~5s，是 `pickup` 启动慢的根因）。现在改为先用 `os.stat` 按真实文件 mtime 把候选文件排好序，凑够 `limit` 条有效结果就停止；新增或改写这两个扫描函数时不要退回“先建全量列表再截断”的写法。因为时间修正已经收敛成单会话 `effective_session_time` 判断（见「标题与排序」），提前停止不再需要按分钟桶粒度对齐。
 - Codex 侧提前停止前必须先按真实文件 mtime（`os.path.getmtime`）重新排序，不能直接用 `_find_all_session_files` 现成的按文件名（创建时间）排序去做提前停止——同一会话被续接时 mtime 会变但文件名不变，按创建时间提前停会漏掉“很久以前创建、但刚被续接”的会话。
-- `runtime/registry.py` 的 `scan_all()` 用 `ThreadPoolExecutor` 并发跑各运行时的扫描：各运行时读的是完全独立的目录、无共享状态，线程池只是为了重叠磁盘 I/O 等待。新增运行时时这个并发逻辑不用改，注册进去即可自动享受。
+- `runtime/registry.py` 的 `scan_all()` 用 `ThreadPoolExecutor` 并发跑各运行时的扫描：各运行时读的是完全独立的目录、无共享状态，线程池只是为了重叠磁盘 I/O 等待。新增运行时时这个并发逻辑不用改，注册进去即可自动享受。**单个运行时的 `scan_sessions` 抛出未预料异常时会被就地捕获、降级为空列表**，不拖累其余运行时的结果，也不让 `pickup` 因为一条脏会话数据直接崩溃退出（真实故障：`scan_kimi.py` 曾在 `title`/`lastPrompt` 是纯空白字符串时 `IndexError`，在改这道异常隔离前会让整个首屏扫描失败）。`agent_api.py` 的 `_scan_runtimes` 是同语义的独立实现（机器接口不复用 TUI 的 `registry.scan_all`，因为它按需只扫描 `--runtime` 指定的子集），改其中一处的隔离逻辑要检查另一处是否也要同步。
 - **cwd 判活必须按 cwd 记忆化，不能逐会话裸调 `os.path.isdir`。** 排查过一次首屏 >1.3s 的问题：`scan_sessions` 循环里对每条候选会话的 `cwd` 都单独调用 `os.path.isdir` 判断目录是否还在（用于过滤已删除工作目录、无法 resume 的会话），但实测本机一次扫描里几百条候选会话经常只对应十几个不同的 cwd（同一项目下反复续接）；这些 cwd 常年落在 Syncthing/网络同步目录上，单次 `isdir` 实测 ~5-10ms，去重前光这一项就吃掉 profile 里 0.6s+ 的裸开销。修法是在 `scan_sessions` 内建一个按 cwd 缓存结果的 `isdir` 闭包（单次扫描内 cwd 存在性稳定，用完即弃），两个扫描函数都要保留这个闭包，不要退回裸调用。
 - **Claude 侧完整解析前必须先用廉价预探（`_peek_head_meta`）拦掉自产噪音会话和死 cwd 会话，不能等整文件解析完才丢弃。** 后台标题生成会调用 `claude`/`codex`，在 `~/.claude/projects/` 留下以 `titles.PROMPT_MARKER` 开头的噪音会话；这类会话和 cwd 已删的会话本来就会在解析后被过滤，但过滤发生在读完 300 行头部 + 64KB 尾部之后，白白解析。实测本机为凑够 30 条有效结果，`_build_session_info` 曾被调 347 次，其中一大半是最终会被丢弃的噪音/死 cwd 会话。`_peek_head_meta` 只读头部 ≤40 行拿 cwd 和首条用户消息，探到确定是噪音或死 cwd 才提前 `continue`；探不到（如头部很长的真实会话）时不跳过，照常走完整解析兜底——改动前后结果必须字节级一致（id 顺序、`fallback_title`、`native_title` 全部相同），新增类似优化时也要用这个标准核验。Codex 侧噪音少，只做了 cwd 记忆化，没加预探，保持简单。
 - 上述两项优化落地后，本机实测 `limit=30` 时 Claude 扫描从 1320ms 降到 225ms、Codex 从 585ms 降到 243ms，`scan_all` 并发后首屏约 0.25s；`limit=50`（默认值）约 0.6s，仍在 1s 硬指标内。
 - 评估过给单文件解析结果加磁盘缓存（按 `路径+mtime+size` 做 key）的方案，判断当前收益不足以覆盖风险，暂缓：cwd 记忆化 + 预探已经把首屏压到 1s 硬指标以内，缓存要处理和后台标题生成进程的并发写、文件被删除/截断重写后的失效判断，复杂度换来的收益不划算。若历史继续增长导致启动明显变慢（>1s）或用户明确要求，再按 `titles.py` 已有的原子写 + 内容指纹失效模式加缓存。
+- **本机历史数据量增长后，`scan_claude.py` 的头部解析（`_read_head`，最多 300 行）重新成为首屏耗时大头**：实测本机真实会话文件里，前 300 行经常混入几百 KB 甚至上 MB 的 `assistant`/工具调用大段嵌入内容（大文件读取、工具结果），逐行 `json.loads()` 解析这些巨大行很贵；同时后台标题生成积累的自产噪音会话（`PROMPT_MARKER` 前缀）在候选文件中占比可能相当高（本机实测一次凑够 50 条有效结果需要探测 130+ 候选，其中过半是噪音），叠加多个真实 codex/claude 进程并发争抢磁盘和 CPU 时，`scan_all` 有概率短暂超过 1s。**曾尝试给 `_read_head` 加字节预算提前停止（仿 `_read_tail` 的 `max_bytes`），用本机全部 1263 条真实会话验证后发现 196 条（约 15.6%）`fallback_title` 结果改变，且抽查显示新结果通常比原结果质量更差（挑到的是对话里更靠后、更简短的跟帖消息，而不是最初的完整需求描述）——已回退，不要重新引入这个方向。** 若要继续优化头部解析开销，应该在不改变"必须完整扫描到能覆盖 ai-title/last-prompt 出现位置"这个约束的前提下想办法（如按类型子串先廉价过滤要不要整行 `json.loads`，同时确保时间戳提取仍走完整解析，不能用无法区分嵌套字段的正文子串匹配去猜时间戳）。
+- `_choose_claude_fallback_title` 同分候选（如两条 `last_prompt`）平手时用 `max()` 取先出现的那条：这是**有意**保留的行为，不是 bug。头部/尾部按时间顺序把候选依次加入 `title_candidates`，同源同分时"先出现"往往对应对话里更早、更完整的原始诉求，而"最后出现"经常只是简短的追问或跟帖（已用本机真实数据核验：反转成"取最后一条"会让约 15.6% 的会话标题变得更模糊、更不能代表这次会话在做什么）。不要假设"更晚出现的候选更能代表用户意图"去改这里。
 
 ## 界面
 
@@ -82,6 +98,8 @@
 - **已修复（预览页 footer 在窄终端曾会崩溃）**：`_draw_preview` 底部快捷键提示行（`footer_y + 1` 那一行，屏幕最后一行）曾在 80/90/100 列终端下抛 `curses.error: addnwstr() returned ERR` 崩掉整个 TUI——`hint` 字符串真实显示宽度（`_text_width` 约 100 列）超过多数终端宽度，而 `addnstr` 的 `n` 参数按字符数而非显示列数截断，含中文的字符串写到最后一行边界时触发 ncurses 的"右下角"保护性异常（字符数达到 n 时，实际已写入的显示列数可能因宽字符超出 n，越界到真正的最后一列）。修法：改用 `_fit_cell(hint, width - 2)` 按**显示宽度**截断（留 2 列安全边界）再 `addnstr`，实际写入列数因此可控，永远不会碰到最后一列；等价于任何在屏幕最后一行写变长中英文混排文本的地方都应该用这个模式，不要直接把显示宽度当字符数传给 `addnstr` 的 `n`。用真实 pty（80/90/100/120 列各测一遍）复现过修复前的崩溃、验证过修复后不再崩溃，窄终端下超出的尾部提示（如 `n 新建`/`Space/q 关闭`）会被自然截掉，不影响前面更常用的按键提示。
 - **弱化文字（分隔线/次要列/帮助文字）禁止用 `curses.COLOR_WHITE` 强制写死前景色，也不能只靠 `curses.A_DIM` 保证可读性。** 排查过一次用户在白色背景终端下反馈「弱化文字几乎看不清」的问题：老实现把 `PAIR_DIM`/`PAIR_TAB_INACTIVE` 的前景色写死成 `COLOR_WHITE` 再叠加 `A_DIM`，在深色终端上没问题，但在浅色/白色背景终端上等于「白底写白字再调暗」，对比度几乎为零。修法是在 `pickup.py` 的 `_init_colors` 里判断 `curses.COLORS >= 256`：够 256 色时改用真正的中灰（256 色调色板第 244 号），不再叠加任何暗淡属性（灰色本身对比度已经够、再叠加会过淡）；退化到 8/16 色终端时才回退到「终端默认前景色（`use_default_colors()` 成功时的 `-1`）+ `A_DIM`」，靠终端自身配色跟随浅色/深色主题，而不是硬编码某个具体颜色。模块级 `DIM_EXTRA_ATTR` 由 `_init_colors` 按上述判断结果覆盖，所有需要弱化的文字必须用 `curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR` 这个组合，不要在别处再手写字面量 `curses.A_DIM`。新增弱化用途的颜色对时按同样思路处理，不要复用裸 `COLOR_WHITE`。
 - **强调色和状态色（青/绿/黄/红）同样不能用裸 ANSI 亮色 + `A_BOLD`，这是白色背景下的第二类坑。** 后续又收到用户反馈「cyan 在白色背景终端里看不清」。根因不是颜色本身，而是**加粗**：`PAIR_TAB_ACTIVE`（标签/筛选/预览用户消息）、`PAIR_KEY`（快捷键名）、`PAIR_DONE`/`PAIR_PENDING`（状态、预览助手消息、spinner）在使用处都叠了 `curses.A_BOLD`，而多数终端会把「加粗的 ANSI 0-7 前景色」升成对应的亮色——暗青 `#008080` 在白底本有 4.77 的 WCAG 对比度，一加粗升成亮青 `#00ffff` 就只剩 **1.25**，基本不可读；黄（升亮后 1.07）、绿（1.37）同理。修法与弱化文字一致、并推广到全部前景色：`curses.COLORS >= 256` 时改用**索引色**（`accent_fg=30` 暗青 teal、`done_fg=28` 绿、`pending_fg=130` 琥珀替代白底几乎不可见的黄、`aborted_fg=160` 红；都按 WCAG 在白底/黑底都 ≥4.3 挑过），索引色的关键好处是 **A_BOLD 只加粗字重、不会把色相升成刺眼亮色**，从根上消除坑；8/16 色终端才回退到原 ANSI 亮色（假定深色背景）。选中条 `PAIR_SELECTED` 是「亮青底 + 黑字」的填充块，背景色与终端主题无关、白底深底都清晰，保持不变。**新增任何带 `A_BOLD` 的前景色对时，256 色路径一律用索引色、不要用 `COLOR_CYAN`/`COLOR_YELLOW` 等裸 ANSI 色**，否则加粗会在浅色终端上把它打成不可读的亮色。改色号后用真实 pty（`TERM=xterm-256color`）抓一次原始 SGR 转义确认发出的是 `38;5;<n>` 索引色、且没有 `1;36m`（加粗亮青）这类旧坑。
+- **已修复（`x` 关闭后台确认框曾在 200ms 后自动消失）**：`_confirm_kill_keepalive` 原实现只调用一次 `stdscr.getch()`，但 `stdscr` 处于 `_run` 设的 200ms 非阻塞超时模式，超时返回 `-1` 曾被当成"其他键取消"处理——确认框实际只有 200ms 窗口可按 `y`，之后就自动消失，用户几乎不可能在这个窗口内按到确认键。修法：改成循环等待，`getch()` 返回 `-1`（超时）就继续等，只有真正读到按键（含 `curses.error` 之外的任何返回值）才判定 `y`/`Y` 是否命中。新增任何在 200ms 超时模式下需要"等待用户单次按键确认"的弹窗，都要走这个循环写法，不要直接信任裸 `getch()` 一次调用的返回值。
+- **已修复（终端被拖窄导致内嵌面板隐藏后，按键仍被转发进看不见的会话）**：`_run` 主循环里 `emb.dead and ui.focus == "pane"` 只处理了"面板里的会话进程已退出"这一种情况，把焦点弹回列表；但终端被拖窄导致 `_embed_list_width` 返回全宽（面板本身不可见，会话在后台 tmux 里仍然活着）是另一种情况，之前没有对应处理——此时界面显示的是全宽列表，但 `ui.focus` 仍是 `"pane"`，所有按键（包括 `q`）都会被 `_forward_pane_key` 转发进这个已经看不见的托管会话，表现像键盘失灵，只能靠 `C-\` 逃生。修法是同一处主循环新增 `elif width == full_width and ui.focus == "pane"` 分支，面板隐藏时同样把焦点强制拉回列表；拉宽终端后用户可以再次回车重新聚焦面板。
 
 ### 项目侧边栏
 
@@ -174,6 +192,7 @@
 
 ## 机器接口维护（agent_api.py）
 
+- `list`/`search`/`resolve_ref`（`show`/`context`/`plan continue` 共用）在扫描多个运行时时统一走 `_scan_runtimes` 辅助函数：`ThreadPoolExecutor` 并发扫描 + 单运行时异常隔离，与 `runtime/registry.py` 的 `scan_all()` 同语义但独立实现（机器接口按需只扫描 `--runtime` 指定的子集，不复用 TUI 那份）。之前是逐个运行时串行 `scan_sessions()`，运行时数量越多、`pickup list`/`search` 不带 `--runtime` 时延迟越接近各运行时耗时之和；改并发后接近最慢那个运行时的耗时。新增调用点需要扫描多个运行时时复用这个函数，不要退回字典推导式的串行写法。
 - `list`/`search`/`show`/`context`/`plan continue`/`describe` 的 JSON envelope 结构（`{ok, data, error, meta}`）、
   退出码分配（0/1/2/3/5）和已发布字段名是对外契约，一旦发布过版本就按“只加不改不删”演进；
   确需破坏性变更时同步提升 `agent_api.AGENT_API_VERSION` 并在 `docs/SKILL.md` 标注。
