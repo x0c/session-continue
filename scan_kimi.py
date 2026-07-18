@@ -224,9 +224,13 @@ def _build_session_info(session_dir: str, session_id: str) -> dict | None:
         status_tag = titles.STATUS_NONE
 
     # 兜底标题：原生标题 > 首条用户消息 > 最后一条 prompt。
+    # candidate 可能是纯空白（如 " "），strip() 后为空串时 splitlines() 返回空列表，
+    # 取 [0] 会 IndexError；先判空再取首行，纯空白候选按"无标题"处理，尝试下一个来源。
     fallback = ""
     for candidate in (native_title, first_user_msg, state.get("lastPrompt")):
-        line = str(candidate or "").strip().splitlines()[0].strip() if candidate else ""
+        stripped = str(candidate or "").strip()
+        lines = stripped.splitlines()
+        line = lines[0].strip() if lines else ""
         if line:
             fallback = line[:60] + "…" if len(line) > 60 else line
             break

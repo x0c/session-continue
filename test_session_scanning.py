@@ -1386,6 +1386,23 @@ class KimiScanTests(TimezoneMixin, unittest.TestCase):
             self.assertEqual([s["id"] for s in sessions], ["session_titled"])
             self.assertEqual(sessions[0]["fallback_title"], "简单问候")
 
+    def test_blank_title_and_last_prompt_do_not_crash_scan(self) -> None:
+        # 真实故障复现：title/lastPrompt 是纯空白字符串（如 " "）而非缺失时，
+        # strip() 后为空串，splitlines()[0] 曾抛 IndexError 崩掉整个扫描。
+        with tempfile.TemporaryDirectory() as td:
+            sessions_dir = Path(td) / "sessions"
+            _make_kimi_session(
+                sessions_dir, "wd_demo", "session_blank_title",
+                state={"title": " ", "workDir": td, "lastPrompt": "\n",
+                       "updatedAt": "2026-07-17T08:01:00.000Z"},
+                wire_rows=[
+                    _kimi_user_event("真实用户消息", 1_784_275_205_000),
+                ],
+            )
+            sessions = self._scan(sessions_dir, limit=10)
+            self.assertEqual([s["id"] for s in sessions], ["session_blank_title"])
+            self.assertEqual(sessions[0]["fallback_title"], "真实用户消息")
+
     def test_dead_cwd_session_is_dropped(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             sessions_dir = Path(td) / "sessions"

@@ -55,6 +55,30 @@ class FakeRuntime(BaseRuntime):
         return LaunchPlan((self.executable,), cwd)
 
 
+class BrokenRuntime(BaseRuntime):
+    """scan_sessions 必抛异常的假运行时，供验证 scan_all 的异常隔离。"""
+
+    id = "broken"
+    display_name = "Broken"
+    executable = "broken"
+    history_reading_hint = "测试格式"
+
+    def scan_sessions(self, limit: int) -> list[dict]:
+        raise RuntimeError("模拟某条真实会话记录触发的未预料解析异常")
+
+    def load_conversation(self, session: dict) -> list:
+        return []
+
+    def build_resume_plan(self, session: dict) -> LaunchPlan:
+        return LaunchPlan((self.executable, "--resume", str(session["id"])), None)
+
+    def build_new_plan(self, handoff: Handoff) -> LaunchPlan:
+        return LaunchPlan((self.executable, handoff.render_prompt()), None)
+
+    def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
+        return LaunchPlan((self.executable,), cwd)
+
+
 class RuntimeTests(unittest.TestCase):
     def _session(self, source: str, history_path: str, cwd: str) -> dict:
         return {
@@ -282,6 +306,16 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(plan.argv, ("gemini",))
         self.assertEqual(plan.cwd, td)
+
+    def test_scan_all_isolates_exception_from_one_runtime(self) -> None:
+        # 单个运行时的扫描异常（如某条真实会话记录触发未预料的解析 bug）不能
+        # 拖垮其余运行时的结果，也不能让 pickup 首屏直接崩溃退出。
+        registry = RuntimeRegistry((FakeRuntime(), BrokenRuntime()))
+
+        scanned = registry.scan_all(limit=10)
+
+        self.assertEqual(scanned["gemini"], [])
+        self.assertEqual(scanned["broken"], [])
 
     def test_passthrough_plan_prepends_auto_approve_args(self) -> None:
         plan = default_registry().build_passthrough_plan("claude", ["把测试修到全绿"])

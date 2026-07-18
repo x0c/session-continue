@@ -42,10 +42,22 @@ class RuntimeRegistry:
 
     def scan_all(self, limit: int) -> dict[str, list[SessionInfo]]:
         """并发扫描各运行时。各适配器只读各自独立的历史目录，互不干扰，
-        用线程池重叠磁盘 I/O 等待时间即可，不需要多进程。"""
+        用线程池重叠磁盘 I/O 等待时间即可，不需要多进程。
+
+        单个运行时的扫描异常（如某条真实会话记录格式异常触发未预料的解析
+        bug）被隔离在这里：该运行时降级为空列表，不拖垮其余运行时的结果，
+        也不让 pickup 首屏因为一条脏数据直接崩溃退出。
+        """
         runtimes = list(self)
+
+        def _scan_one(runtime: BaseRuntime) -> list[SessionInfo]:
+            try:
+                return runtime.scan_sessions(limit)
+            except Exception:
+                return []
+
         with ThreadPoolExecutor(max_workers=max(1, len(runtimes))) as pool:
-            scanned = pool.map(lambda runtime: runtime.scan_sessions(limit), runtimes)
+            scanned = pool.map(_scan_one, runtimes)
         return {runtime.id: result for runtime, result in zip(runtimes, scanned)}
 
     def build_launch_plan(self, request: LaunchRequest) -> LaunchPlan:
