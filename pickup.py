@@ -1201,6 +1201,73 @@ def _is_mouse_wheel_down(bstate: int) -> bool:
     return bool(report) and bstate == report
 
 
+def _read_sgr_mouse(scr) -> tuple[int, int, int, bool] | None:
+    """在已消费 `ESC [ <` 前缀后读取 SGR 鼠标负载。
+
+    返回 (button, x, y, 是否按下)，坐标转为 0-based；序列不完整或格式
+    非法返回 None。供绕过 ncurses KEY_MOUSE 的原始解析路径复用。
+    """
+    seq = bytearray()
+    press = None
+    while len(seq) < 32:
+        c = scr.getch()
+        if c == -1:
+            return None
+        if c in (ord("M"), ord("m")):
+            press = c == ord("M")
+            break
+        seq.append(c)
+    if press is None:
+        return None
+    try:
+        button_s, x_s, y_s = seq.decode("ascii").split(";")
+        return int(button_s), int(x_s) - 1, int(y_s) - 1, press
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _sgr_synth_bstate(button: int, press: bool) -> int | None:
+    """SGR 按钮号合成 ncurses bstate，让原始路径与 KEY_MOUSE 共用同一套坐标路由。
+
+    返回 None 表示无需处理的事件类型（如滚轮的释放形态、右键等）。"""
+    if button == 64:
+        return curses.BUTTON4_PRESSED if press else None
+    if button == 65:
+        if not press:
+            return None
+        return getattr(curses, "BUTTON5_PRESSED", 0) or curses.BUTTON2_PRESSED
+    if button == 0:
+        return curses.BUTTON1_PRESSED if press else curses.BUTTON1_RELEASED
+    if button == 32 and press:
+        # 左键按住拖动的 motion：合成裸位置上报，坐标路由据 sel_anchor 更新选区
+        return getattr(curses, "REPORT_MOUSE_POSITION", 0) or None
+    return None
+
+
+def _preview_escape_scroll(scr) -> int | None:
+    """预览页 Esc 分流：识别原始 SGR 滚轮序列，避免旧平台上一滚就关闭预览。
+
+    返回滚动增量（非滚轮鼠标事件返回 0 表示已消费），裸 Esc 或其他序列返回
+    None，调用方按「关闭预览」处理。
+    """
+    scr.timeout(ESCAPE_WAIT_MS)
+    try:
+        nxt = scr.getch()
+        if nxt != ord("["):
+            return None
+        if scr.getch() != ord("<"):
+            return None  # 方向键等 CSI 已被 keypad 翻译，走到这里的按旧行为关闭
+        parsed = _read_sgr_mouse(scr)
+        if parsed is None:
+            return 0
+        button, _mx, _my, press = parsed
+        if button & 64 and press:
+            return -PREVIEW_MOUSE_SCROLL_LINES if not (button & 1) else PREVIEW_MOUSE_SCROLL_LINES
+        return 0
+    finally:
+        scr.timeout(200)
+
+
 def _is_scrollback_return_event(bstate: int, scroll_offset: int) -> bool:
     """在回滚状态识别无法被旧 ncurses 命名的“向下”鼠标事件。
 
@@ -1237,18 +1304,21 @@ def _apply_mousemask(enabled: bool) -> None:
         curses.mousemask(mask)
     except curses.error:
         pass  # 终端或 curses 编译版本不支持鼠标上报时静默降级为纯键盘操作
-    # macOS 自带 ncurses 使用 NCURSES_MOUSE_VERSION=1，32 位事件布局没有
-    # BUTTON5，无法可靠表达向下滚轮。显式请求 SGR 1006 后，终端把滚轮编码为
-    # ESC[<64/65;…M；列表页和 pane 的 Escape 解码会自行消费，不依赖 curses 的
-    # Button5 映射。1000 是滚轮所需的基础追踪模式，1006 只升级编码格式。
-    try:
-        if enabled:
-            sys.stdout.write("\x1b[?1000h\x1b[?1006h")
-        else:
-            sys.stdout.write("\x1b[?1006l\x1b[?1000l")
-        sys.stdout.flush()
-    except OSError:
-        pass
+    # 仅旧平台（BUTTON5 不可用，如 macOS 系统 ncurses 的协议 v1 布局）才手动
+    # 请求 SGR 1006：这种布局无法表达向下滚轮，只能换编码后由 pickup 自行解析
+    # ESC[<64/65;…M。新版 ncurses（Linux 常见）自己协商并解码 KEY_MOUSE，
+    # **绝不能**全平台强开 1006——那会把终端上报格式切成 ncurses 不认的编码，
+    # 点击/滚轮全部失灵（2026-07-19 双机实报回归：pane 滚轮丢失、pane 聚焦时
+    # 左栏点击序列被当文本打进 agent 输入框）。
+    if not getattr(curses, "BUTTON5_PRESSED", 0):
+        try:
+            if enabled:
+                sys.stdout.write("\x1b[?1000h\x1b[?1006h")
+            else:
+                sys.stdout.write("\x1b[?1006l\x1b[?1000l")
+            sys.stdout.flush()
+        except OSError:
+            pass
     if enabled:
         try:
             # 不把一次点击合成为依赖 release 的 CLICK 事件。部分终端/旧 ncurses
@@ -1312,9 +1382,15 @@ def _show_preview(
                     if at_bottom:
                         scroll = 10 ** 9  # 停在底部时自动跟随新消息
                 continue
-            if ch in (ord(" "), 27):
+            if ch == ord(" "):
                 stdscr.clear()
                 return None
+            if ch == 27:
+                delta = _preview_escape_scroll(stdscr)
+                if delta is None:
+                    stdscr.clear()
+                    return None
+                scroll = max(0, scroll + delta)
             if ch in (10, 13, curses.KEY_ENTER):
                 stdscr.clear()
                 return LaunchRequest(session, ui.source, title), False
@@ -1823,50 +1899,18 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                 embed.send_key(emb.name, "Escape")
                 return
             if nxt == ord("["):
-                # macOS 自带 ncurses 5.x 无法可靠地把 SGR 1006 的向下滚轮
-                # 交成 KEY_MOUSE（BUTTON5 与修饰键位重叠）。先在原始 CSI 输入
-                # 中截获滚轮，避免它被当普通 Escape 文本透传给内层 TUI。
+                # 旧平台的鼠标序列不会变成 KEY_MOUSE，整个 ESC[<... 原样落到这里。
+                # 合成 bstate 走与 KEY_MOUSE 相同的坐标路由：pane 聚焦时左栏点击、
+                # pane 滚轮/选词照常生效。鼠标序列**绝不能**当 Escape 文本透传给
+                # 内层程序（2026-07-19 双机实报：点击序列被打进 agent 输入框）。
                 first = stdscr.getch()
                 if first == ord("<"):
-                    mouse_seq = bytearray([first])
-                    while len(mouse_seq) < 32:
-                        c = stdscr.getch()
-                        if c == -1:
-                            break
-                        mouse_seq.append(c)
-                        if c in (ord("M"), ord("m")):
-                            break
-                    try:
-                        payload = mouse_seq.decode("ascii")
-                        button_s, x_s, y_s = payload[1:-1].split(";")
-                        button, mx, my = int(button_s), int(x_s) - 1, int(y_s) - 1
-                    except (UnicodeDecodeError, ValueError):
-                        button = -1
-                    if button in (64, 65):
-                        height_now, full_width = stdscr.getmaxyx()
-                        pane_x0 = EMBED_LEFT_BAND + 1
-                        pane_h = max(1, height_now - 2)
-                        pane_visible = _embed_list_width(full_width, height_now, emb) != full_width
-                        if (pane_visible and mx >= pane_x0 and my < pane_h
-                                and emb.name and not emb.dead):
-                            # 内嵌模式的滚轮始终属于 pickup 的回滚视图。若把它交给
-                            # 内层 TUI，Claude/Codex 一类申请鼠标的程序会抢走事件，
-                            # 而它们未必提供对应的向下回滚，造成“只能向上”的死路。
-                            if button == 64:
-                                emb.scroll_offset = min(
-                                    emb.scroll_offset + PREVIEW_MOUSE_SCROLL_LINES,
-                                    emb.history_size,
-                                )
-                                emb.poke.set()
-                            else:
-                                emb.scroll_offset = max(
-                                    0, emb.scroll_offset - PREVIEW_MOUSE_SCROLL_LINES,
-                                )
-                                emb.poke.set()
-                            return
-                    # 非滚轮 SGR 事件仍按 Escape 文本透传，维持既有降级行为。
-                    embed.send_key(emb.name, "Escape")
-                    embed.send_literal(emb.name, "[" + mouse_seq.decode("ascii", errors="replace"))
+                    parsed = _read_sgr_mouse(stdscr)
+                    if parsed is not None:
+                        button, mx, my, press = parsed
+                        synth = _sgr_synth_bstate(button, press)
+                        if synth is not None:
+                            _handle_mouse(mx, my, synth)
                     return
                 if first != -1:
                     curses.ungetch(first)
@@ -1925,33 +1969,15 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
 
             first = stdscr.getch()
             if first == ord("<"):
-                mouse_seq = bytearray([first])
-                while len(mouse_seq) < 32:
-                    c = stdscr.getch()
-                    if c == -1:
-                        return None
-                    mouse_seq.append(c)
-                    if c in (ord("M"), ord("m")):
-                        break
-                try:
-                    payload = mouse_seq.decode("ascii")
-                    button_s, x_s, y_s = payload[1:-1].split(";")
-                    button, mx, my = int(button_s), int(x_s) - 1, int(y_s) - 1
-                except (UnicodeDecodeError, ValueError):
-                    return None
-                # 有些 macOS 终端不会把 SGR 滚轮交给 ncurses 的 KEY_MOUSE，
-                # 而是把整个 ESC[<... 序列原样送到这里。不能只处理左键点击。
-                if button & 64:
-                    height_now, full_width = stdscr.getmaxyx()
-                    pane_x0 = EMBED_LEFT_BAND + 1
-                    pane_h = max(1, height_now - 2)
-                    pane_visible = _embed_list_width(full_width, height_now, emb) != full_width
-                    if not pane_visible or mx < pane_x0 or my >= pane_h:
-                        _scroll_list_viewport(wheel_up=not bool(button & 1))
-                    return None
-                # 左键按下立刻等价于 Enter；释放事件无需再处理。
-                if button == 0 and payload.endswith("M"):
-                    _activate_list_click(mx, my)
+                # 旧平台（或把 SGR 原样透传的终端）的鼠标序列不会变成 KEY_MOUSE，
+                # 而是整个 ESC[<... 落到这里。合成 bstate 后走与 KEY_MOUSE 完全
+                # 相同的坐标路由——列表点击/滚轮、pane 滚轮/选词一个都不能少。
+                parsed = _read_sgr_mouse(stdscr)
+                if parsed is not None:
+                    button, mx, my, press = parsed
+                    synth = _sgr_synth_bstate(button, press)
+                    if synth is not None:
+                        _handle_mouse(mx, my, synth)
                 return None
 
             csi_keys = {
@@ -2062,8 +2088,18 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         return True
 
     def _pane_mouse() -> bool:
-        """鼠标事件总入口；返回 True 表示改了 UI 状态需要重绘。
+        """ncurses KEY_MOUSE 事件入口：读取 getmouse 后交统一坐标路由。"""
+        try:
+            _, mx, my, _, bstate = curses.getmouse()
+        except curses.error:
+            return False
+        return _handle_mouse(mx, my, bstate)
 
+    def _handle_mouse(mx: int, my: int, bstate: int) -> bool:
+        """鼠标事件统一坐标路由；返回 True 表示改了 UI 状态需要重绘。
+
+        两个入口共用：ncurses KEY_MOUSE（新版 ncurses 正常解码），以及旧平台
+        绕过 ncurses 的原始 SGR 解析（经 _sgr_synth_bstate 合成 bstate）。
         分发顺序：
         1. 左栏左键按下 → 立即切回列表或打开会话；右侧 pane 内的按下/拖动/抬起
            用于 **拖拽选词**：按下记起点、拖动实时更新高亮、抬起按流式区域复制到
@@ -2075,10 +2111,6 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         事件流只转发或丢弃、绝不触发整帧重绘（选词高亮除外）——这是拖拽
         不卡死的关键：画面更新一律由 capture/poke 驱动。
         """
-        try:
-            _, mx, my, _, bstate = curses.getmouse()
-        except curses.error:
-            return False
         wheel_up = bool(bstate & curses.BUTTON4_PRESSED)
         wheel_down = _is_mouse_wheel_down(bstate)
 

@@ -2127,22 +2127,54 @@ class TuiLayoutTests(unittest.TestCase):
 
         self.assertIn((0, 3), drawn_states)
 
-    def test_mousemask_forces_sgr_wheel_encoding_for_macos_compatibility(self) -> None:
-        """不依赖旧 ncurses 缺失的 Button5，主动请求 SGR 1006。"""
+    def test_mousemask_requests_sgr_1006_only_on_legacy_platforms(self) -> None:
+        """SGR 1006 只在 BUTTON5 不可用的旧平台手动请求。
+
+        新版 ncurses 自己协商并解码 KEY_MOUSE；全平台强开 1006 会把终端上报
+        格式切成 ncurses 不认的编码，点击/滚轮全部失灵（2026-07-19 双机实报
+        回归）。这条断言两个方向都锁死。
+        """
+        # 旧平台（BUTTON5 存在但为 0x0）：手动请求 + 对称撤销
         stdout = mock.Mock()
         with (
+            mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 0, create=True),
             mock.patch.object(pickup.curses, "mousemask"),
             mock.patch.object(pickup.curses, "mouseinterval"),
             mock.patch.object(pickup.sys, "stdout", stdout),
         ):
             pickup._apply_mousemask(True)
             pickup._apply_mousemask(False)
-
         self.assertEqual(
             [call.args[0] for call in stdout.write.call_args_list],
             ["\x1b[?1000h\x1b[?1006h", "\x1b[?1006l\x1b[?1000l"],
         )
         self.assertEqual(stdout.flush.call_count, 2)
+
+        # 新平台（BUTTON5 可用）：绝不碰终端的鼠标编码模式
+        stdout = mock.Mock()
+        with (
+            mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True),
+            mock.patch.object(pickup.curses, "mousemask"),
+            mock.patch.object(pickup.curses, "mouseinterval"),
+            mock.patch.object(pickup.sys, "stdout", stdout),
+        ):
+            pickup._apply_mousemask(True)
+            pickup._apply_mousemask(False)
+        stdout.write.assert_not_called()
+
+    def test_sgr_synth_bstate_maps_raw_buttons_to_key_mouse_equivalents(self) -> None:
+        """原始 SGR 路径必须与 KEY_MOUSE 路由等价：各按钮号的合成映射锁死。"""
+        self.assertEqual(pickup._sgr_synth_bstate(64, True), pickup.curses.BUTTON4_PRESSED)
+        self.assertIsNone(pickup._sgr_synth_bstate(64, False))
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 0, create=True):
+            self.assertEqual(pickup._sgr_synth_bstate(65, True), pickup.curses.BUTTON2_PRESSED)
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True):
+            self.assertEqual(pickup._sgr_synth_bstate(65, True), 1 << 20)
+        self.assertEqual(pickup._sgr_synth_bstate(0, True), pickup.curses.BUTTON1_PRESSED)
+        self.assertEqual(pickup._sgr_synth_bstate(0, False), pickup.curses.BUTTON1_RELEASED)
+        self.assertEqual(pickup._sgr_synth_bstate(32, True),
+                         pickup.curses.REPORT_MOUSE_POSITION)
+        self.assertIsNone(pickup._sgr_synth_bstate(2, True))  # 右键之类直接丢弃
 
     def test_runtime_picker_esc_cancels(self) -> None:
         """所有选择弹窗也必须统一用 Esc 返回。"""
@@ -2164,7 +2196,8 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
 
-        screen.getch.side_effect = [curses.KEY_MOUSE, 27]
+        # 结尾的 -1 模拟裸 Esc 后没有后续字节（Esc 分流会多读一次以识别 SGR 滚轮）
+        screen.getch.side_effect = [curses.KEY_MOUSE, 27, -1]
         with (
             mock.patch.object(pickup, "_draw_preview", return_value=(5, 10)) as draw,
             mock.patch.object(pickup.curses, "mousemask") as mousemask,
@@ -2197,7 +2230,8 @@ class TuiLayoutTests(unittest.TestCase):
         session = {"source": "claude", "id": "abc", "short_id": "abc12345"}
         ui = pickup.UIState(source="claude")
 
-        screen.getch.side_effect = [ord("m"), ord("m"), 27]
+        # 结尾的 -1 模拟裸 Esc 后没有后续字节（Esc 分流会多读一次以识别 SGR 滚轮）
+        screen.getch.side_effect = [ord("m"), ord("m"), 27, -1]
         with (
             mock.patch.object(pickup, "_draw_preview", return_value=(0, 0)) as draw,
             mock.patch.object(pickup.curses, "mousemask") as mousemask,
