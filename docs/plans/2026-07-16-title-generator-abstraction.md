@@ -16,13 +16,13 @@
 - 标题生成器不进 `runtime/`;`titlegen.py` 不得 import `runtime` 包,`runtime/` 也不得 import `titlegen`。
 - 每个任务完成后必跑:
   ```bash
-  cd /Users/geraltgraham/Codes/SessionContinue/cli
+  cd <仓库根>/cli
   python3 -m py_compile sc.py scan_claude.py scan_codex.py scan_opencode.py titles.py titlegen.py models.py agent_api.py keepalive.py runtime/*.py test_*.py
   python3 -m unittest -v
   ```
   预期:0 错误、全部测试 PASS。
 - 每个任务一个独立 commit,不 amend。
-- 仓库真实路径:`/Users/geraltgraham/Codes/SessionContinue/cli/`(下文相对路径均以此为根)。
+- 下文相对路径均以 CLI 仓库根为基准。
 
 ## 背景:现状事实(实现前无需再考古)
 

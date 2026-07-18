@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -599,7 +600,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         save_mock.assert_not_called()
 
     def test_refresh_titles_saves_cache_per_batch(self) -> None:
-        # 三批（_BATCH_SIZE 条/批），每批都有成功标题：应逐批落盘而非最后一次性写。
+        # 三批（_BATCH_SIZE 条/批）并行完成后，仍应每批落盘而非最后一次性写。
         sessions = [
             {"id": f"s{i}", "source": "claude", "mtime": 1, "size_kb": 1, "fallback_title": f"标题{i}"}
             for i in range(titles._BATCH_SIZE * 3)
@@ -614,6 +615,51 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
 
         self.assertEqual(len(result), titles._BATCH_SIZE * 3)
         self.assertEqual(save_mock.call_count, 3)
+
+    def test_refresh_titles_runs_five_batches_in_parallel(self) -> None:
+        sessions = [
+            {"id": f"s{i}", "source": "claude", "mtime": 1, "size_kb": 1, "fallback_title": f"标题{i}"}
+            for i in range(titles._BATCH_SIZE * (titles._MAX_PARALLEL_BATCHES + 1))
+        ]
+        lock = threading.Lock()
+        started = threading.Event()
+        release = threading.Event()
+        state = {"active": 0, "max_active": 0}
+        outcome = {}
+
+        def fake_batch(chunk, generator, timeout=90):
+            with lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                if state["active"] == titles._MAX_PARALLEL_BATCHES:
+                    started.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("并行批次未在预期时间内释放")
+            with lock:
+                state["active"] -= 1
+            return {titles.session_key(s): f"生成{s['id']}" for s in chunk}
+
+        def run_refresh():
+            try:
+                outcome["result"] = titles.refresh_titles(sessions, {}, generator=mock.Mock())
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        with mock.patch.object(titles, "generate_titles_batch", side_effect=fake_batch):
+            runner = threading.Thread(target=run_refresh)
+            runner.start()
+            try:
+                self.assertTrue(started.wait(timeout=1))
+                with lock:
+                    self.assertEqual(state["active"], titles._MAX_PARALLEL_BATCHES)
+                    self.assertEqual(state["max_active"], titles._MAX_PARALLEL_BATCHES)
+            finally:
+                release.set()
+            runner.join(timeout=2)
+
+        self.assertFalse(runner.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(len(outcome["result"]), len(sessions))
 
     def test_scan_sessions_memoizes_cwd_isdir_and_peek_skips_noise_and_dead_cwd(self) -> None:
         # 首屏 ≤1s 的回归防退化用例：不依赖真实数据。构造大量会话共享极少数
@@ -992,7 +1038,7 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
         uuid = "019f2c27-c9b0-7dc3-a600-8678bf0e8dcc"
         lsof_output = (
             "p47372\n"
-            f"n/Users/geraltgraham/.codex/sessions/2026/07/04/"
+            f"n/private/tmp/codex/sessions/2026/07/04/"
             f"rollout-2026-07-04T16-03-52-{uuid}.jsonl\n"
         )
 
@@ -1949,8 +1995,10 @@ class TuiLayoutTests(unittest.TestCase):
         with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, pickup.curses.BUTTON4_PRESSED)):
             self.assertEqual(pickup._preview_mouse_scroll_delta(), -pickup.PREVIEW_MOUSE_SCROLL_LINES)
 
-        with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, pickup.curses.BUTTON5_PRESSED)):
-            self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
+        # 部分 macOS curses 不暴露 BUTTON5_PRESSED；补出该常量后仍应按相同语义处理向下滚轮。
+        with mock.patch.object(pickup.curses, "BUTTON5_PRESSED", 1 << 20, create=True):
+            with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, 1 << 20)):
+                self.assertEqual(pickup._preview_mouse_scroll_delta(), pickup.PREVIEW_MOUSE_SCROLL_LINES)
 
         with mock.patch.object(pickup.curses, "getmouse", return_value=(0, 0, 0, 0, 0)):
             self.assertIsNone(pickup._preview_mouse_scroll_delta())

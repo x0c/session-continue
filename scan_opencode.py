@@ -245,7 +245,7 @@ if __name__ == "__main__":
     for i, s in enumerate(sessions):
         print(
             f"{i+1:>2}. [{s['short_id']}] {s['cwd_display']:<24} {s['display_time']:<12} "
-            f"{s['size_kb']:>7}KB {'进行中' if s['live'] else '已结束':<6} "
+            f"{s['size_kb']:>7}KB {'运行中' if s['live'] else '已结束':<6} "
             f"native={s['native_title']!r} fallback={s['fallback_title']!r} "
             f"status={s['status_tag']!r}"
         )

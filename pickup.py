@@ -256,7 +256,7 @@ def _init_colors() -> None:
 
 
 def _status_attr(live: bool) -> int:
-    """状态列颜色：进行中（进程活着）用绿色高亮，已结束用暗色。"""
+    """状态列颜色：运行中（进程活着）用绿色高亮，已结束用暗色。"""
     return curses.color_pair(PAIR_DONE) if live else curses.color_pair(PAIR_DIM) | DIM_EXTRA_ATTR
 
 
@@ -558,7 +558,7 @@ class EmbedUI:
     active: bool = False           # 分栏布局是否开启
     enabled: bool = False          # embed.available() 的一次性判定结果
     name: str | None = None        # 当前面板聚焦的 tmux 会话名（pickup-* 命名空间）
-    session_key: str | None = None  # 对应的列表会话键，用于状态列"面板中"标注
+    session_key: str | None = None  # 当前面板聚焦的列表会话键（与 name 的 tmux 会话名配对）
     dead: bool = False             # 聚焦会话的进程已退出
     grid: list | None = None       # 最近一次解析出的单元格画面（embed.parse_screen）
     generation: int = 0            # grid 版本号：绘制段缓存与主循环跳帧都以它为准
@@ -566,7 +566,8 @@ class EmbedUI:
     spans_gen: int = -1
     size: tuple[int, int] = (0, 0)  # 面板当前宽高（字符），变化时同步 resize 托管会话
     cursor: tuple[int, int, bool] | None = None  # (x, y, 是否可见)
-    copy_mode: bool = False        # 本地跟踪：pane 是否处于我们经滚轮发起的 copy-mode
+    scroll_offset: int = 0         # 应用层滚动：相对 live 窗口向上回滚的行数（0=直播画面）
+    history_size: int = 0          # pane 回滚行数（scroll_offset 的上限，pane_state 每轮刷新）
     mouse_any: bool = False        # pane 内程序是否申请了鼠标上报（申请则滚轮直达程序）
     mouse_sgr: bool = False        # 鼠标上报是否为 SGR 1006 编码
     mouse_report: bool = True      # 全局鼠标上报开关（m 键切换；关闭后恢复终端原生框选）
@@ -832,9 +833,7 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0,
             selected = current and list_focused  # 只有列表持有焦点时才用反白
             is_gen = key in generating
             is_keepalive = bool(s.get("keepalive_name"))
-            status_text = "后台运行中" if is_keepalive else ("进行中" if s["live"] else "已结束")
-            if emb is not None and emb.active and not emb.dead and key == emb.session_key:
-                status_text = "面板中"
+            status_text = "运行中(托管)" if is_keepalive else ("运行中" if s["live"] else "已结束")
 
             if selected:
                 base_attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
@@ -991,14 +990,22 @@ def _draw(stdscr, store: SessionStore, ui: UIState, frame: int = 0,
         _draw_embed_pane(stdscr, emb, pool, ui, width, full_width, height)
 
     # 拖拽选词高亮：流式区域（首行起点→行尾、中间整行、末行→终点）反显；
-    # chgat 只改属性不动文本，每帧随选择状态重画
+    # chgat 只改属性不动文本，每帧随选择状态重画；行级区域钳制与提取一致
     if emb is not None and emb.sel_start is not None and emb.sel_end is not None:
         (sx, sy), (ex, ey) = emb.sel_start, emb.sel_end
         if (sy, sx) > (ey, ex):
             sx, sy, ex, ey = ex, ey, sx, sy
+        pane_x0 = EMBED_LEFT_BAND + 1
         for y in range(max(0, sy), min(ey, height - 1) + 1):
             x0 = sx if y == sy else 0
             x1 = ex if y == ey else full_width - 1
+            if pane_visible and emb.sel_zone is not None:
+                if emb.sel_zone == "pane":
+                    x0 = max(x0, pane_x0)
+                else:
+                    x1 = min(x1, pane_x0 - 1)
+            if x1 < x0:
+                continue
             try:
                 stdscr.chgat(y, max(0, x0), max(1, min(x1, full_width - 1) - max(0, x0) + 1),
                              curses.A_REVERSE)
@@ -1114,7 +1121,12 @@ def _draw_embed_pane(stdscr, emb: EmbedUI, pool: "embed.PairPool", ui: UIState,
         pass  # 尺寸瞬变期越界写入失败时静默，下一帧自然收敛
 
     pane_focused = ui.focus == "pane"
-    hint = "C-\\ 回列表 · 按键直接发往会话" if pane_focused else "回车 聚焦会话 · c 关闭面板"
+    if emb.scroll_offset > 0:
+        hint = f"↑ 回滚 {emb.scroll_offset} 行 · 滚轮向下/按键回直播"
+    elif pane_focused:
+        hint = "C-\\ 回列表 · 按键直接发往会话"
+    else:
+        hint = "回车 聚焦会话 · c 关闭面板"
     try:
         stdscr.addnstr(height - 2, x0, "─" * pane_w, pane_w, dim)
         hint_fitted = _fit_cell(hint, max(0, pane_w - 1)).rstrip()
@@ -1617,7 +1629,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                     gap = time.monotonic() - last_capture
                     if 0 < gap < MIN_INTERVAL:
                         time.sleep(MIN_INTERVAL - gap)
-                    text = embed.capture(name)
+                    text = embed.capture(name, emb.scroll_offset, emb.size[1])
                     last_capture = time.monotonic()
                     if text is None:
                         # capture 失败常常只是 tmux 瞬时超时；必须连续失败且
@@ -1647,6 +1659,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                                 if state is not None:
                                     emb.cursor = state[:3]
                                     emb.mouse_any, emb.mouse_sgr = state[3], state[4]
+                                    emb.history_size = state[5]
                                 emb.generation += 1
                             store.dirty.set()
                         elif ui.focus == "pane":
@@ -1658,6 +1671,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                                         emb.cursor = state[:3]
                                         store.dirty.set()
                                     emb.mouse_any, emb.mouse_sgr = state[3], state[4]
+                                    emb.history_size = state[5]
                     interval = IDLE_FALLBACK if channel is not None else POLL_INTERVAL
             except Exception as exc:
                 # 抓帧线程绝不能死：任何未料异常记录后继续，线程一旦静默退出，
@@ -1686,7 +1700,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         emb.dead = False
         emb.grid = None
         emb.cursor = None
-        emb.copy_mode = False
+        emb.scroll_offset = 0  # 换会话从直播画面开始
         emb.session_key = skey
         emb.size = (0, 0)  # 触发下一帧重算尺寸并 resize 托管窗口
         ui.focus = "pane"
@@ -1816,10 +1830,21 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         if (sy, sx) > (ey, ex):
             sx, sy, ex, ey = ex, ey, sx, sy
         width = stdscr.getmaxyx()[1]
+        pane_x0 = EMBED_LEFT_BAND + 1
+        pane_visible = emb is not None and _embed_list_width(width, stdscr.getmaxyx()[0], emb) != width
         lines: list[str] = []
         for y in range(sy, ey + 1):
             x0 = sx if y == sy else 0
             x1 = ex if y == ey else width - 1
+            if pane_visible and emb.sel_zone is not None:
+                # 行级区域钳制：流式选择的中间整行也不能越过分栏线（用户实报
+                # 从 pane 拖向左时左栏标题被一起选入）
+                if emb.sel_zone == "pane":
+                    x0 = max(x0, pane_x0)
+                else:
+                    x1 = min(x1, pane_x0 - 1)
+            if x1 < x0:
+                continue
             cells = max(1, x1 - x0 + 1)
             try:
                 # instr 的 n 按**字节**截断（实测：n=8 读到「↓ 选」就停，「择」
@@ -1928,10 +1953,15 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                 )
             return False
         if wheel_up or wheel_down:
-            if not emb.copy_mode:
-                embed.copy_mode_enter(emb.name)
-                emb.copy_mode = True
-            embed.copy_mode_scroll(emb.name, up=wheel_up)
+            # 应用层滚动：offset 增减后经 capture-pane -S/-E 抓历史窗口渲染。
+            # 不能用 tmux copy-mode——它的滚动偏移只作用于 client 渲染层，
+            # capture-pane 抓的 pane buffer 永远停在 live 窗口（实测 scroll_position
+            # 变化对 capture 内容零影响），内嵌显示会完全不动（用户实报的根因）
+            if wheel_up:
+                emb.scroll_offset = min(emb.scroll_offset + PREVIEW_MOUSE_SCROLL_LINES,
+                                        emb.history_size)
+            else:
+                emb.scroll_offset = max(0, emb.scroll_offset - PREVIEW_MOUSE_SCROLL_LINES)
             emb.poke.set()
         return False
 
@@ -1939,11 +1969,9 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         """pane 聚焦时的按键总入口：除 C-\ 已在主循环拦截外，全部发往托管会话。"""
         if not emb.name or emb.dead:
             return
-        # 滚轮翻历史进入的 copy-mode：任何按键先退出再把键发给程序（tmux 原生
-        # copy-mode 会吃掉普通键，用户接着打字时字符会丢，体验上像「键盘失灵」）
-        if emb.copy_mode and ch != curses.KEY_MOUSE:
-            embed.copy_mode_cancel(emb.name)
-            emb.copy_mode = False
+        # 键盘输入一律回到直播画面（滚轮翻历史后接着打字时，输入落在最新内容上
+        # 才符合直觉）；C-\ 只是焦点移动不经这里，它会保留滚动位置供回来接着看
+        emb.scroll_offset = 0
         if 32 <= ch <= 255 and ch != 127:
             _drain_input(ch)
         elif ch == 27:
@@ -2057,10 +2085,8 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
         # "方向键转义序列的开头"，会把序列的第一个字节直接当成裸 ESC 返回，
         # 导致方向键失灵。所以退出键只留 q（pane 聚焦时 ESC 会透传给会话）。
         if ui.focus == "pane":
-            if ch == 28:  # C-\：焦点回列表，托管会话在后台 tmux 里继续跑
-                if emb.copy_mode:
-                    embed.copy_mode_cancel(emb.name)
-                    emb.copy_mode = False
+            if ch == 28:  # C-\：焦点回列表，托管会话在后台 tmux 里继续跑；
+                # 滚动位置保留，回车/下次聚焦时接着看
                 ui.focus = "list"
             elif ch == curses.KEY_MOUSE:
                 # 鼠标事件不置 had_key：拖拽/移动事件流仅转发或丢弃，若每个事件都
@@ -2163,7 +2189,7 @@ def _run(stdscr, store: SessionStore, embed_ok: bool) -> LaunchRequest | NewSess
                 emb.name = None
                 emb.grid = None
                 emb.cursor = None
-                emb.copy_mode = False
+                emb.scroll_offset = 0
                 emb.session_key = None
                 embed.close_channel()
             elif ch == curses.KEY_MOUSE:

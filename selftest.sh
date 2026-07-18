@@ -68,6 +68,10 @@ trap 'rm -f "$FAKEHOME/.claude/sessions/$$.json"' EXIT
 # 在会话创建后 ~100ms 内完成，真实 agent 查询时注入早已就位
 sleep 0.5
 python3 -c 'import os,sys,termios,tty,select;fd=sys.stdin.fileno();old=termios.tcgetattr(fd);tty.setraw(fd);os.write(1,b"\x1b]11;?\x07");r,_,_=select.select([fd],[],[],2.0);d=os.read(fd,64) if r else b"TIMEOUT";termios.tcsetattr(fd,termios.TCSADRAIN,old);print("BGRESP",repr(d))' 2>/dev/null || echo "BGRESP unavailable"
+# aaaa1111 预置 100 行历史（撑满回滚区 history_size>0）：滚轮翻历史的端到端
+# 测试依赖非空回滚，1s 心跳积累到测试点时还不够一屏（真实缺陷曾因此被掩盖）。
+# 必须在 FAKE 就绪标志之前输出，否则标志行被顶出屏幕、wait_for 永远等不到
+[[ "$SID" == "aaaa1111" ]] && seq 1 100
 echo "FAKE-CLAUDE-INTERACTIVE args=$*"
 # bbbb2222 模拟申请了鼠标的 TUI 程序（Claude Code 等真实 agent 的行为）：
 # 开 SGR 1006 鼠标上报，收到的输入原样记入 mouse.log 供滚轮直达断言
@@ -163,7 +167,7 @@ for i in $(seq 1 10); do
 done
 check "面板切换到第二个会话" '[[ "$STARTCMD" == *"--resume bbbb2222"* ]]'
 check "第一个会话仍在后台" 'ka_sessions | grep -qx "pickup-claude-aaaa1111"'
-check "重扫后第一个会话仍标注后台运行中" 'cap | grep -qF "后台运行中"'
+check "重扫后第一个会话仍标注运行中(托管)" 'cap | grep -qF "运行中(托管)"'
 cap > "$TMP/shots/6-second-session.txt"
 
 # ---------- 6b. 滚轮直达：程序申请了鼠标时，滚轮编码为 SGR 序列发给它 ----------
@@ -280,29 +284,32 @@ check "预览关闭后回到分栏" 'true'
 tmux -L "$OUTER" send-keys -t tui k   # 光标回第一个会话
 sleep 1
 
-# ---------- 8a. 回车聚焦 aaaa（未开鼠标）：滚轮 → copy-mode 回滚 ----------
+# ---------- 8a. 回车聚焦 aaaa（未开鼠标）：滚轮 → 应用层滚动翻历史 ----------
 tmux -L "$OUTER" send-keys -t tui Enter
 wait_for "TICK-" 15 || exit 1
 tmux -L "$OUTER" send-keys -t tui "backmark" Enter   # 新标记确认接回 aaaa 且按键通路正常
 wait_for "ECHO: backmark" 8 || exit 1
 sleep 2  # 等 pane_state 刷新 mouse_any=0
 tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<64;60;5M')"   # pane 内滚轮上
-sleep 2
-INMODE=$(tmux -L pickup-keepalive display-message -p -t pickup-claude-aaaa1111 '#{pane_in_mode}' 2>/dev/null)
-check "滚轮上进入 copy-mode 回滚浏览（pane_in_mode=$INMODE）" '[[ "$INMODE" == "1" ]]'
-# 渲染验证：pickup 画面必须真的显示回滚位置，不是只进了模式而视图没动
-T_LIVE=$(capl pickup-claude-aaaa1111 | grep -oE "TICK-[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
+sleep 1
 tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<64;60;5M')"   # 再滚一格（累计 6 行）
 sleep 1.5
+T_LIVE=$(capl pickup-claude-aaaa1111 | grep -oE "TICK-[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
 T_VIEW=$(cap | grep -oE "TICK-[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
 check "滚轮后 pickup 渲染出回滚视图（画面 TICK-$T_VIEW 早于会话最新 TICK-$T_LIVE）" '[[ -n "$T_VIEW" && -n "$T_LIVE" && "$T_VIEW" -lt "$T_LIVE" ]]'
+INMODE=$(tmux -L pickup-keepalive display-message -p -t pickup-claude-aaaa1111 '#{pane_in_mode}' 2>/dev/null)
+check "应用层滚动不进 copy-mode（pane_in_mode=$INMODE，应为 0）" '[[ "$INMODE" == "0" ]]'
+check "面板提示行显示回滚状态" 'cap | grep -qF "回滚"'
 tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<65;60;5M')"   # pane 内滚轮下
 sleep 1
-tmux -L "$OUTER" send-keys -t tui "wmark" Enter                      # 普通键：先退 copy-mode 再透传
+tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<65;60;5M')"   # 再滚到底（回直播）
+sleep 1
+tmux -L "$OUTER" send-keys -t tui "wmark" Enter                      # 普通键：回直播并透传
 wait_for "ECHO: wmark" 8 || exit 1
-INMODE2=$(tmux -L pickup-keepalive display-message -p -t pickup-claude-aaaa1111 '#{pane_in_mode}' 2>/dev/null)
-check "按键自动退出 copy-mode 且到达会话（pane_in_mode=$INMODE2）" '[[ "$INMODE2" == "0" ]]'
-cap > "$TMP/shots/8a-wheel-copymode.txt"
+T_VIEW2=$(cap | grep -oE "TICK-[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
+T_LIVE2=$(capl pickup-claude-aaaa1111 | grep -oE "TICK-[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
+check "按键后画面回到直播（TICK-$T_VIEW2 追平 TICK-$T_LIVE2 附近）" '[[ -n "$T_VIEW2" && "$T_VIEW2" -ge "$((T_LIVE2 - 2))" ]]'
+cap > "$TMP/shots/8a-wheel-scroll.txt"
 
 # ---------- 8b. 光标锚定：pane 聚焦时外层光标落在面板内（IME 预览跟随处） ----------
 CUR=$(tmux -L "$OUTER" display-message -p -t tui '#{cursor_x} #{cursor_y}' 2>/dev/null)
@@ -393,8 +400,8 @@ check "q 退出后第二个会话仍在保活" 'ka_sessions | grep -qx "pickup-c
 # ---------- 11. 重开 pickup，回车接回存活会话（pid 祖先链 annotate 路径） ----------
 tmux -L "$OUTER" send-keys -t tui "env $TUIENV python3 pickup.py --limit 5" Enter
 wait_for "自测标题B" 20 || exit 1
-wait_for "后台运行中" 15 || exit 1
-check "重开后状态列显示后台运行中" 'true'
+wait_for "运行中(托管)" 15 || exit 1
+check "重开后状态列显示运行中(托管)" 'true'
 T_BEFORE=$(capl pickup-claude-bbbb2222 | grep -oE "TICK-[0-9]+" | tail -1)
 tmux -L "$OUTER" send-keys -t tui j
 sleep 1

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import titlegen
 from models import session_key
@@ -288,13 +289,16 @@ def generate_titles_batch(sessions: list[dict], generator: "titlegen.TitleGenera
     return {}
 
 
-_BATCH_SIZE = 5  # 每次 claude -p 调用最多处理的会话数，超出则拆批串行执行
+_BATCH_SIZE = 5  # 每次模型调用处理 5 条会话，控制单条提示词体量。
+_MAX_PARALLEL_BATCHES = 5  # 最多同时运行 5 批，即至多并行补全 25 条标题。
 
 
 def refresh_titles(sessions: list[dict], cache: dict, generator: "titlegen.TitleGenerator | None" = None) -> dict[str, str]:
     """对一批待生成的会话批量生成标题,写回缓存,返回 {会话键: title} 增量。
 
-    内部按 _BATCH_SIZE 拆批串行,避免单次调用超时。
+    内部按 _BATCH_SIZE 拆批，并以最多 _MAX_PARALLEL_BATCHES 批并行生成。
+    例如 25 条待生成会话会启动 5 个并行任务，每个任务处理 5 条；超过
+    25 条时，完成的任务会继续领取下一批，避免同时启动过多模型进程。
     generator 为 None 时按环境自动选择;本机没有任何可用 CLI 时返回空增量。
     """
     if not sessions:
@@ -306,21 +310,24 @@ def refresh_titles(sessions: list[dict], cache: dict, generator: "titlegen.Title
 
     merged: dict[str, str] = {}
 
-    for i in range(0, len(sessions), _BATCH_SIZE):
-        chunk = sessions[i: i + _BATCH_SIZE]
-        raw = generate_titles_batch(chunk, generator)
-        chunk_updated = False
-        for s in chunk:
-            key = session_key(s)
-            title = _normalize_title(raw.get(key) or raw.get(s["id"]))
-            if title and not _is_low_value_title(title) and not _is_machine_slug(title):
-                merged[key] = title
-                cache[key] = {"fp": _fingerprint(s), "title": title}
-                chunk_updated = True
-        # 每批完成立即落盘：后台进程逐批生成时，TUI 轮询能尽早读到新标题，
-        # 而不是等整批全部跑完才一次性可见。
-        if chunk_updated:
-            save_cache(cache)
+    chunks = [sessions[i: i + _BATCH_SIZE] for i in range(0, len(sessions), _BATCH_SIZE)]
+    with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_BATCHES, len(chunks))) as pool:
+        futures = {pool.submit(generate_titles_batch, chunk, generator): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            chunk = futures[future]
+            raw = future.result()
+            chunk_updated = False
+            for s in chunk:
+                key = session_key(s)
+                title = _normalize_title(raw.get(key) or raw.get(s["id"]))
+                if title and not _is_low_value_title(title) and not _is_machine_slug(title):
+                    merged[key] = title
+                    cache[key] = {"fp": _fingerprint(s), "title": title}
+                    chunk_updated = True
+            # 每批完成立即落盘：后台任务并行生成时，TUI 轮询能尽早读到新标题，
+            # 而不是等所有批次结束才一次性可见。缓存仍只在当前线程写入，避免竞争。
+            if chunk_updated:
+                save_cache(cache)
 
     return merged
 

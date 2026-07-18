@@ -145,11 +145,14 @@ class SessionIoTests(unittest.TestCase):
         self.assertEqual(calls[1][-1], "sc-claude-1")
 
     def test_pane_state_parses_formats(self):
-        # (光标 x, 光标 y, 光标可见, 程序申请鼠标, SGR 鼠标模式)
+        # (光标 x, 光标 y, 光标可见, 程序申请鼠标, SGR 鼠标模式, 回滚行数)
+        with mock.patch.object(embed.subprocess, "check_output", return_value=b"12|7|1|1|1|234\n"):
+            self.assertEqual(embed.pane_state("s"), (12, 7, True, True, True, 234))
+        with mock.patch.object(embed.subprocess, "check_output", return_value=b"0|0|0|0|0|0\n"):
+            self.assertEqual(embed.pane_state("s"), (0, 0, False, False, False, 0))
+        # 旧版 5 段输出（解析失败兜底 None，不崩）
         with mock.patch.object(embed.subprocess, "check_output", return_value=b"12|7|1|1|1\n"):
-            self.assertEqual(embed.pane_state("s"), (12, 7, True, True, True))
-        with mock.patch.object(embed.subprocess, "check_output", return_value=b"0|0|0|0|0\n"):
-            self.assertEqual(embed.pane_state("s"), (0, 0, False, False, False))
+            self.assertIsNone(embed.pane_state("s"))
 
     def test_pane_state_none_on_failure(self):
         with mock.patch.object(embed.subprocess, "check_output",
@@ -194,28 +197,34 @@ class ControlModeTests(unittest.TestCase):
                                side_effect=FileNotFoundError()):
             self.assertFalse(embed.supports_theme_report())
 
-    def test_copy_mode_primitives_fork_without_channel(self):
-        calls = []
+    def test_capture_scroll_offset_inserts_range_flags(self):
+        captured = {}
 
-        def run_side_effect(argv, **_kwargs):
-            calls.append(argv)
-            return subprocess.CompletedProcess(args=argv, returncode=0)
+        def check_output_side_effect(argv, **kwargs):
+            captured["argv"] = argv
+            return b"screen text"
 
-        # 确保没有活动通道，全部走外部 fork 路径
-        with mock.patch.object(embed, "_channel", None), \
-                mock.patch.object(embed.subprocess, "run", side_effect=run_side_effect):
-            embed.copy_mode_enter("sc-claude-1")
-            embed.copy_mode_scroll("sc-claude-1", up=True, lines=3)
-            embed.copy_mode_scroll("sc-claude-1", up=False)
-            embed.copy_mode_cancel("sc-claude-1")
-        self.assertEqual(calls[0][3:], ["copy-mode", "-e", "-t", "sc-claude-1"])
-        # -t 必须在 copy-mode 命令名之前：`-X scroll-up -t x` 的 -t 会被当成
-        # 第二个 copy-mode 命令而静默失效（真 tmux 实测确认）
-        self.assertEqual(calls[1][3:],
-                         ["send", "-X", "-t", "sc-claude-1", "-N", "3", "scroll-up"])
-        self.assertEqual(calls[2][3:],
-                         ["send", "-X", "-t", "sc-claude-1", "-N", "3", "scroll-down"])
-        self.assertEqual(calls[3][3:], ["send", "-X", "-t", "sc-claude-1", "cancel"])
+        with mock.patch.object(embed.subprocess, "check_output",
+                               side_effect=check_output_side_effect):
+            # 应用层滚动：offset>0 时抓「live 窗口上移 offset 行」的历史窗口，
+            # 公式 -S -offset -E (h-1-offset)（真 tmux 实测钉死）；
+            # copy-mode 滚动对 capture 不可见（实测），不能用
+            self.assertEqual(embed.capture("s", scroll_offset=10, pane_height=40),
+                             "screen text")
+        argv = captured["argv"]
+        self.assertEqual(argv[4:8], ["-S", "-10", "-E", "29"])
+
+    def test_capture_live_without_range_flags(self):
+        captured = {}
+
+        def check_output_side_effect(argv, **kwargs):
+            captured["argv"] = argv
+            return b"x"
+
+        with mock.patch.object(embed.subprocess, "check_output",
+                               side_effect=check_output_side_effect):
+            embed.capture("s")
+        self.assertNotIn("-S", captured["argv"])
 
 
 class TranslateKeyTests(unittest.TestCase):
@@ -421,26 +430,26 @@ class ControlChannelIntegrationTests(unittest.TestCase):
         embed.send_key(self.SESSION, "Enter")
         self.assertTrue(fired.wait(4.0), "%output 事件应在 pane 产生输出后触发")
 
-    def test_copy_mode_roundtrip(self):
-        embed.open_channel(self.SESSION)
-        embed.copy_mode_enter(self.SESSION)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if (embed.pane_state(self.SESSION) or (0, 0, False, False, False)) and self._in_mode():
-                break
-            time.sleep(0.1)
-        self.assertTrue(self._in_mode(), "copy_mode_enter 后 pane 应处于 copy-mode")
-        embed.copy_mode_cancel(self.SESSION)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and self._in_mode():
-            time.sleep(0.1)
-        self.assertFalse(self._in_mode(), "copy_mode_cancel 后 pane 应退出 copy-mode")
+    def test_capture_scroll_offset_reads_history(self):
+        """应用层滚动的真 tmux 验证：静态会话里 offset 抓到的历史窗口内容上移。
 
-    def _in_mode(self) -> bool:
-        out = subprocess.check_output(
-            ["tmux", "-L", self.SOCKET, "display-message", "-p", "-t", self.SESSION,
-             "#{pane_in_mode}"], timeout=2).decode().strip()
-        return out == "1"
+        copy-mode 滚动对 capture 不可见（scroll_position 变但 pane buffer 不变），
+        内嵌滚动必须走 capture-pane -S/-E 历史窗口——本测试钉死这条路径。"""
+        subprocess.run(["tmux", "-L", self.SOCKET, "kill-session", "-t", self.SESSION],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "-L", self.SOCKET, "new-session", "-d", "-s", self.SESSION,
+                        "-x", "60", "-y", "20", "seq 1 100; sleep 60"],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.2)
+        live = embed.capture(self.SESSION)
+        self.assertIsNotNone(live)
+        self.assertIn("100", live)
+        back = embed.capture(self.SESSION, scroll_offset=30, pane_height=20)
+        self.assertIsNotNone(back)
+        # 新公式窗口 = live(82..100) 上移 30 = 52..71
+        self.assertIn("60", back, f"上滚 30 行应看到 52..71 区间内容：{back!r}")
+        self.assertNotIn("100", back)
+        self.assertNotIn("95", back, f"窗口上界不得超过 71：{back!r}")
 
     def test_resize_via_channel(self):
         embed.open_channel(self.SESSION)

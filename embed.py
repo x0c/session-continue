@@ -112,35 +112,45 @@ def is_alive(name: str) -> bool:
         return False
 
 
-def capture(name: str) -> str | None:
-    """抓取会话当前画面（带 SGR 颜色序列）；会话不存在或抓取失败返回 None。"""
+def capture(name: str, scroll_offset: int = 0, pane_height: int = 0) -> str | None:
+    """抓取会话画面（带 SGR 颜色序列）；会话不存在或抓取失败返回 None。
+
+    scroll_offset > 0 时抓「从 live 窗口向上回滚 offset 行」的历史窗口——
+    应用层滚动必须用这种方式：copy-mode 的滚动偏移只作用于 client 渲染层，
+    capture-pane 抓的 pane buffer 永远停在 live 窗口（实测 scroll_position 变化
+    对 capture 内容零影响，这是内嵌滚轮最初不可见的根因）。
+    """
+    argv = [*keepalive._BASE_ARGV, "capture-pane", "-p", "-e", "-t", name]
+    if scroll_offset > 0 and pane_height > 0:
+        # 实测钉死的窗口公式：-S -offset -E (h-1-offset) = live 窗口精确上移 offset 行
+        # （seq 1 100 会话里 -S -6 -E 13 得 76..95，相对 live 82..101 正好上移 6）
+        argv[4:4] = ["-S", f"-{scroll_offset}", "-E", str(pane_height - 1 - scroll_offset)]
     try:
-        out = subprocess.check_output(
-            [*keepalive._BASE_ARGV, "capture-pane", "-p", "-e", "-t", name],
-            stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT,
-        )
+        out = subprocess.check_output(argv, stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     return out.decode("utf-8", errors="replace")
 
 
-def pane_state(name: str) -> tuple[int, int, bool, bool, bool] | None:
-    """一次查询拿全 pane 交互状态：(光标 x, 光标 y, 光标可见, 程序申请了鼠标, SGR 鼠标模式)。
+def pane_state(name: str) -> tuple[int, int, bool, bool, bool, int] | None:
+    """一次查询拿全 pane 交互状态：(光标 x, 光标 y, 光标可见, 程序申请了鼠标,
+    SGR 鼠标模式, 回滚行数 history_size)。
 
     合并进单个 display-message 调用——capture 循环每轮都要光标位置，滚轮转发要鼠标
-    模式，分开查每轮就是两次 fork。查询失败返回 None。
+    模式，应用层滚动的上限判定要回滚量，分开查每轮就是三次 fork。查询失败返回 None。
     """
     try:
         out = subprocess.check_output(
             [*keepalive._BASE_ARGV, "display-message", "-p", "-t", name,
-             "#{cursor_x}|#{cursor_y}|#{cursor_flag}|#{mouse_any_flag}|#{mouse_sgr_flag}"],
+             "#{cursor_x}|#{cursor_y}|#{cursor_flag}|#{mouse_any_flag}|#{mouse_sgr_flag}"
+             "|#{history_size}"],
             stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT,
         ).decode().strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     try:
-        xs, ys, fs, ma, ms = out.split("|")
-        return int(xs), int(ys), fs == "1", ma == "1", ms == "1"
+        xs, ys, fs, ma, ms, hs = out.split("|")
+        return int(xs), int(ys), fs == "1", ma == "1", ms == "1", int(hs)
     except ValueError:
         return None
 
@@ -392,29 +402,6 @@ def _modify(name: str, *args: str) -> None:
         )
     except (OSError, subprocess.TimeoutExpired):
         pass
-
-
-# ---- copy-mode 原语：滚轮驱动回滚浏览 ----
-
-def copy_mode_enter(name: str) -> None:
-    """进入 copy-mode（-e：滚回底部时自动退出）。"""
-    _modify(name, "copy-mode", "-e", "-t", name)
-
-
-def copy_mode_scroll(name: str, up: bool, lines: int = 3) -> None:
-    """copy-mode 中滚动指定行数；到底后 -e 模式自动退出（本地状态可能滞后，
-    调用方对多发 scroll/cancel 保持幂等容忍）。
-
-    注意 -t 必须放在 copy-mode 命令名之前：`send -X scroll-up -t x` 的 -t 会被
-    当成第二个 copy-mode 命令而静默失效（真 tmux 实测确认）。
-    """
-    _modify(name, "send", "-X", "-t", name, "-N", str(lines),
-            "scroll-up" if up else "scroll-down")
-
-
-def copy_mode_cancel(name: str) -> None:
-    """退出 copy-mode；不在 copy-mode 时命令报错被静默吞掉，调用方无需先查状态。"""
-    _modify(name, "send", "-X", "-t", name, "cancel")
 
 
 def sgr_mouse_sequence(button: int, x: int, y: int) -> str:

@@ -114,8 +114,8 @@ switch between them without losing any of them:
 - `Ctrl-\` moves keyboard focus back to the session list (same muscle memory as detaching).
 - Scroll wheel works inside the pane: if the agent requested mouse input, wheel events are
   forwarded to it as SGR mouse sequences; otherwise the wheel browses the pane's scrollback
-  (tmux copy-mode) and any keystroke drops you back to the live view. Wheel over the left
-  sidebar scrolls the session list. Mouse events never trigger a full redraw, so
+  (rendered from tmux history) and any keystroke drops you back to the live view. Wheel over
+  the left sidebar scrolls the session list. Mouse events never trigger a full redraw, so
   drag storms can't freeze the UI.
 - Drag to select anywhere — pickup implements its own selection: drag with the left button
   and the highlighted text is copied straight to your clipboard (OSC 52, works over SSH),
