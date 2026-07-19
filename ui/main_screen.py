@@ -1,7 +1,7 @@
 """主屏：会话列表 + 右栏内嵌面板，取代旧版 pickup.py 里的 _run 主循环。
 
-按键语义（/ 聚焦项目搜索 / p 固定 / a 高级操作 / n 新建 / e 全屏 /
-x 关闭后台 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
+按键语义（/ 聚焦项目搜索 / a 高级操作 / n 新建 / e 全屏 /
+q 结束会话 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
 展示完整对话预览（不再使用 Space 全屏预览页）。侧边栏顶部为项目搜索框，
 大小写无关模糊匹配项目名与会话标题。
 """
@@ -35,11 +35,10 @@ LIST_PANE_WIDTH = 39  # 分栏时左栏固定宽度，对应旧版 EMBED_LEFT_BA
 
 class MainScreen(Screen):
     BINDINGS = [
-        Binding("p", "pin_pane", "固定"),
         Binding("a", "handoff", "高级操作"),
         Binding("n", "new_session", "新建"),
         Binding("e", "fullscreen", "全屏"),
-        Binding("x", "kill_keepalive", "关闭后台", show=False),
+        Binding("q", "kill_keepalive", "结束会话"),
         Binding("c", "close_pane", "关闭面板", show=False),
         Binding("m", "toggle_mouse", "鼠标", show=False),
         Binding("f12", "save_screenshot", "截图", show=False),
@@ -224,8 +223,6 @@ class MainScreen(Screen):
         # 面板已持有键盘焦点时不跟随列表：直启会话、或用户已明确 Enter 聚焦某个
         # 托管会话，都不应被列表初次挂载/后台重扫触发的 highlight 事件覆盖画面。
         if pane.has_focus:
-            return
-        if self.nav.pinned_key is not None:
             return
         if session_list.is_new_session_selected():
             pane.show_detail(lambda: Text("新建会话：选择项目与运行时"))
@@ -527,21 +524,6 @@ class MainScreen(Screen):
             event.stop()
             search.focus()
 
-    def action_pin_pane(self) -> None:
-        import pickup
-
-        session_list = self.query_one(SessionListView)
-        session = session_list.selected_session()
-        if session is None:
-            self.app.bell()
-            return
-        key = pickup.session_key(session)
-        if self.nav.pinned_key == key:
-            self.nav.pinned_key = None
-            self._follow_current_selection()
-        else:
-            self.nav.pinned_key = key
-
     @work
     async def action_handoff(self) -> None:
         session_list = self.query_one(SessionListView)
@@ -583,7 +565,7 @@ class MainScreen(Screen):
             return
         title = self.store.get_title(session)
         confirmed = await self.app.push_screen_wait(
-            ConfirmModal(f"关闭后台进程「{title}」？未保存的当前任务进度将丢失")
+            ConfirmModal(f"结束会话「{title}」？未保存的当前任务进度将丢失")
         )
         if not confirmed:
             return

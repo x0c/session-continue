@@ -25,10 +25,12 @@ class PickupApp(App):
     # 这条限制，保留选择能力。
     CSS = """
     #project-search {
-        height: 1;
+        /* 侧边栏项约定：总高度含末行间隔（正文 1 + 间隔 1），间隔算进本项命中区。
+           禁止用 ListItem/兄弟节点的 margin 做分隔——点在空隙上不会落到本项。 */
+        height: 2;
         margin: 0;
         border: none;
-        padding: 0 1;
+        padding: 0 1 1 1;
         color: white;
         background: $primary-darken-2;
     }

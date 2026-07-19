@@ -405,6 +405,7 @@ class SidebarVisualLayoutTests(unittest.IsolatedAsyncioTestCase):
             cards = list(app.screen.query(SessionCard))
 
             self.assertEqual(search.styles.color, Color.parse("white"))
+            self.assertEqual(search.region.height, 2)  # 正文 1 + 末行间隔 1
             self.assertGreaterEqual(len(items), 3)
             # 分隔空行画在卡片自身内，两项 region 紧挨、无外边距空隙
             self.assertEqual(items[1].region.y - items[0].region.bottom, 0)
@@ -414,6 +415,8 @@ class SidebarVisualLayoutTests(unittest.IsolatedAsyncioTestCase):
             from ui.session_list import NewSessionCard
             new_card = app.screen.query_one(NewSessionCard)
             self.assertEqual(new_card.region.height, 2)
+            # 搜索框底边紧贴新建项顶边（搜索的末行间隔已含在 height: 2 内）
+            self.assertEqual(items[0].region.y - search.region.bottom, 0)
 
 
 class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):

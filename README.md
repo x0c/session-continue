@@ -119,8 +119,6 @@ around when their content updates; only genuinely new sessions appear, always pr
   return keyboard control to browsing.
 - Type `\\` quickly while operating a pane to return keyboard focus to the list. A single `\`
   is passed through to the agent after a short delay, and `Ctrl-\` remains supported for compatibility.
-- `p` pins the right pane to the current session so you can browse other history while monitoring it;
-  press `p` again to restore follow mode. `f` cycles the optional project filter.
 - The wheel follows the natural direction: up moves into older output and down returns toward the
   live view. At the live edge, agents that request wheel input receive it directly; otherwise pickup
   browses tmux history. Use `e` for full-screen mouse interaction. Wheel over the left sidebar scrolls
@@ -142,8 +140,8 @@ around when their content updates; only genuinely new sessions appear, always pr
   `Shift`/`Option`-drag, which bypasses mouse reporting).
 - `c` closes the split and returns to the full-width list; hosted sessions keep running in the
   background and can be reopened with `Enter`.
-- `x` on a backgrounded session still kills it (with confirmation); quitting `pickup` with `Esc`
-  never kills anything — everything stays alive in tmux.
+- `q` on a backgrounded / in-progress session kills it (with confirmation); quitting `pickup` with
+  `Esc` never kills anything — everything stays alive in tmux.
 
 ## Direct Launch
 
@@ -231,12 +229,11 @@ agent workflows.
 | --- | --- |
 | `Up` / `Down` / `j` / `k` | Move selection |
 | `/` | Focus the project search box (case-insensitive fuzzy match on project name and session title) |
-| `p` | Pin or unpin the right-hand detail pane |
 | `Home` / `End` | Jump in the right-pane conversation preview |
 | `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background); on the pinned first row `＋ 新建会话`, start the new-session flow instead |
 | `a` | Open advanced handoff actions |
 | `n` | New blank session in the current project with the current runtime (no prompts) |
-| `x` | Close a backgrounded (keep-alive) session, with confirmation |
+| `q` | End a backgrounded / in-progress (keep-alive) session, with confirmation |
 | `Esc` | Clear search / close dialog, or quit |
 
 `pickup` waits briefly for an escape sequence to complete, so `Esc` can close the current
