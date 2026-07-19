@@ -51,7 +51,7 @@
 
 - `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力
 - `docs/TERMINAL_UI_KNOWLEDGE_BASE.md`：终端界面、侧边栏筛选/新建会话、对话预览、高级操作弹窗、Footer 按键、多语言文案、截图验收
-- `docs/EMBEDDED_TERMINAL_KNOWLEDGE_BASE.md`：内嵌实时终端、右栏托管画面、抓帧与按键转发、全屏/结束会话、连接中卡死、控制通道
+- `docs/EMBEDDED_TERMINAL_KNOWLEDGE_BASE.md`：内嵌实时终端、右栏托管画面、抓帧与按键转发、焦点边界/结束会话、连接中卡死、控制通道
 - `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md`：会话扫描、对话预览数据、判活、扫描性能、各助手历史格式
 - `docs/CROSS_RUNTIME_HANDOFF_KNOWLEDGE_BASE.md`：跨助手接力、高级操作、原生恢复、空白新建、启动计划与接力提示词
 - `docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md`：新增一种 AI 助手、补扫描/预览/恢复/接力/空白新建与注册验收

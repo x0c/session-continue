@@ -83,10 +83,16 @@ MIN_CAPTURE_INTERVAL = 0.04  # 事件驱动下的最小抓帧间隔，避免 %ou
 # 5Hz 缓存复用后光标对 IME 锚定的最多滞后 200ms，无感知；画面文本本身仍按
 # %output 事件全速抓帧，输入回显帧率不受影响。
 STATE_POLL_INTERVAL = 0.2
+# 窗口拖动时 Resize 会连续到达；tmux resize-window + 唤醒抓帧必须防抖，
+# 等尺寸停稳再做一次（与 PickupApp 整屏重绘防抖同量级，避免拖动期狂刷）。
+_RESIZE_TMUX_DEBOUNCE = 0.12
 
 
 class EmbedPane(Widget):
-    """右栏：托管 tmux 会话的实时画面。聚焦时键盘/粘贴/滚轮直接转发给会话。
+    """右栏：托管 tmux 会话的实时画面。
+
+    键盘/粘贴只在本面板持有焦点时转发（需鼠标点到右栏才聚焦）；滚轮按鼠标所在位置
+    处理，与焦点无关——列表聚焦时把鼠标移到右栏仍可滚预览或会话历史。
 
     刻意不设 ALLOW_SELECT=False：保留 Textual 内置的鼠标拖拽选词 + Ctrl+C 复制
     （见 ui/app.py 的 PickupApp 说明）。本类自己只接管滚轮/按键/粘贴/resize，
@@ -152,6 +158,8 @@ class EmbedPane(Widget):
         # 旧帧缓存却已经失效；版本号能让这种快速往返也强制重抓，并拦住旧回调回写。
         self._capture_generation = 0
         self._real_cursor_shown = False  # 外层真实硬件光标当前是否被我们显式打开（见 _set_real_cursor）
+        self._resize_tmux_timer = None  # 防抖：拖动停稳后再 resize-window + 抓帧
+        self._pending_tmux_size: tuple[int, int] | None = None
 
     # ---- 生命周期 ----
 
@@ -426,13 +434,18 @@ class EmbedPane(Widget):
     # ---- 渲染（Line API：render_line 是真正的绘制入口，见类 docstring）----
 
     def render_line(self, y: int) -> Strip:
+        width = max(1, self.size.width)
         if self.session_name is None or self.dead or self._grid is None:
             strips = self._ensure_static_strips()
-            strip = strips[y] if 0 <= y < len(strips) else Strip.blank(self.size.width)
+            strip = strips[y] if 0 <= y < len(strips) else Strip.blank(width)
         elif self._strips is not None and 0 <= y < len(self._strips):
             strip = self._strips[y]
         else:
-            strip = Strip.blank(self.size.width)
+            strip = Strip.blank(width)
+        # 窗口刚变宽/变窄、新抓帧尚未到达时，缓存行可能仍是旧宽度；按当前面板
+        # 宽度裁切或补空白，避免右缘残留旧画面字符（与整屏重绘防抖配合）。
+        if strip.cell_length != width:
+            strip = strip.adjust_cell_length(width)
         # 自定义 Line API 不会像 Textual 默认 Rich 渲染路径那样自动附加文本
         # 坐标；缺少 offset 元数据时，拖选只能把整个 Widget 识别为全选。
         strip = strip.apply_offsets(0, y)
@@ -800,9 +813,34 @@ class EmbedPane(Widget):
         self._poke.set()  # 唤醒后台线程按新 offset 立即补抓一帧，主线程不等待
 
     def _on_resize(self, event: events.Resize) -> None:
-        name = self.session_name
-        if name and not self.dead:
-            embed.resize(name, max(1, event.size.width), max(1, event.size.height))
+        # 静态详情按尺寸缓存；尺寸变了必须失效。实时画面行宽由 render_line 按当前
+        # 面板宽度裁补。tmux resize-window + 抓帧走防抖：拖动过程中只记目标尺寸，
+        # 停稳后再改托管窗并补抓，避免连续 Resize 狂刷 tmux。
         self.invalidate_detail()
+        self._update_app_cursor()
+        # 不在这里 self.refresh()：Textual 布局阶段的 _size_updated 已把本控件标脏；
+        # 拖动期多余 refresh 只会加重局部重绘。昂贵的 tmux 路径走下面的防抖。
+        name = self.session_name
+        if not name or self.dead:
+            return
+        self._pending_tmux_size = (
+            max(1, event.size.width),
+            max(1, event.size.height),
+        )
+        if self._resize_tmux_timer is not None:
+            self._resize_tmux_timer.stop()
+        self._resize_tmux_timer = self.set_timer(
+            _RESIZE_TMUX_DEBOUNCE,
+            self._apply_pending_tmux_resize,
+        )
+
+    def _apply_pending_tmux_resize(self) -> None:
+        """防抖到期：把托管会话窗口调到最后一次目标尺寸并唤醒抓帧。"""
+        self._resize_tmux_timer = None
+        size = self._pending_tmux_size
+        self._pending_tmux_size = None
+        name = self.session_name
+        if not name or self.dead or size is None:
+            return
+        embed.resize(name, size[0], size[1])
         self._poke.set()
-        self._update_app_cursor()  # widget 在屏幕上的绝对位置可能变了，重新锚定

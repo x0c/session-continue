@@ -7,9 +7,15 @@
 
 from __future__ import annotations
 
-from textual.app import App
+from textual.app import App, ScreenError
+from textual.timer import Timer
 
 from ui.main_screen import MainScreen
+
+# 窗口拖动时 SIGWINCH 会连续触发。布局跟随 Textual 自带的 ~120fps 合并即可；
+# 整屏全量重绘（用来清掉终端 reflow 残影）必须另行防抖，等尺寸停稳再做一次，
+# 否则拖动过程中会疯狂全量刷新、卡顿闪烁。
+_RESIZE_FULL_REPAINT_DEBOUNCE = 0.12  # 秒；最后一次尺寸变化后再等这么久才整屏重绘
 
 
 class PickupApp(App):
@@ -45,6 +51,7 @@ class PickupApp(App):
         self._embed_ok = embed_ok
         self._direct = direct
         self._osc_report = osc_report
+        self._resize_full_repaint_timer: Timer | None = None
 
     def _on_terminal_supports_synchronized_output(self, message) -> None:
         # Textual 默认在终端支持时把每帧包进同步输出（`\e[?2026h…l`，原子提交整帧防撕裂）。
@@ -57,6 +64,38 @@ class PickupApp(App):
         if os.environ.get("PICKUP_DISABLE_SYNC_OUTPUT") == "1":
             return
         super()._on_terminal_supports_synchronized_output(message)
+
+    def _check_resize(self) -> None:
+        """布局立即跟随；整屏清残影防抖后再做。
+
+        Textual 默认只差分刷新布局变化的区域。iTerm2 等终端会在应用重绘前自行
+        reflow 备用屏幕，差分重绘会留下残影/错位。必须整屏全量重绘才能清干净，
+        但不能在拖动过程中每次尺寸变化都全量刷——这里只重置防抖计时器，等
+        `_RESIZE_FULL_REPAINT_DEBOUNCE` 内不再有新尺寸后再 `_force_full_repaint`。
+        """
+        super()._check_resize()
+        if self._resize_full_repaint_timer is not None:
+            self._resize_full_repaint_timer.stop()
+        self._resize_full_repaint_timer = self.set_timer(
+            _RESIZE_FULL_REPAINT_DEBOUNCE,
+            self._force_full_repaint,
+        )
+
+    def _force_full_repaint(self) -> None:
+        """尺寸停稳后：把当前屏整屏标脏，触发一次 compositor 全量重绘。"""
+        self._resize_full_repaint_timer = None
+        try:
+            screens = [self.screen, *self._background_screens]
+        except ScreenError:
+            return
+        for screen in screens:
+            compositor = getattr(screen, "_compositor", None)
+            if compositor is None:
+                continue
+            region = screen.size.region
+            if region:
+                compositor._dirty_regions.add(region)
+            screen.refresh()
 
     def on_mount(self) -> None:
         # pickup 自己的界面色也要跟随外层终端的深浅色，不能只管注入托管 pane

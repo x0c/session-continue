@@ -113,18 +113,20 @@ around when their content updates; only genuinely new sessions appear, always pr
 
 - The first row is a pinned `+ New session` item (Chinese locale: `＋ 新建会话`) that never scrolls away: press
   `Enter` on it to pick a project directory and an agent runtime, and the blank session starts
-  hosted in the right-hand pane, ready for input. `n` does the same without prompts, using the
+  hosted in the right-hand pane. `n` does the same without prompts, using the
   current project filter (or the selected session's directory) and the current runtime.
-- `Enter` resumes the selected session in the right-hand pane, or gives keyboard focus to its
-  already-hosted live terminal. Moving the selection alone never starts an agent.
-- Click a session card to do the same thing as `Enter`; click an empty part of the left list to
-  return keyboard control to browsing.
-- Type `\\` quickly while operating a pane to return keyboard focus to the list. A single `\`
-  is passed through to the agent after a short delay, and `Ctrl-\` remains supported for compatibility.
-- The wheel follows the natural direction: up moves into older output and down returns toward the
-  live view. At the live edge, agents that request wheel input receive it directly; otherwise pickup
-  browses tmux history. Use `e` for full-screen mouse interaction. Wheel over the left sidebar scrolls
-  the session list.
+- `Enter` resumes the selected session in the right-hand pane (or reconnects an already-hosted
+  live terminal there). Keyboard focus stays on the sidebar so browsing shortcuts keep working;
+  click the right pane when you want to type into the agent. Moving the selection alone never
+  starts an agent.
+- Click a session card to do the same thing as `Enter`; click the right pane to interact with it,
+  and click back on the left list to return keyboard control to browsing.
+- While the right pane has focus, `Ctrl-\` returns keyboard focus to the list. Hosted sessions keep
+  running in the background.
+- The wheel follows where the mouse is, independent of keyboard focus: over the right pane it
+  scrolls conversation preview or live history; over the left sidebar it scrolls the session list.
+  At the live edge, agents that request wheel input receive it directly; otherwise pickup browses
+  tmux history.
 - Drag to select text in the embedded pane, then press `Ctrl+C` to copy it through OSC 52 (including
   over SSH when the terminal supports it).
 - `m` (in the list/sidebar) toggles mouse reporting off and on — turn it off when you want
@@ -136,10 +138,6 @@ around when their content updates; only genuinely new sessions appear, always pr
   terminal's background color at startup and feeds it to each hosted pane
   (`refresh-client -r`), so agents that query OSC 11 get the true value. Agents that were
   already running keep their earlier guess — restart them or set their theme manually once.
-- `e` takes over the full terminal the classic way (use it when you need a big screen, easy
-  text selection, or mouse clicking/dragging inside the agent TUI — only wheel scrolling can be
-  injected into an embedded pane; for selection use your terminal's modifier-drag, e.g.
-  `Shift`/`Option`-drag, which bypasses mouse reporting).
 - `c` closes the split and returns to the full-width list; hosted sessions keep running in the
   background and can be reopened with `Enter`.
 - `q` on a backgrounded / in-progress session ends it after a second `q` confirmation;
@@ -149,8 +147,8 @@ around when their content updates; only genuinely new sessions appear, always pr
 
 `pickup claude [args...]`, `pickup codex [args...]`, `pickup opencode [args...]`, and
 `pickup kimi [args...]`, and `pickup cursor [args...]` start a brand-new session
-directly. In a real terminal they open the same sidebar TUI with the new session already hosted in
-the right-hand pane, so the fresh agent is one `Esc` away from your full history; outside a real
+directly. In a real terminal they open the same sidebar TUI with the new session already hosted and
+focused in the right-hand pane, so you can type immediately; outside a real
 terminal (piped/scripted) or with `--no-keepalive` they take over the terminal the classic way
 instead. Everything after the runtime name is passed through unchanged to the
 underlying command; `pickup` only prepends the runtime's auto-approve flag
@@ -240,8 +238,8 @@ agent workflows.
 
 `pickup` waits briefly for an escape sequence to complete, so `Esc` can close the current
 view without breaking arrow keys.
-Inside an embedded session, `\\` returns to browsing without ending the process; `Ctrl-\` remains a
-compatibility shortcut (see [Keep-Alive](#keep-alive-survive-ssh-disconnects)).
+Click the right pane to type into a hosted agent; `Ctrl-\` returns keyboard focus to the sidebar
+without ending the process. Mouse wheel over either pane works regardless of which side has focus.
 
 ## Cross-Runtime Handoff
 

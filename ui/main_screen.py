@@ -1,8 +1,10 @@
 """主屏：左栏会话列表 + 右栏预览/内嵌终端（pickup 唯一界面）。
 
-按键语义（/ 聚焦项目搜索 / a 高级操作 / n 新建 / e 全屏 /
+按键语义（/ 聚焦项目搜索 / a 高级操作 / n 新建 /
 q 结束会话 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
-展示完整对话预览。侧边栏顶部为项目搜索框，大小写无关模糊匹配项目名与会话标题。
+展示完整对话预览。侧边栏选中或回车托管后，键盘焦点仍留在列表——只有鼠标点到右栏
+才与内嵌会话交互；右栏滚轮/预览翻页与焦点无关，鼠标在右栏上即可滚动。
+侧边栏顶部为项目搜索框，大小写无关模糊匹配项目名与会话标题。
 禁止再加第二套全屏预览或纯列表旧界面。
 """
 
@@ -40,7 +42,6 @@ LIST_PANE_WIDTH = 39  # 分栏时左栏固定宽度，对应旧版 EMBED_LEFT_BA
 _ACTION_I18N = {
     "handoff": "action.advanced",
     "new_session": "action.new",
-    "fullscreen": "action.fullscreen",
     "kill_keepalive": "action.kill_session",
     "close_pane": "action.close_pane",
     "save_screenshot": "action.screenshot",
@@ -57,7 +58,6 @@ def _main_bindings() -> list[Binding]:
     return [
         Binding("a", "handoff", t("action.advanced")),
         Binding("n", "new_session", t("action.new")),
-        Binding("e", "fullscreen", t("action.fullscreen")),
         Binding("q", "kill_keepalive", t("action.kill_session")),
         Binding("c", "close_pane", t("action.close_pane"), show=False),
         Binding("f12", "save_screenshot", t("action.screenshot"), show=False),
@@ -127,9 +127,9 @@ class MainScreen(Screen):
             self._await_initial_load()
         self.set_interval(CACHE_POLL_INTERVAL, self._poll_cache)
         if self.direct is not None:
-            # 直启子命令：焦点最终要落在内嵌面板上。SessionListView.focus() 走
-            # Textual 的 call_later 延迟生效，如果这里也调用，会在 _host_direct_launch
-            # 已经同步聚焦面板之后又把焦点抢回列表（真实 bug，靠真机 tmux 冒烟发现）。
+            # 直启子命令：焦点最终要落在内嵌面板上（用户就是来操作新会话的）。
+            # 不要先调 SessionListView.focus()——它走 call_later，会在托管完成后
+            # 把焦点抢回列表（真机冒烟回归过）。
             self._host_direct_launch()
         else:
             self.query_one(SessionListView).focus()
@@ -394,10 +394,10 @@ class MainScreen(Screen):
             request = pickup.LaunchRequest(current, request.target_runtime_id, request.title)
             existing = request.session.get("keepalive_name") if same_runtime else None
             if existing:
+                # 只挂接右栏画面，不抢键盘焦点——点右栏才与内嵌会话交互。
                 pane.focus_session(
                     str(existing), lambda s=request.session: self._render_detail(s),
                 )
-                self.set_focus(pane)
                 return
             if self._host_busy:
                 self.app.bell()
@@ -475,8 +475,8 @@ class MainScreen(Screen):
                     request.session["keepalive_name"] = name
                 current = marked or request.session
             fallback = lambda s=current: self._render_detail(s)
+        # 托管成功只更新右栏画面；键盘焦点留在侧边栏，点右栏才进入内嵌交互。
         pane.focus_session(name, fallback)
-        self.set_focus(pane)
         self.call_next(self._rebuild_list)
 
     def _host_direct_launch(self) -> None:
@@ -524,6 +524,7 @@ class MainScreen(Screen):
         self._host_busy = False
         pane = self.query_one(EmbedPane)
         pane.focus_session(name)
+        # 直启是「打开就操作」：焦点落到右栏。侧边栏点选/回车路径不抢焦点。
         self.set_focus(pane)
 
     def _focus_list(self) -> None:
@@ -650,16 +651,6 @@ class MainScreen(Screen):
             self.app.bell()
             return
         self.notify(t("notify.screenshot", path=path), title="pickup", timeout=4)
-
-    def action_fullscreen(self) -> None:
-        session_list = self.query_one(SessionListView)
-        session = session_list.selected_session()
-        if session is None:
-            self.app.bell()
-            return
-        import pickup
-        request = pickup.LaunchRequest(session, self.nav.source, self.store.get_title(session))
-        self.app.exit(result=request)
 
     def action_quit_app(self) -> None:
         # 搜索框聚焦时 Esc 先清空查询，再交回列表；列表上 Esc 才真正退出

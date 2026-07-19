@@ -148,6 +148,38 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(delay=0.2)
             self.assertEqual(app.theme, "textual-dark")
 
+    async def test_resize_full_repaint_is_debounced(self) -> None:
+        """连续缩放手势只在停稳后触发一次整屏全量重绘，不能每次尺寸变化都狂刷。"""
+        import ui.app as app_mod
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            calls: list[Size] = []
+            original = app._force_full_repaint
+
+            def _tracking_force() -> None:
+                calls.append(app.size)
+                original()
+
+            with mock.patch.object(app, "_force_full_repaint", side_effect=_tracking_force):
+                # 快速连续缩放：防抖计时器应被反复重置，到期前不应触发全量重绘
+                await pilot.resize_terminal(90, 28)
+                await pilot.pause(delay=0.02)
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause(delay=0.02)
+                await pilot.resize_terminal(70, 22)
+                await pilot.pause(delay=0.02)
+                self.assertEqual(calls, [], "拖动过程中不应触发整屏全量重绘")
+                # 停稳超过防抖窗口后应恰好一次，且尺寸为最后一次目标
+                await pilot.pause(delay=app_mod._RESIZE_FULL_REPAINT_DEBOUNCE + 0.05)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0], Size(70, 22))
+                # 全量路径：整屏区域应在 compositor 脏区（或刚被 refresh 消费后为空，
+                # 二者都可接受；关键是 _force_full_repaint 被调用且带最终尺寸）
+                self.assertIsNone(app._resize_full_repaint_timer)
+
     async def test_f12_saves_screenshot_under_cache(self) -> None:
         import observe
         import tempfile
@@ -712,21 +744,56 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             for card in others:
                 card.refresh.assert_not_called()
 
-    async def test_e_key_forces_fullscreen_even_when_embed_available(self) -> None:
-        """`e` 是「放弃分栏、全屏接管」的逃生舱：即使内嵌可用也必须直接退出应用。"""
+    async def test_enter_keeps_list_focus_until_pane_clicked(self) -> None:
+        """回车/点选只挂右栏画面，不把键盘焦点抢走；点右栏后才进入内嵌交互。"""
         store, registry = _make_store()
+        registry.build_launch_plan = lambda request: LaunchPlan(("claude",), None)
+        app = PickupApp(store, embed_ok=True)
+        with mock.patch("embed.host_session", return_value="pickup-claude-s0"):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(delay=0.2)
+                list_view = app.screen.query_one(SessionListView)
+                pane = app.screen.query_one(EmbedPane)
+                pane.focus_session = mock.Mock(wraps=pane.focus_session)
 
-        def fake_build_launch_plan(request):
-            return LaunchPlan(("claude",), None)
-        registry.build_launch_plan = fake_build_launch_plan
+                await pilot.press("down")
+                await pilot.press("enter")
+                await _wait_until(lambda: not app.screen._host_busy)
+                self.assertTrue(pane.focus_session.called)
+                self.assertTrue(list_view.has_focus)
+                self.assertFalse(pane.has_focus)
 
+                await pilot.click(pane)
+                await pilot.pause()
+                self.assertTrue(pane.has_focus)
+                self.assertFalse(list_view.has_focus)
+
+    async def test_right_pane_wheel_scrolls_while_list_focused(self) -> None:
+        """焦点在侧边栏时，鼠标在右栏滚轮仍应滚动静态预览（与焦点无关）。"""
+        store, registry = _make_store()
+        long_body = "\n".join(f"行{i} " + ("内容" * 20) for i in range(80))
+        registry.get("claude").load_conversation.return_value = [
+            pickup.ConversationMessage("user", long_body),
+            pickup.ConversationMessage("assistant", long_body),
+        ]
         app = PickupApp(store, embed_ok=True)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause(delay=0.2)
             await pilot.press("down")
-            await pilot.press("e")
+            await pilot.pause(delay=0.3)
+            list_view = app.screen.query_one(SessionListView)
+            pane = app.screen.query_one(EmbedPane)
+            await _wait_until(lambda: pane._is_detail_view() and "行0" in pane.render().plain)
+            self.assertTrue(list_view.has_focus)
+            self.assertFalse(pane.has_focus)
+            before = pane.detail_offset
+            # 滚轮处理不检查 has_focus；列表聚焦时直接投递也应能滚右栏预览。
+            pane._on_mouse_scroll_down(
+                events.MouseScrollDown(None, 10, 5, 0, 0, 0, False, False, False),
+            )
             await pilot.pause()
-        self.assertIsInstance(app.return_value, pickup.LaunchRequest)
+            self.assertGreater(pane.detail_offset, before)
+            self.assertTrue(list_view.has_focus)
 
 
 class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -859,9 +926,14 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             self._hosted_names.append(pane.session_name)
             self.assertNotIn("连接中", pane.render().plain)
             await _wait_for_pane_text(pane, "HELLO-UI-TEST")
-            self.assertTrue(pane.has_focus)
+            list_view = app.screen.query_one(SessionListView)
+            self.assertTrue(list_view.has_focus)
+            self.assertFalse(pane.has_focus)
 
-            # ctrl+backslash 回列表，'c' 关闭分栏；托管会话应在后台继续存活
+            # 点右栏后才聚焦内嵌会话；ctrl+backslash 回列表，'c' 关闭分栏
+            await pilot.click(pane)
+            await pilot.pause()
+            self.assertTrue(pane.has_focus)
             await pilot.press("ctrl+backslash")
             await pilot.pause()
             await pilot.press("c")
@@ -997,7 +1069,14 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             pane = app.screen.query_one(EmbedPane)
             self._hosted_names.append(pane.session_name)
             await _wait_for_pane_text(pane, "CURSOR-TEST")
+            list_view = app.screen.query_one(SessionListView)
+            self.assertTrue(list_view.has_focus)
+            self.assertFalse(pane._real_cursor_shown, "列表聚焦时不应显示内嵌真实光标")
+
+            await pilot.click(pane)
+            await pilot.pause()
             self.assertTrue(pane.has_focus)
+            await _wait_until(lambda: pane._real_cursor_shown)
             self.assertTrue(pane._real_cursor_shown, "聚焦活会话时应显示外层真实光标")
 
             await pilot.press("ctrl+backslash")  # 焦点回列表
@@ -1151,6 +1230,55 @@ class EmbedPaneWheelTests(unittest.TestCase):
         self.assertEqual(pane.history_offset, 7)
 
 
+class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
+    """窗口缩放：行宽即时裁补；tmux resize + 抓帧必须防抖，不能拖动期狂刷。"""
+
+    def test_render_line_adjusts_cached_strip_to_current_width(self) -> None:
+        from rich.segment import Segment
+        from textual.strip import Strip
+
+        pane = EmbedPane()
+        pane.session_name = "pickup-claude-x"
+        # 模拟旧宽度缓存行（10 列），面板已缩到 6 列
+        pane._grid = [[object()] * 10]  # 非空即可让 render_line 走 _strips 分支
+        pane._strips = [Strip([Segment("abcdefghij")])]
+        with mock.patch.object(type(pane), "size", new_callable=mock.PropertyMock) as size_mock:
+            size_mock.return_value = Size(6, 1)
+            strip = pane.render_line(0)
+        self.assertEqual(strip.cell_length, 6)
+        self.assertEqual(strip.text, "abcdef")
+
+    async def test_tmux_resize_and_capture_are_debounced(self) -> None:
+        import ui.embed_pane as embed_pane_mod
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            pane = app.screen.query_one(EmbedPane)
+            pane.session_name = "pickup-claude-debounce"
+            pane.dead = False
+            resize_calls: list[tuple] = []
+            poke_calls: list[int] = []
+
+            def _fake_resize(name, w, h):
+                resize_calls.append((name, w, h))
+
+            with (
+                mock.patch("embed.resize", side_effect=_fake_resize),
+                mock.patch.object(pane._poke, "set", side_effect=lambda: poke_calls.append(1)),
+            ):
+                pane._on_resize(events.Resize(Size(50, 20), Size(50, 20)))
+                await pilot.pause(delay=0.02)
+                pane._on_resize(events.Resize(Size(40, 18), Size(40, 18)))
+                await pilot.pause(delay=0.02)
+                self.assertEqual(resize_calls, [], "拖动过程中不应立刻 resize-window")
+                self.assertEqual(poke_calls, [], "拖动过程中不应立刻唤醒抓帧")
+                await pilot.pause(delay=embed_pane_mod._RESIZE_TMUX_DEBOUNCE + 0.05)
+                self.assertEqual(resize_calls, [("pickup-claude-debounce", 40, 18)])
+                self.assertEqual(len(poke_calls), 1)
+
+
 @unittest.skipUnless(HAS_TMUX, "内嵌面板依赖真实 tmux")
 class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
     """直启子命令（pickup claude ...）带进 TUI 的托管路径。"""
@@ -1165,10 +1293,7 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
                             stderr=subprocess.DEVNULL)
 
     async def test_direct_launch_hosts_and_focuses_pane_without_stealing_focus_back(self) -> None:
-        """回归测试：MainScreen.on_mount 曾经先调度 SessionListView.focus()（延迟生效），
-        直启托管完成、显式聚焦面板之后，那个延迟的列表 focus() 会在下一轮事件循环
-        把焦点抢回列表——键盘输入实际发不到内嵌会话（真机 tmux 冒烟才暴露的 bug，
-        修法是直启场景完全不调用列表的 focus()）。"""
+        """直启托管成功后焦点应在右栏；且挂载时不能再调度列表 focus 把焦点抢回去。"""
         store, _ = _make_store()
         plan = LaunchPlan(("bash", "-c", "printf 'DIRECT-HELLO\\n'; cat"), None)
         direct = pickup._DirectLaunch(plan, "claude", "directtest01")
@@ -1185,7 +1310,6 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
             await _wait_for_pane_text(pane, "DIRECT-HELLO")
             self.assertTrue(pane.has_focus)
 
-            # 键盘输入必须真的到达托管会话，而不是被抢回焦点的列表吞掉
             await pilot.press(*"x")
             await _wait_for_pane_text(pane, "x")
             self.assertIn("x", pane.render().plain.split("DIRECT-HELLO")[-1])

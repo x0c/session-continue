@@ -33,6 +33,14 @@ wait_for() {
   cap >&2 || true
   return 1
 }
+# 右栏键盘交互入口：列表聚焦时 Tab 沿焦点链进入内嵌面板（搜索→列表→右栏）。
+# 回车/直启只挂接画面、不抢焦点——要测键盘转发或 IME 光标，必须先进入右栏。
+# 自动化里用 Tab 比注入 SGR 单击更稳（tmux send-keys 的假鼠标偶发不触发 Textual 命中）。
+focus_right_pane() {
+  local target="${1:-tui}"
+  tmux -L "$OUTER" send-keys -t "$target" Tab
+  sleep 0.35
+}
 cleanup() {
   tmux -L "$OUTER" kill-server 2>/dev/null || true
   tmux -L "$KEEPALIVE" kill-session -t pickup-claude-aaaa1111 2>/dev/null || true
@@ -81,7 +89,7 @@ TMUX_DIR="$(dirname "$(command -v tmux)")"
 # 能看到的 sys.path 原样透传，绕开这个问题；真正 pip install 到系统/venv 的
 # 用户不受影响。
 PYWORKAROUND_PATH="$(python3 -c 'import sys; print(":".join(p for p in sys.path if p))')"
-ENVV="HOME=$TMP/home PYTHONPATH=$PYWORKAROUND_PATH PATH=$TMP/fakebin:$TMUX_DIR:/usr/local/bin:/usr/bin:/bin TERM=xterm-256color PICKUP_TITLE_GENERATOR=none"
+ENVV="HOME=$TMP/home PYTHONPATH=$PYWORKAROUND_PATH PATH=$TMP/fakebin:$TMUX_DIR:/usr/local/bin:/usr/bin:/bin TERM=xterm-256color PICKUP_TITLE_GENERATOR=none PICKUP_LANG=zh"
 tmux -L "$OUTER" new-session -d -s tui -x 180 -y 42
 tmux -L "$OUTER" set-option -t tui mouse on
 tmux -L "$OUTER" send-keys -t tui "cd $REPO && env $ENVV python3 pickup.py --limit 5" Enter
@@ -101,14 +109,14 @@ wait_for "FAKE-CLAUDE --resume aaaa1111" 60
 sessions | grep -qx "pickup-claude-aaaa1111"
 ok "回车把会话托管进后台 tmux 并在右栏展示实时画面"
 
-# 键盘输入必须真的转发进托管会话（这是本次 curses -> Textual 迁移里出过真实
-# 回归的地方：MainScreen 曾经在挂载时抢焦点回列表，导致直启场景键位发不进去；
-# 这里在主列表路径下也钉一遍，防止同类问题复发）。
+# 回车只挂右栏画面，焦点仍在侧边栏。先点右栏再打字，验证键盘真实转发进
+# 托管会话（同时证明「点右栏才交互」这条焦点边界生效）。
+focus_right_pane tui
 tmux -L "$OUTER" send-keys -t tui -l "smoke-input"
 tmux -L "$OUTER" send-keys -t tui Enter
 wait_for "ECHO: smoke-input" 40
 sleep 0.5
-ok "键盘输入真实转发进托管会话（不是被列表吞掉）"
+ok "点右栏后键盘输入真实转发进托管会话"
 
 # Ctrl+\ 回列表：Textual 原生区分 Ctrl+\ 与连续两次按 \，不再需要旧版的双反
 # 斜杠时间窗口消歧义。回列表后按 / 聚焦搜索框并输入项目名应能过滤列表（如果焦点
@@ -194,10 +202,11 @@ direct_session="$(comm -13 <(echo "$before_direct" | sort) <(sessions | grep '^p
 [[ -n "$direct_session" ]]
 ok "直启子命令自动托管新会话并在侧边栏展示"
 
+# 直启会自动聚焦右栏（与侧边栏点选不抢焦点的语义不同）。
 tmux -L "$OUTER" send-keys -t direct -l "direct-smoke-input"
 tmux -L "$OUTER" send-keys -t direct Enter
 wait_for_direct "ECHO: direct-smoke-input" 40
-ok "直启场景键盘输入同样真实转发进托管会话（此前真机冒烟发现的焦点回归点）"
+ok "直启场景键盘输入真实转发进托管会话"
 
 # ---- IME 光标锚定：真实终端硬件光标必须精确落在托管 pane 内的真实光标位置 ----
 # （这是 IME 候选框/emoji 弹出框定位依赖的同一套机制，真机没有输入法没法直接
@@ -226,14 +235,26 @@ if [[ -z "$cursor_session" ]]; then
   sessions >&2
   exit 1
 fi
-sleep 0.3
-inner_cursor="$(tmux -L "$KEEPALIVE" display-message -p -t "$cursor_session" '#{cursor_x},#{cursor_y}')"
-outer_cursor="$(tmux -L "$OUTER" display-message -p -t cursor '#{cursor_x},#{cursor_y}')"
+# 直启已自动聚焦右栏；等外层光标跟上内嵌 pane 光标即可。
+expected_x=""
+outer_cursor=""
+inner_cursor=""
+for _ in {1..40}; do
+  inner_cursor="$(tmux -L "$KEEPALIVE" display-message -p -t "$cursor_session" '#{cursor_x},#{cursor_y}')"
+  outer_cursor="$(tmux -L "$OUTER" display-message -p -t cursor '#{cursor_x},#{cursor_y}')"
+  outer_x="${outer_cursor%,*}"; outer_y="${outer_cursor#*,}"
+  inner_x="${inner_cursor%,*}"; inner_y="${inner_cursor#*,}"
+  # 左栏固定宽度 39（ui/main_screen.py 的 LIST_PANE_WIDTH），面板起点在第 39 列；
+  # 真实外层光标列 = 39 + pane 内真实光标列，行 = pane 内真实光标行（面板顶部无
+  # 额外偏移）。算错了说明 EmbedPane._update_app_cursor 的坐标换算或时机有问题。
+  expected_x=$((39 + inner_x))
+  if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$inner_y" ]]; then
+    break
+  fi
+  sleep 0.15
+done
 outer_x="${outer_cursor%,*}"; outer_y="${outer_cursor#*,}"
 inner_x="${inner_cursor%,*}"; inner_y="${inner_cursor#*,}"
-# 左栏固定宽度 39（ui/main_screen.py 的 LIST_PANE_WIDTH），面板起点在第 39 列；
-# 真实外层光标列 = 39 + pane 内真实光标列，行 = pane 内真实光标行（面板顶部无
-# 额外偏移）。算错了说明 EmbedPane._update_app_cursor 的坐标换算或时机有问题。
 expected_x=$((39 + inner_x))
 if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$inner_y" ]]; then
   ok "外层终端真实光标精确落在托管 pane 内的真实光标位置（内 ${inner_cursor} -> 外 ${outer_cursor}，IME 候选框定位依据的机制验证通过）"

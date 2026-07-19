@@ -23,10 +23,6 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "New",
         "zh": "新建",
     },
-    "action.fullscreen": {
-        "en": "Fullscreen",
-        "zh": "全屏",
-    },
     "action.kill_session": {
         "en": "End session",
         "zh": "结束会话",
