@@ -412,11 +412,14 @@ class MainScreen(Screen):
             ident = keepalive.new_session_ident()
 
         # pane.content_size 是 Textual 的 DOM/布局状态，必须在主线程读完再进 worker，
-        # 不能在后台线程里访问 Widget 属性。
+        # 不能在后台线程里访问 Widget 属性。创建尺寸抬到 embed 下限，避免首帧极窄排版。
+        from pickup import embed as embed_mod
+
         pane_size = pane.content_size
+        width, height = embed_mod.normalize_host_size(pane_size.width, pane_size.height)
         self._host_busy = True
         self._host_and_focus(
-            request, plan, ident, same_runtime, max(20, pane_size.width), max(4, pane_size.height),
+            request, plan, ident, same_runtime, width, height,
         )
 
     @work(thread=True, group="host")
@@ -485,9 +488,12 @@ class MainScreen(Screen):
             return
         direct = self.direct
         pane = self.query_one(EmbedPane)
+        from pickup import embed as embed_mod
+
         pane_size = pane.content_size
+        width, height = embed_mod.normalize_host_size(pane_size.width, pane_size.height)
         self._host_busy = True
-        self._host_direct_worker(direct, max(20, pane_size.width), max(4, pane_size.height))
+        self._host_direct_worker(direct, width, height)
 
     @work(thread=True, group="host")
     def _host_direct_worker(self, direct, width: int, height: int) -> None:

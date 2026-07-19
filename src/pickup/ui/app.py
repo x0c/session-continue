@@ -52,6 +52,9 @@ class PickupApp(App):
         self._direct = direct
         self._osc_report = osc_report
         self._resize_full_repaint_timer: Timer | None = None
+        # Textual compositor 在窗口高度骤变时偶发 chops/spans 行数不一致（IndexError）；
+        # 连续恢复有上限，避免真故障时死循环刷屏。
+        self._compositor_recovery_budget = 0
 
     def _on_terminal_supports_synchronized_output(self, message) -> None:
         # Textual 默认在终端支持时把每帧包进同步输出（`\e[?2026h…l`，原子提交整帧防撕裂）。
@@ -74,6 +77,8 @@ class PickupApp(App):
         `_RESIZE_FULL_REPAINT_DEBOUNCE` 内不再有新尺寸后再 `_force_full_repaint`。
         """
         super()._check_resize()
+        # 每次尺寸变化给一次恢复额度：缩放过程中 compositor IndexError 可自愈。
+        self._compositor_recovery_budget = 2
         if self._resize_full_repaint_timer is not None:
             self._resize_full_repaint_timer.stop()
         self._resize_full_repaint_timer = self.set_timer(
@@ -96,6 +101,21 @@ class PickupApp(App):
             if region:
                 compositor._dirty_regions.add(region)
             screen.refresh()
+
+    def _handle_exception(self, error: Exception) -> None:
+        """缩放期 compositor 行数竞态：整屏重绘一次自愈，不退出整个界面。
+
+        Textual 默认 `_handle_exception` 一律退出。真机在拖动窗口时偶发
+        `ChopsUpdate` 的 `chops[y]` IndexError（spans 仍引用旧高度）。
+        """
+        if isinstance(error, IndexError) and self._compositor_recovery_budget > 0:
+            self._compositor_recovery_budget -= 1
+            try:
+                self._force_full_repaint()
+                return
+            except Exception:
+                pass
+        super()._handle_exception(error)
 
     def on_mount(self) -> None:
         # pickup 自己的界面色也要跟随外层终端的深浅色，不能只管注入托管 pane

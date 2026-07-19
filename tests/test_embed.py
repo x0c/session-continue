@@ -236,6 +236,18 @@ class SessionIoTests(unittest.TestCase):
         with mock.patch.object(embed.subprocess, "check_output", return_value=b"garbage"):
             self.assertIsNone(embed.pane_state("s"))
 
+    def test_normalize_and_guard_host_size(self):
+        self.assertEqual(embed.normalize_host_size(10, 3), (40, 10))
+        self.assertEqual(embed.normalize_host_size(120, 40), (120, 40))
+        self.assertTrue(embed.should_resize_host(40, 10))
+        self.assertFalse(embed.should_resize_host(39, 20))
+        self.assertFalse(embed.should_resize_host(80, 9))
+
+    def test_resize_skips_below_minimum(self):
+        with mock.patch.object(embed.subprocess, "run") as run:
+            embed.resize("pickup-claude-x", 20, 18)
+        run.assert_not_called()
+
 
 class ControlModeTests(unittest.TestCase):
     """控制模式转义、SGR 鼠标序列、tmux 版本门控、copy-mode 原语（无通道时走 fork）。"""

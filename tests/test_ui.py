@@ -185,6 +185,32 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(calls[0], Size(70, 22))
                 self.assertIsNone(app._resize_full_repaint_timer)
 
+    def test_compositor_index_error_recovers_instead_of_exiting(self) -> None:
+        """窗口缩放时 Textual chops/spans 行数竞态：IndexError 应自愈，不退出 TUI。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        app._compositor_recovery_budget = 2
+        forced: list[int] = []
+
+        def _fake_force() -> None:
+            forced.append(1)
+
+        with mock.patch.object(app, "_force_full_repaint", side_effect=_fake_force):
+            app._handle_exception(IndexError("list index out of range"))
+        self.assertEqual(forced, [1])
+        self.assertEqual(app._compositor_recovery_budget, 1)
+        self.assertNotEqual(getattr(app, "_return_code", None), 1)
+
+        # 额度耗尽后仍走默认致命路径
+        app._compositor_recovery_budget = 0
+        with (
+            mock.patch.object(app, "_force_full_repaint", side_effect=_fake_force),
+            mock.patch("textual.app.App._handle_exception") as fatal,
+        ):
+            app._handle_exception(IndexError("list index out of range"))
+        fatal.assert_called_once()
+        self.assertEqual(forced, [1], "额度耗尽后不应再尝试整屏重绘")
+
     async def test_f12_saves_screenshot_under_cache(self) -> None:
         from pickup import observe
         import tempfile
@@ -1288,6 +1314,24 @@ class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(delay=embed_pane_mod._RESIZE_TMUX_DEBOUNCE + 0.05)
                 self.assertEqual(resize_calls, [("pickup-claude-debounce", 40, 18)])
                 self.assertEqual(len(poke_calls), 1)
+
+    async def test_tmux_resize_skips_when_pane_too_narrow(self) -> None:
+        """右栏短时缩到下限以下时不得 resize-window，避免窄折行烧进历史。"""
+        import pickup.ui.embed_pane as embed_pane_mod
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            pane = app.screen.query_one(EmbedPane)
+            pane.session_name = "pickup-claude-narrow"
+            pane.dead = False
+            resize_calls: list[tuple] = []
+
+            with mock.patch("pickup.embed.resize", side_effect=lambda *a: resize_calls.append(a)):
+                pane._on_resize(events.Resize(Size(20, 18), Size(20, 18)))
+                await pilot.pause(delay=embed_pane_mod._RESIZE_TMUX_DEBOUNCE + 0.05)
+                self.assertEqual(resize_calls, [])
 
 
 @unittest.skipUnless(HAS_TMUX, "内嵌面板依赖真实 tmux")

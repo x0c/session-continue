@@ -207,7 +207,9 @@ class EmbedPane(Widget):
         self.history_offset = 0
         channel = embed.open_channel(name, on_output=self._on_pane_output)
         pane_w, pane_h = self._pane_size()
-        if pane_w and pane_h:
+        # 过窄时不 resize：布局尚未稳定或用户把终端缩得很小时，避免 agent
+        # 按几列硬换行写进 scrollback（恢复宽度后往上滚仍会看到窄条历史）。
+        if embed.should_resize_host(pane_w, pane_h):
             embed.resize(name, pane_w, pane_h)
         # 终端背景色注入：此后 pane 内 agent 的 OSC 11 查询由 tmux 按真实值应答，
         # 深/浅主题自动检测才不会瞎猜（tmux 默认不应答 pane 内的查询）。
@@ -848,6 +850,8 @@ class EmbedPane(Widget):
         self._pending_tmux_size = None
         name = self.session_name
         if not name or self.dead or size is None:
+            return
+        if not embed.should_resize_host(size[0], size[1]):
             return
         embed.resize(name, size[0], size[1])
         self._poke.set()

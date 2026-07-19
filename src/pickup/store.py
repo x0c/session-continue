@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Callable
 
-from pickup import keepalive, titles
+from pickup import embed, keepalive, titles
 from pickup.display import (
     _filter_sessions_by_query,
     _normalize_cwd,

@@ -202,8 +202,31 @@ def pane_state(name: str) -> tuple[int, int, bool, bool, bool, int] | None:
         return None
 
 
+# 托管窗过窄时，Cursor/Claude 等会按当前列数硬换行并写入 scrollback；
+# 之后哪怕右栏恢复正常宽度，往上滚仍会看到「只剩几列」的历史。创建时抬到下限；
+# 后续缩放若仍低于下限则跳过，保留上一次可用尺寸。
+MIN_HOST_WIDTH = 40
+MIN_HOST_HEIGHT = 10
+
+
+def normalize_host_size(width: int, height: int) -> tuple[int, int]:
+    """创建托管会话用：宽高至少到下限，避免首帧就按极窄几何排版。"""
+    return max(MIN_HOST_WIDTH, max(1, int(width))), max(MIN_HOST_HEIGHT, max(1, int(height)))
+
+
+def should_resize_host(width: int, height: int) -> bool:
+    """后续 resize-window：低于下限则不要改托管窗。"""
+    return int(width) >= MIN_HOST_WIDTH and int(height) >= MIN_HOST_HEIGHT
+
+
 def resize(name: str, width: int, height: int) -> None:
-    """把托管会话的窗口调整为面板尺寸；失败静默（会话可能刚好退出）。"""
+    """把托管会话的窗口调整为面板尺寸；失败静默（会话可能刚好退出）。
+
+    调用方应先用 `should_resize_host` 过滤过窄尺寸；此处再兜底一次，
+    防止遗漏路径把几列宽烧进历史。
+    """
+    if not should_resize_host(width, height):
+        return
     ch = _active_channel(name)
     if ch is not None and ch.command(
             "resizew", "-t", name, "-x", str(width), "-y", str(height)):

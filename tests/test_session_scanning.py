@@ -2301,6 +2301,39 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertNotIn("claude:s0", store._force_ended)
         self.assertFalse(store.find_session("claude:s0").get("live"))
 
+    def test_refresh_rebinds_hosted_name_via_embed_is_alive(self) -> None:
+        """本进程托管记录在 annotate 未命中时，必须能调用 embed.is_alive 兜底回填。
+
+        回归：src 包化后 store 漏 import embed，托管会话后台重扫会 NameError，
+        搜索框一直显示 Failed to refresh。
+        """
+        session = {
+            "source": "claude", "id": "s1", "short_id": "s1", "mtime": 1.0,
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "t",
+            "cwd": "/tmp", "live": True, "pid": 42,
+        }
+        claude_runtime = mock.Mock()
+        claude_runtime.id = "claude"
+        claude_runtime.display_name = "Claude"
+        claude_runtime.scan_signature.return_value = None
+        claude_runtime.scan_sessions.return_value = [dict(session)]
+        registry = pickup.RuntimeRegistry((claude_runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+        store.hosted["claude:s1"] = "pickup-claude-s1"
+        # 去掉 keepalive_name，迫使走 hosted + embed.is_alive 分支
+        store.find_session("claude:s1").pop("keepalive_name", None)
+        claude_runtime.scan_sessions.return_value = [dict(session)]
+        with (
+            mock.patch.object(pickup.keepalive, "annotate"),
+            mock.patch("pickup.store.embed.is_alive", return_value=True) as alive,
+        ):
+            store.refresh()
+        alive.assert_called_with("pickup-claude-s1")
+        self.assertEqual(store.find_session("claude:s1").get("keepalive_name"), "pickup-claude-s1")
+
+
 class NavStub:
     """`_new_session_cwd` 只需要 `project_query` 属性；界面层真实用的是
     `ui.nav.NavState`，测试这里用一个最小 stub 避免依赖 ui 包。"""
