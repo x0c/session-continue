@@ -1,6 +1,6 @@
-"""PickupApp：Textual 应用外壳，取代 curses.wrapper(_run, ...) 的入口点。
+"""PickupApp：Textual 应用外壳，唯一界面入口。
 
-`run_app()` 是唯一对外函数，返回值语义与旧版完全一致：
+`run_app()` 是唯一对外函数，返回值语义：
 `LaunchRequest | NewSessionRequest` 表示需要外层 execvp 全屏接管，
 `None` 表示用户只是退出。
 """
@@ -17,8 +17,7 @@ class PickupApp(App):
 
     TITLE = "pickup"
     # 不整体关闭 Textual 内置的鼠标拖拽文本选择：EmbedPane 需要它来实现"划词
-    # 选中托管会话画面里的文字 + Ctrl+C 复制"（老版 curses 用手写 OSC 52 做的
-    # 事，这版直接用 Textual 自带机制）。真机实测过的崩溃只出在 SessionCard/
+    # 选中托管会话画面里的文字 + Ctrl+C 复制"。真机实测过的崩溃只出在 SessionCard/
     # NewSessionCard 这类会被后台重扫动态增删的列表项 Widget 上（选择过程中
     # 控件被移除，container 解析为 None 后访问 .region 崩溃），已单独在那两个
     # 类和弹窗菜单项上关闭 ALLOW_SELECT；EmbedPane 画面不会被动态增删，不受
@@ -74,9 +73,8 @@ class PickupApp(App):
 def run_app(store, embed_ok: bool, direct=None, osc_report: bytes | None = None):
     """启动 Textual 界面并阻塞直至用户退出或选择启动某个会话。
 
-    返回值与旧版 `curses.wrapper(_run, store, embed_ok, direct)` 语义一致：
-    `LaunchRequest | NewSessionRequest | None`。osc_report 是启动前探测到的外层
-    终端 OSC 10/11 应答（见 pickup._probe_osc_colours），用于内嵌面板聚焦托管
+    返回 `LaunchRequest | NewSessionRequest | None`。osc_report 是启动前探测到的
+    外层终端 OSC 10/11 应答（见 pickup._probe_osc_colours），用于内嵌面板聚焦托管
     会话时注入真实背景色。
     """
     import i18n

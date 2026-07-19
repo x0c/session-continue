@@ -23,7 +23,7 @@
 ## 文档导航
 
 - `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力前必读。
-- `docs/MAINTAINER_GUIDE.md`：修改、评审、排查或优化标题生成、扫描排序、扫描性能/启动耗时（含首屏异步 `store.load`）、界面列宽/侧边栏配色与标题省略、runtime 名配色（`pickup.runtime_label_style`）、TUI 可观测性（`observe.py` / `events.log` / F12 截图 / `pickup diagnose`）、TUI 刷新（列表原地更新、spinner 省刷）、状态列/会话存活判断、会话预览（右栏完整对话、消息级时间戳、缓存按 mtime 失效；Space 全屏预览已退役）、运行时边界（含跨运行时接手提示词的对话摘录）、会话保活（`keepalive.py`，含 tmux 隔离、pid 祖先链匹配、回收策略）、内嵌面板（`embed.py` + `ui/embed_pane.py` 的 `EmbedPane`，含控制模式通道与抓帧 `request()`、真彩色直通、Line API 局部重绘、输入延迟、跨终端/触控板滚动兼容、回滚状态、鼠标拖拽选词的取舍、IME 光标锚定、深/浅主题背景色注入、「连接中…」卡死）、直启子命令（`pickup claude`/`pickup codex`，含 `auto_approve_args` 设计取舍）、`agent_api.py` 机器接口（含新增字段/参数、只读边界取舍、`AgentApiTests` 测试写法）、打包发布和 GitHub 开源维护前必读。
+- `docs/MAINTAINER_GUIDE.md`：修改、评审、排查或优化标题生成、扫描排序、扫描性能/启动耗时（含首屏异步 `store.load`）、界面列宽/侧边栏配色与标题省略、runtime 名配色（`pickup.runtime_label_style`）、TUI 可观测性（`observe.py` / `events.log` / F12 截图 / `pickup diagnose`）、TUI 刷新（列表原地更新、spinner 省刷）、状态列/会话存活判断、会话预览（右栏完整对话、消息级时间戳、缓存按 mtime 失效）、运行时边界（含跨运行时接手提示词的对话摘录）、会话保活（`keepalive.py`，含 tmux 隔离、pid 祖先链匹配、回收策略）、内嵌面板（`embed.py` + `ui/embed_pane.py` 的 `EmbedPane`，含控制模式通道与抓帧 `request()`、真彩色直通、Line API 局部重绘、输入延迟、跨终端/触控板滚动兼容、回滚状态、鼠标拖拽选词的取舍、IME 光标锚定、深/浅主题背景色注入、「连接中…」卡死）、直启子命令（`pickup claude`/`pickup codex`，含 `auto_approve_args` 设计取舍）、`agent_api.py` 机器接口（含新增字段/参数、只读边界取舍、`AgentApiTests` 测试写法）、打包发布和 GitHub 开源维护前必读。
 - `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义前必读（含 `diagnose` 与界面异常排查）；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里。
 - `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界前必读。
 - `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求前必读。
@@ -35,7 +35,7 @@
 - 跨运行时接力统一走“源适配器导出 `Handoff` → 目标适配器生成 `LaunchPlan`”，禁止增加 Claude→Gemini、Codex→Gemini 等两两转换分支。
 - 同运行时使用原生恢复；跨运行时必须新建目标会话、让目标 Agent 按需读取原始 JSONL，不能改写或伪造原会话。
 - 标题生成是独立服务，不属于任何运行时适配器。生成后端统一走 `titlegen.py` 的 `TitleGenerator` 抽象，`titles.py` 不得直接拼接任何 CLI 命令；`titlegen.py` 与 `runtime/` 互不 import——运行时适配器管「怎么恢复/接力会话」，标题生成器管「怎么无头问一次模型」，两者后端恰好重名但职责不同，不要合并。标题和界面状态使用“运行时 + 会话 ID”作为唯一键，新增运行时不得退回纯会话 ID。新增标题生成后端时，若该 CLI 会把生成调用落盘成会话历史，对应扫描器必须加 `titles.PROMPT_MARKER` 前缀过滤。
-- 会话预览：选中非进行中会话时，右栏直接展示完整对话（与旧 Space 全屏预览同款内容）；进行中/已托管会话右栏展示内嵌实时终端。Space 全屏预览页已退役，禁止再加回第二套预览入口。
+- 会话预览：选中非进行中会话时，右栏直接展示完整对话；进行中/已托管会话右栏展示内嵌实时终端。唯一界面是左右分栏，禁止再加回全屏预览或纯列表第二套入口。
 - **侧边栏末行间隔（硬约定）**：凡往左栏加控件（搜索框、新建项、会话卡、未来任何块），**最后一行必须是间隔空行**，画在该控件自身高度内并算进命中区与选中高亮；禁止用 `margin`、兄弟空隙或 `ListItem` padding 做分隔（点在空隙上不会落到本项）。当前基准：搜索框高 2、新建项高 2、会话卡高 3。细则见 `docs/MAINTAINER_GUIDE.md`「界面」节。
 - `agent_api.py`（`pickup list`/`search`/`show`/`context`/`describe`）是只读数据接口，禁止新增任何执行/拉起副作用命令——pickup 只负责把会话数据交出来，怎么用是调用方的事。暴露更多可见性字段（如运行中会话的 `live`/`pid`）不违反这条约束，只要新字段本身来自扫描/只读探测、不触发任何拉起或写操作；真正"接管/下发指令给运行中会话"的能力不属于 pickup，留给调用方基于这些数据自行实现。命令参数与 `pickup describe` 的输出必须共用同一份 `COMMANDS` 定义，不能各写一份导致漂移。新增或修改子命令时同步 `docs/SKILL.md`。
 - Agent 接口里 `list`/`search` 的 `--limit` 固定表示每个运行时的扫描深度，`--top` 才表示最终返回条数；`--compact` 必须同时做到紧凑 JSON 和精简默认字段。改这三个参数或 `show --out` 大结果落盘行为时，同步 `pickup describe`、`docs/SKILL.md` 和 `docs/MAINTAINER_GUIDE.md`。

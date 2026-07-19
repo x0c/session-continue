@@ -1,11 +1,11 @@
-"""内嵌宿主：把托管在 tmux 里的会话画面搬进 pickup 自己的 curses 界面。
+"""内嵌宿主：把托管在 tmux 里的会话画面搬进 pickup 的 Textual 右栏。
 
 与 keepalive.py 平级的运行时无关层：keepalive 管「把启动计划包进 tmux 以便
 SSH 断线保活」，本模块管「不 attach——用 capture-pane 拿画面、send-keys 送按键」，
-让 pickup.py 的 TUI 回车后退化为左侧会话列表 + 右侧会话现场，会话在后台 tmux 里
-持续运行，随时经列表切换。与保活共用 `tmux -L pickup-keepalive` socket 和
-pickup-* 命名空间：e 键全屏接管、keepalive.annotate() 状态标注、reap_idle() 空闲
-回收对内嵌会话全部照旧生效。适配器不感知本模块，pickup.py 主循环是唯一直接调用方。
+让右栏展示会话现场，会话在后台 tmux 里持续运行，随时经列表切换。与保活共用
+`tmux -L pickup-keepalive` socket 和 pickup-* 命名空间：e 键全屏接管、
+keepalive.annotate() 状态标注、reap_idle() 空闲回收对内嵌会话全部照旧生效。
+适配器不感知本模块；主要调用方是 `ui.embed_pane.EmbedPane`。
 
 渲染保真度由 tmux 自己保证（它就是终端模拟器）：本模块只解析 capture-pane -e
 输出的 SGR 颜色序列，不做完整 VT100 模拟。

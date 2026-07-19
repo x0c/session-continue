@@ -1192,7 +1192,7 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RightPanePreviewTests(unittest.IsolatedAsyncioTestCase):
-    """选中即完整预览：右栏展示对话全文；Space 全屏预览已退役。"""
+    """选中即完整预览：右栏展示对话全文。"""
 
     async def test_right_pane_shows_full_conversation_not_last_qa_blurb(self) -> None:
         store, _ = _make_store()

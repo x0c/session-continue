@@ -35,10 +35,6 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "Close pane",
         "zh": "关闭面板",
     },
-    "action.mouse": {
-        "en": "Mouse",
-        "zh": "鼠标",
-    },
     "action.screenshot": {
         "en": "Screenshot",
         "zh": "截图",

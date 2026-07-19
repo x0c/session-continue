@@ -1,9 +1,9 @@
-"""主屏：会话列表 + 右栏内嵌面板，取代旧版 pickup.py 里的 _run 主循环。
+"""主屏：左栏会话列表 + 右栏预览/内嵌终端（pickup 唯一界面）。
 
 按键语义（/ 聚焦项目搜索 / a 高级操作 / n 新建 / e 全屏 /
 q 结束会话 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
-展示完整对话预览（不再使用 Space 全屏预览页）。侧边栏顶部为项目搜索框，
-大小写无关模糊匹配项目名与会话标题。
+展示完整对话预览。侧边栏顶部为项目搜索框，大小写无关模糊匹配项目名与会话标题。
+禁止再加第二套全屏预览或纯列表旧界面。
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ _ACTION_I18N = {
     "fullscreen": "action.fullscreen",
     "kill_keepalive": "action.kill_session",
     "close_pane": "action.close_pane",
-    "toggle_mouse": "action.mouse",
     "save_screenshot": "action.screenshot",
     "preview_home": "action.preview_home",
     "preview_end": "action.preview_end",
@@ -61,7 +60,6 @@ def _main_bindings() -> list[Binding]:
         Binding("e", "fullscreen", t("action.fullscreen")),
         Binding("q", "kill_keepalive", t("action.kill_session")),
         Binding("c", "close_pane", t("action.close_pane"), show=False),
-        Binding("m", "toggle_mouse", t("action.mouse"), show=False),
         Binding("f12", "save_screenshot", t("action.screenshot"), show=False),
         # 右栏静态对话预览滚动（列表聚焦时也生效；优先级高于 ListView 的同名键）
         Binding("home", "preview_home", t("action.preview_home"), show=False, priority=True),
@@ -102,7 +100,6 @@ class MainScreen(Screen):
         runtime_ids = store.registry.ids
         source = next((rid for rid in runtime_ids if store.sessions[rid]), runtime_ids[0])
         self.nav = NavState(source=source)
-        self.mouse_forward_enabled = True
         self._host_busy = False
         self._preview_gen = 0
 
@@ -640,9 +637,6 @@ class MainScreen(Screen):
     def action_preview_page_down(self) -> None:
         if self.embed_ok:
             self.query_one(EmbedPane).scroll_detail_page(1)
-
-    def action_toggle_mouse(self) -> None:
-        self.mouse_forward_enabled = not self.mouse_forward_enabled
 
     def action_save_screenshot(self) -> None:
         """F12：导出当前 TUI 到 ~/.cache/pickup/screenshots/（用户主动触发）。"""
