@@ -9,7 +9,7 @@ python3 -m pip install --user -e .
 python3 -m unittest -v
 ```
 
-The project intentionally has no required runtime dependencies beyond the Python standard library.
+The project keeps runtime dependencies minimal: the UI layer is built on [Textual](https://github.com/Textualize/textual) (the only required third-party package), everything else stays on the Python standard library.
 
 ## Before Opening A Pull Request
 

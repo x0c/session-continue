@@ -1,7 +1,6 @@
-"""embed.py 的单元测试：tmux 命令拼装、SGR 画面解析、颜色对池、按键翻译。
+"""embed.py 的单元测试：tmux 命令拼装、SGR 画面解析、Cell→Style 映射、按键翻译。
 
-tmux 子进程一律 mock，不需要真实 tmux；PairPool 依赖的 curses 全局状态
-（COLOR_PAIRS / init_pair / color_pair）也用 mock 隔离，可在无终端环境跑。
+tmux 子进程一律 mock，不需要真实 tmux，可在无终端环境跑。
 """
 
 from __future__ import annotations
@@ -185,6 +184,56 @@ class ControlModeTests(unittest.TestCase):
         self.assertEqual(embed.sgr_mouse_sequence(64, 5, 3), "\x1b[<64;5;3M")
         self.assertEqual(embed.sgr_mouse_sequence(65, 1, 1), "\x1b[<65;1;1M")
 
+    def test_send_mouse_sequence_nonblocking_and_forked(self):
+        """滚轮序列必须排队到后台线程发送：调用方（UI 主线程）零 fork、立即返回。"""
+        delivered = threading.Event()
+        calls = []
+
+        def fake_send(name, seq, *, force_fork=False):
+            calls.append((name, seq, force_fork))
+            delivered.set()
+
+        with mock.patch.object(embed, "send_literal", side_effect=fake_send):
+            started = time.monotonic()
+            embed.send_mouse_sequence("sc-claude-1", "\x1b[<65;10;6M")
+            elapsed = time.monotonic() - started
+            self.assertTrue(delivered.wait(2.0), "后台线程应投递滚轮序列")
+        self.assertLess(elapsed, 0.05, "send_mouse_sequence 自身不得阻塞调用方")
+        self.assertEqual(calls, [("sc-claude-1", "\x1b[<65;10;6M", True)])
+
+    def test_send_mouse_sequence_queue_cap_drops_oldest(self):
+        """积压超过 _WHEEL_QUEUE_MAX 时丢弃最旧事件：内层重绘不过来就跳中间帧，
+        不能停手后还在追滚动。"""
+        gate = threading.Event()
+        drained = threading.Event()
+        delivered = []
+
+        def fake_send(name, seq, *, force_fork=False):
+            if not delivered:
+                gate.wait(2.0)  # 第一条卡住发送线程，模拟内层程序重绘慢
+            delivered.append(seq)
+            if seq == "seq29":
+                drained.set()
+
+        with mock.patch.object(embed, "send_literal", side_effect=fake_send), \
+                mock.patch.object(embed, "_WHEEL_SEND_INTERVAL", 0):
+            embed.send_mouse_sequence("sc-claude-1", "first")
+            # 等发送线程取走 first（队列清空即说明已进入发送、卡在 gate 上）
+            for _ in range(200):
+                with embed._wheel_lock:
+                    if not embed._wheel_queues.get("sc-claude-1"):
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("发送线程未取走第一条")
+            time.sleep(0.05)  # 留出「取走 → 进入 fake_send 卡 gate」的窗口
+            for i in range(30):
+                embed.send_mouse_sequence("sc-claude-1", f"seq{i}")
+            gate.set()
+            self.assertTrue(drained.wait(5.0), "队列应在放行后全部投递")
+        # first + 队列上限 12 条（seq18..seq29，最旧的 seq0..seq17 被丢弃）
+        self.assertEqual(delivered, ["first"] + [f"seq{i}" for i in range(18, 30)])
+
     def test_supports_theme_report_version_gate(self):
         for ver, expected in ((b"tmux 3.5a\n", True), (b"tmux 3.4\n", False),
                               (b"tmux next-3.7\n", True), (b"tmux 2.9\n", False)):
@@ -227,28 +276,29 @@ class ControlModeTests(unittest.TestCase):
         self.assertNotIn("-S", captured["argv"])
 
 
-class TranslateKeyTests(unittest.TestCase):
+class TranslateTextualKeyTests(unittest.TestCase):
     def test_enter_tab_backspace_escape(self):
-        self.assertEqual(embed.translate_key(10), ("keys", "Enter"))
-        self.assertEqual(embed.translate_key(13), ("keys", "Enter"))
-        self.assertEqual(embed.translate_key(9), ("keys", "Tab"))
-        self.assertEqual(embed.translate_key(127), ("keys", "BSpace"))
-        self.assertEqual(embed.translate_key(8), ("keys", "BSpace"))
-        self.assertEqual(embed.translate_key(27), ("keys", "Escape"))
+        self.assertEqual(embed.translate_textual_key("enter"), ("keys", "Enter"))
+        self.assertEqual(embed.translate_textual_key("return"), ("keys", "Enter"))
+        self.assertEqual(embed.translate_textual_key("tab"), ("keys", "Tab"))
+        self.assertEqual(embed.translate_textual_key("backspace"), ("keys", "BSpace"))
+        self.assertEqual(embed.translate_textual_key("escape"), ("keys", "Escape"))
 
     def test_control_letters(self):
-        self.assertEqual(embed.translate_key(3), ("keys", "C-c"))
-        self.assertEqual(embed.translate_key(26), ("keys", "C-z"))
-        self.assertEqual(embed.translate_key(1), ("keys", "C-a"))
+        self.assertEqual(embed.translate_textual_key("ctrl+c"), ("keys", "C-c"))
+        self.assertEqual(embed.translate_textual_key("ctrl+z"), ("keys", "C-z"))
+        self.assertEqual(embed.translate_textual_key("ctrl+a"), ("keys", "C-a"))
 
     def test_special_keys(self):
-        import curses
-        self.assertEqual(embed.translate_key(curses.KEY_UP), ("keys", "Up"))
-        self.assertEqual(embed.translate_key(curses.KEY_PPAGE), ("keys", "PPage"))
-        self.assertEqual(embed.translate_key(curses.KEY_F0 + 5), ("keys", "F5"))
+        self.assertEqual(embed.translate_textual_key("up"), ("keys", "Up"))
+        self.assertEqual(embed.translate_textual_key("pageup"), ("keys", "PPage"))
+        self.assertEqual(embed.translate_textual_key("f5"), ("keys", "F5"))
+        self.assertEqual(embed.translate_textual_key("delete"), ("keys", "DC"))
+        self.assertEqual(embed.translate_textual_key("insert"), ("keys", "IC"))
 
     def test_untranslatable(self):
-        self.assertIsNone(embed.translate_key(9999))
+        self.assertIsNone(embed.translate_textual_key("x"))
+        self.assertIsNone(embed.translate_textual_key("shift+up"))
 
 
 class ParseScreenTests(unittest.TestCase):
@@ -315,58 +365,44 @@ class RgbQuantizeTests(unittest.TestCase):
         self.assertTrue(232 <= mid <= 255)
 
 
-class PairPoolTests(unittest.TestCase):
-    def _make_pool(self, color_pairs=256, first=16, use_default=True):
-        # COLOR_PAIRS 在 initscr 之前不存在于 curses 模块里，patch 时需要 create=True
-        with mock.patch.object(embed.curses, "COLOR_PAIRS", color_pairs, create=True), \
-                mock.patch.object(embed.curses, "init_pair") as init_pair, \
-                mock.patch.object(embed.curses, "color_pair", side_effect=lambda n: n * 1000):
-            pool = embed.PairPool(first=first, use_default=use_default)
-            pool._init_pair_mock = init_pair  # 便于断言
-            yield pool
+class CellStyleTests(unittest.TestCase):
+    def test_default_colors_are_none(self):
+        style = embed.cell_style(embed.Cell("x"))
+        self.assertIsNone(style.color)
+        self.assertIsNone(style.bgcolor)
 
-    def test_allocates_and_reuses(self):
-        for pool in self._make_pool():
-            cell = embed.Cell("x", fg=200, bg=17)
-            a1 = pool.attr(cell)
-            a2 = pool.attr(cell)
-            self.assertEqual(a1, a2)
-            self.assertEqual(a1 & ~0, pool.first * 1000)
-            pool._init_pair_mock.assert_called_once_with(pool.first, 200, 17)
-
-    def test_distinct_combos_get_distinct_pairs(self):
-        for pool in self._make_pool():
-            a1 = pool.attr(embed.Cell("x", fg=1, bg=-1))
-            a2 = pool.attr(embed.Cell("x", fg=2, bg=-1))
-            self.assertNotEqual(a1, a2)
-
-    def test_lru_eviction_reuses_oldest_number(self):
-        for pool in self._make_pool(color_pairs=18):  # 容量 = 18 - 16 = 2
-            pool.attr(embed.Cell("x", fg=1, bg=-1))
-            pool.attr(embed.Cell("x", fg=2, bg=-1))
-            calls_before = pool._init_pair_mock.call_count
-            pool.attr(embed.Cell("x", fg=3, bg=-1))  # 触发淘汰，复用编号 first
-            self.assertEqual(pool._init_pair_mock.call_count, calls_before + 1)
-            self.assertEqual(pool._init_pair_mock.call_args.args, (pool.first, 3, -1))
-
-    def test_zero_capacity_degrades_to_attrs_only(self):
-        for pool in self._make_pool(color_pairs=16):  # 容量 0
-            attr = pool.attr(embed.Cell("x", fg=1, bg=2, bold=True))
-            self.assertEqual(attr, embed.curses.A_BOLD)
-
-    def test_default_colors_translated_when_unsupported(self):
-        for pool in self._make_pool(use_default=False):
-            pool.attr(embed.Cell("x", fg=-1, bg=5))
-            pool._init_pair_mock.assert_called_once_with(
-                pool.first, embed.curses.COLOR_WHITE, 5)
+    def test_colors_map_to_ansi_256(self):
+        style = embed.cell_style(embed.Cell("x", fg=200, bg=17))
+        self.assertEqual(style.color.number, 200)
+        self.assertEqual(style.bgcolor.number, 17)
 
     def test_attr_flags(self):
-        for pool in self._make_pool():
-            attr = pool.attr(embed.Cell("x", bold=True, dim=True, underline=True, reverse=True))
-            self.assertTrue(attr & embed.curses.A_BOLD)
-            self.assertTrue(attr & embed.curses.A_DIM)
-            self.assertTrue(attr & embed.curses.A_UNDERLINE)
-            self.assertTrue(attr & embed.curses.A_REVERSE)
+        style = embed.cell_style(embed.Cell("x", bold=True, dim=True, underline=True, reverse=True))
+        self.assertTrue(style.bold)
+        self.assertTrue(style.dim)
+        self.assertTrue(style.underline)
+        self.assertTrue(style.reverse)
+
+    def test_same_combo_returns_cached_equal_style(self):
+        a = embed.cell_style(embed.Cell("x", fg=1, bg=2))
+        b = embed.cell_style(embed.Cell("y", fg=1, bg=2))  # ch 不同不影响样式缓存键
+        self.assertEqual(a, b)
+
+
+class GridToTextTests(unittest.TestCase):
+    def test_merges_adjacent_cells_with_same_style_into_one_span(self):
+        grid = embed.parse_screen("a\x1b[1;31mb\x1b[0mc", 3, 1)
+        rows = embed.grid_to_text(grid)
+        self.assertEqual(len(rows), 1)
+        text, spans = rows[0]
+        self.assertEqual(text, "abc")
+        self.assertEqual([(s, e) for s, e, _ in spans], [(0, 1), (1, 2), (2, 3)])
+        self.assertNotEqual(spans[0][2], spans[1][2])
+
+    def test_wide_char_continuation_cell_excluded_from_text(self):
+        grid = embed.parse_screen("a好b", 4, 1)
+        text, _ = embed.grid_to_text(grid)[0]
+        self.assertEqual(text, "a好b")
 
 
 @unittest.skipUnless(shutil.which("tmux"), "需要真实 tmux")
@@ -495,6 +531,55 @@ class ControlChannelIntegrationTests(unittest.TestCase):
         embed.send_literal(self.SESSION, "echo fork-$((1+1))")
         embed.send_key(self.SESSION, "Enter")
         self._wait_text("fork-2")
+
+    @unittest.skipUnless(embed.supports_theme_report(), "refresh-client -r 需要 tmux 3.5a+")
+    def test_host_session_with_osc_report_answers_program_own_first_query(self):
+        """回归测试：真机排查过的竞态——host_session(osc_report=...) 必须让**托管
+        程序自己在启动瞬间发起的第一次 OSC 11 查询**就拿到正确颜色，而不是像
+        test_report_theme_answers_pane_osc11_query 那样"先注入、再手动在已有
+        shell 里补发一次查询"（那条测试测的是机制本身能不能用，不测时序）。
+
+        真机发现过两种更差的坏法，这里都要防止回归：
+        1. 完全不早注入：托管程序自己启动时查，大概率拿到 tmux 的默认猜测值
+           （通常是纯黑），不是真实终端色。
+        2. 注入后立刻关闭控制通道：比什么都不做还差——`refresh-client -r` 依赖
+           "当前有控制模式客户端连接着"这个前提，通道一关，注入的颜色跟着失效，
+           托管程序此后一次都查不到（而不是查到默认猜测值）。
+        """
+        subprocess.run(["tmux", "-L", self.SOCKET, "kill-session", "-t", self.SESSION],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with mock.patch.object(embed.keepalive, "_BASE_ARGV", ("tmux", "-L", self.SOCKET)):
+            probe_script = (
+                "import os,sys,termios,tty,select,time;"
+                "fd=sys.stdin.fileno();old=termios.tcgetattr(fd);tty.setraw(fd);"
+                "os.write(1,b'\\x1b]11;?\\x07');"
+                "r,_,_=select.select([fd],[],[],1.5);"
+                "d=os.read(fd,64) if r else b'TIMEOUT';"
+                "termios.tcsetattr(fd,termios.TCSADRAIN,old);"
+                "print('RESP', repr(d));"
+                # 探测完立刻退出会让这个 pane（乃至整个测试用 tmux server，因为
+                # 它是唯一会话）跟着关掉，capture 就再也读不到内容——留一个死
+                # 循环撑住进程，直到测试自己 kill-session 收尾。
+                "time.sleep(60)"
+            )
+            plan = LaunchPlan(("python3", "-c", probe_script), None)
+            report = b"\x1b]11;rgb:abcd/1234/5678\x07"
+            name = embed.host_session(plan, "themetest", "themetest-race", 80, 24,
+                                      osc_report=report)
+            self.addCleanup(lambda: subprocess.run(
+                ["tmux", "-L", self.SOCKET, "kill-session", "-t", name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            deadline = time.monotonic() + 6.0
+            text = ""
+            while time.monotonic() < deadline:
+                text = embed.capture(name) or ""
+                if "RESP" in text:
+                    break
+                time.sleep(0.1)
+            self.assertIn("RESP", text, f"托管程序自己的首次查询应已完成：{text!r}")
+            self.assertNotIn("TIMEOUT", text, f"首次查询不应超时无应答：{text!r}")
+            self.assertIn("abab/1212/5656", text,
+                          f"首次查询应拿到注入的真实颜色，而不是 tmux 的默认猜测值：{text!r}")
 
 
 if __name__ == "__main__":

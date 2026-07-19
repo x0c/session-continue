@@ -5,7 +5,7 @@
 
 Fast terminal session picker for Claude Code, Codex CLI, OpenCode, and Kimi Code CLI.
 
-`pickup` scans your local Claude Code, Codex CLI, OpenCode, and Kimi Code CLI history, shows recent coding sessions in a curses TUI, and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
+`pickup` scans your local Claude Code, Codex CLI, OpenCode, and Kimi Code CLI history, shows recent coding sessions in a terminal UI (built with [Textual](https://github.com/Textualize/textual)), and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
 
 Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manager, Kimi Code CLI session manager, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
 
@@ -39,7 +39,7 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 
 - Python 3.10 or newer.
 - `tmux` (hard requirement — session hosting, embedded panes, and SSH keep-alive are all built on it).
-- macOS or Linux terminal with curses support.
+- macOS or Linux terminal (any modern ANSI-capable terminal works; the UI is built with Textual, not curses).
 - Claude Code, Codex CLI, OpenCode, and/or Kimi Code CLI installed if you want to resume those sessions.
 
 ## Install
@@ -219,7 +219,7 @@ pickup describe [command]                   # machine-readable command/argument/
 Every command prints a JSON envelope (`{ok, data, error, meta}`) and uses fine-grained exit codes
 (`0` success, `2` usage error, `3` not found, `5` ambiguous session reference). Running `pickup` with no
 subcommand outside a real terminal (piped, scripted, or invoked by an agent) also falls back to a
-JSON session list instead of trying to start the curses TUI.
+JSON session list instead of trying to start the terminal UI.
 
 For `list` and `search`, `--limit` is scan depth per runtime and `--top` is the returned result
 count cap. `search` returns `score`, `matched_via`, and `matched_fields`; `list`/`search` rows
@@ -280,8 +280,9 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 
 | Path | Purpose |
 | --- | --- |
-| `pickup.py` | curses TUI, preview screen, embedded-pane view, JSON output, direct-launch subcommand dispatch, and process handoff |
-| `embed.py` | embedded-pane host: renders hosted tmux sessions into the TUI (`capture-pane` out, `send-keys` in), SGR parsing, color-pair pool |
+| `pickup.py` | session store/data layer, formatting helpers, direct-launch subcommand dispatch, and process handoff; entry point delegates the UI to `ui.app.run_app()` |
+| `ui/` | Textual UI package: main screen (session list + embedded pane), full-screen preview, modals, session-list widget |
+| `embed.py` | embedded-pane host: renders hosted tmux sessions (`capture-pane` out, `send-keys` in), SGR parsing; framework-neutral rendering via `cell_style`/`grid_to_text` (Rich styles) |
 | `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
 | `keepalive.py` | tmux-backed launch wrapper: keep-alive on/off detection, wrap/attach launch plans, idle reaping (config for the dedicated tmux server is inlined here, not a separate file — see maintainer notes) |
 | `models.py` | shared session, handoff, and launch-plan data models |
@@ -299,7 +300,7 @@ Title generation is optional in practice: if `claude` is unavailable or fails, t
 Run the same checks used by CI:
 
 ```bash
-python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py test_*.py
+python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py ui/*.py test_*.py
 python3 -m unittest -v
 ```
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pickup"
-version = "0.17.0"
+version = "0.17.4"
 description = "Terminal session picker and handoff tool for Claude Code, Codex CLI, OpenCode, and Kimi Code CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ keywords = [
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "Environment :: Console :: Curses",
+  "Environment :: Console",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
@@ -33,7 +33,7 @@ classifiers = [
   "Topic :: Software Development",
   "Topic :: Terminals",
 ]
-dependencies = []
+dependencies = ["textual>=8.0"]
 
 [project.urls]
 Homepage = "https://github.com/x0c/pickup"
@@ -44,4 +44,4 @@ pickup = "pickup:main"
 
 [tool.setuptools]
 py-modules = ["models", "pickup", "agent_api", "scan_claude", "scan_codex", "scan_opencode", "scan_kimi", "scan_common", "titles", "titlegen", "keepalive", "embed"]
-packages = ["runtime"]
+packages = ["runtime", "ui"]

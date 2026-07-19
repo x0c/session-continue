@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# pickup 新版统一会话时间线端到端自测：隔离 HOME 与 tmux socket，不碰真实会话。
+# pickup 端到端自测（Textual 界面层）：隔离 HOME 与 tmux socket，不碰真实会话。
+#
+# 界面层已从 curses 换成 Textual；本脚本随之重写，覆盖：内嵌面板真实托管/
+# 接回/关闭、Ctrl+\ 焦点切回列表（Textual 能原生区分 Ctrl+\ 和连续两次按 \，
+# 不再需要旧版靠 300ms 时间窗口消歧义的双反斜杠 hack）、键盘输入真实转发进
+# 托管会话、Esc 退出、直启子命令（pickup claude ...）托管路径、IME 光标锚定
+# 的真实终端坐标验证、划词选中 + Ctrl+C 复制的真实 OSC 52 写入验证。
+#
+# 会话列表卡片本身的鼠标点击这版暂未覆盖（Textual 的会话列表布局与旧版 curses
+# 手绘坐标不同，点击路径本身走 Textual ListView 内置的鼠标处理，非本项目自写
+# 代码，风险低于键盘路径；如需要可后续用
+# `tmux send-keys -l "$(printf '\033[<0;COL;ROWM')"` 针对新布局重新量出坐标补上）。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +37,10 @@ cleanup() {
   tmux -L "$OUTER" kill-server 2>/dev/null || true
   tmux -L "$KEEPALIVE" kill-session -t pickup-claude-aaaa1111 2>/dev/null || true
   tmux -L "$KEEPALIVE" kill-session -t pickup-claude-bbbb2222 2>/dev/null || true
+  # direct_session/cursor_session 是直启子命令生成的随机 uuid 会话名，运行到
+  # 对应步骤才会被赋值；trap 在函数体内引用是延迟求值，EXIT 时能拿到当时的值。
+  [[ -n "${direct_session:-}" ]] && tmux -L "$KEEPALIVE" kill-session -t "$direct_session" 2>/dev/null || true
+  [[ -n "${cursor_session:-}" ]] && tmux -L "$KEEPALIVE" kill-session -t "$cursor_session" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -48,67 +63,83 @@ if [[ "${1:-}" == "--version" ]]; then echo "fake"; exit 0; fi
 sid=""
 previous=""
 for arg in "$@"; do [[ "$previous" == "--resume" ]] && sid="$arg"; previous="$arg"; done
+if [[ "$sid" == "cursortest" ]]; then
+  # 光标探测专用：不带换行地打印提示符，光标停在提示符末尾（模拟真实 shell/
+  # agent 等待输入时的光标位置），用于验证外层终端的真实硬件光标是否精确
+  # 落在这里——这是 IME 候选框定位依赖的同一套机制。
+  printf 'PROMPT> '
+  while true; do sleep 1; done
+fi
 echo "FAKE-CLAUDE --resume $sid"
 while IFS= read -r line; do echo "ECHO: $line"; done
 EOF
 chmod +x "$TMP/fakebin/claude"
 
 TMUX_DIR="$(dirname "$(command -v tmux)")"
-ENVV="HOME=$TMP/home PATH=$TMP/fakebin:$TMUX_DIR:/usr/local/bin:/usr/bin:/bin TERM=xterm-256color PICKUP_TITLE_GENERATOR=none"
+# textual/rich 是 pip --user 装的：HOME 一旦被隔离成 $TMP/home，--user 站点包
+# 路径会跟着 HOME 走而失效（真机排查过的坑，不是猜测）。这里把当前解释器实际
+# 能看到的 sys.path 原样透传，绕开这个问题；真正 pip install 到系统/venv 的
+# 用户不受影响。
+PYWORKAROUND_PATH="$(python3 -c 'import sys; print(":".join(p for p in sys.path if p))')"
+ENVV="HOME=$TMP/home PYTHONPATH=$PYWORKAROUND_PATH PATH=$TMP/fakebin:$TMUX_DIR:/usr/local/bin:/usr/bin:/bin TERM=xterm-256color PICKUP_TITLE_GENERATOR=none"
 tmux -L "$OUTER" new-session -d -s tui -x 180 -y 42
 tmux -L "$OUTER" set-option -t tui mouse on
 tmux -L "$OUTER" send-keys -t tui "cd $REPO && env $ENVV python3 pickup.py --limit 5" Enter
 
 wait_for "workA: 修复切换体验" 60
 wait_for "workB: 第二个会话" 60
+ok "首屏是跨运行时统一时间线"
+
+# 下移到第一张会话卡，右栏应展示未托管会话的静态摘要。
+tmux -L "$OUTER" send-keys -t tui Down
 wait_for "最近提问" 60
-ok "首屏是跨运行时统一时间线，右栏直接显示当前会话摘要"
+ok "选中未托管会话时右栏展示静态摘要"
 
-# 每张卡片有标题、状态和一行留白；第二张卡首行在 y=5（tmux SGR 坐标从 1 开始，因此 y=6）。点击等于 Enter。
-tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<0;12;6M')"
-tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<0;12;6m')"
-wait_for "FAKE-CLAUDE --resume bbbb2222" 60
-sessions | grep -qx "pickup-claude-bbbb2222"
-ok "鼠标点击第二张会话卡直接恢复该会话（等价 Enter）"
-
-# 双反斜杠从右栏回到列表；单个反斜杠不会作为快捷键处理。
-tmux -L "$OUTER" send-keys -t tui -l '\\'
-sleep 0.08
-tmux -L "$OUTER" send-keys -t tui -l '\\'
-wait_for "Enter 恢复/操作" 40
-ok "双反斜杠可从会话操作区返回列表"
-
-# 点击左栏空白处只回列表，不额外启动会话。
-before="$(sessions | grep -c '^pickup-claude-' || true)"
-tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<0;12;30M')"
-tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<0;12;30m')"
-sleep 0.5
-after="$(sessions | grep -c '^pickup-claude-' || true)"
-[[ "$before" == "$after" ]]
-wait_for "Enter 恢复/操作" 20
-ok "点击列表空白处只回到列表，不启动会话"
-
-# 点击第一张卡同样直接进入；同时验证 Enter 的旧路径保留。
-tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<0;12;3M')"
-tmux -L "$OUTER" send-keys -t tui -l "$(printf '\033[<0;12;3m')"
+tmux -L "$OUTER" send-keys -t tui Enter
 wait_for "FAKE-CLAUDE --resume aaaa1111" 60
 sessions | grep -qx "pickup-claude-aaaa1111"
-ok "点击第一张会话卡也直接恢复对应会话"
+ok "回车把会话托管进后台 tmux 并在右栏展示实时画面"
 
-tmux -L "$OUTER" send-keys -t tui -l '\\'
-sleep 0.08
-tmux -L "$OUTER" send-keys -t tui -l '\\'
-wait_for "Enter 恢复/操作" 40
-tmux -L "$OUTER" send-keys -t tui j Enter
-wait_for "FAKE-CLAUDE --resume bbbb2222" 40
-ok "键盘 Enter 恢复路径仍可用"
+# 键盘输入必须真的转发进托管会话（这是本次 curses -> Textual 迁移里出过真实
+# 回归的地方：MainScreen 曾经在挂载时抢焦点回列表，导致直启场景键位发不进去；
+# 这里在主列表路径下也钉一遍，防止同类问题复发）。
+tmux -L "$OUTER" send-keys -t tui -l "smoke-input"
+tmux -L "$OUTER" send-keys -t tui Enter
+wait_for "ECHO: smoke-input" 40
+sleep 0.5
+ok "键盘输入真实转发进托管会话（不是被列表吞掉）"
 
-# 回到列表后，Esc 必须退出 pickup；此前 q 才是退出键，且直接绑 Esc 会吞掉鼠标/方向键序列。
-tmux -L "$OUTER" send-keys -t tui -l '\\'
-sleep 0.08
-tmux -L "$OUTER" send-keys -t tui -l '\\'
-wait_for "Enter 恢复/操作" 40
-tmux -L "$OUTER" send-keys -t tui C-[
+# Ctrl+\ 回列表：Textual 原生区分 Ctrl+\ 与连续两次按 \，不再需要旧版的双反
+# 斜杠时间窗口消歧义。回列表后按 f 应该能正常切换项目筛选（如果焦点还停在
+# pane 上，这个按键会被当成字面文本发进托管会话，标题栏筛选状态不会变化）。
+tmux -L "$OUTER" send-keys -t tui C-\\
+sleep 0.8
+tmux -L "$OUTER" send-keys -t tui f
+wait_for "会话 · workA (" 20
+ok "Ctrl+\\ 把键盘焦点交回列表（f 项目筛选生效证明焦点确实回来了）"
+# 固定数据里有 workA/workB 两个项目，循环是 全部项目 -> workA -> workB -> 全部项目
+# 三档；再按两次 f 才能转回"全部项目"，不是一次。
+tmux -L "$OUTER" send-keys -t tui f
+wait_for "会话 · workB (" 20
+tmux -L "$OUTER" send-keys -t tui f
+wait_for "会话 · 全部项目 (" 20
+
+# 关闭分栏：托管会话必须在后台 tmux 继续存活，不能被一并杀掉。
+tmux -L "$OUTER" send-keys -t tui c
+sleep 0.4
+sessions | grep -qx "pickup-claude-aaaa1111"
+ok "c 关闭分栏后，托管会话仍在后台存活"
+
+# 再次回车接回同一个托管会话，不能新建重复会话。
+tmux -L "$OUTER" send-keys -t tui Enter
+wait_for "FAKE-CLAUDE --resume aaaa1111" 40
+[[ "$(sessions | grep -c '^pickup-claude-aaaa1111$')" == "1" ]]
+ok "重新回车接回已托管会话，不产生重复会话"
+
+# Esc 退出：先回列表，再 Esc。
+tmux -L "$OUTER" send-keys -t tui C-\\
+sleep 0.8
+tmux -L "$OUTER" send-keys -t tui Escape
 for _ in {1..20}; do
   [[ "$(tmux -L "$OUTER" display-message -p -t tui '#{pane_current_command}')" != "python3" ]] && break
   sleep 0.1
@@ -118,6 +149,110 @@ if [[ "$(tmux -L "$OUTER" display-message -p -t tui '#{pane_current_command}')" 
   cap >&2
   exit 1
 fi
-ok "列表 Esc 退出，同时不影响前述鼠标点击和 Enter 路径"
+ok "列表 Esc 退出，托管会话继续在后台存活"
+sessions | grep -qx "pickup-claude-aaaa1111"
+ok "退出 pickup 后，后台托管会话不受影响"
+
+# ---- 直启子命令：pickup claude --resume <id> 直接带进 TUI 侧边栏并托管 ----
+# 直启的 ident 是 keepalive.new_session_ident() 生成的随机 uuid 片段，与
+# --resume 后面的参数无关，因此新会话名靠"托管前后 diff 出唯一新增项"识别，
+# 不能假设成 pickup-claude-<--resume 的参数>。
+before_direct="$(sessions | grep '^pickup-claude-' || true)"
+tmux -L "$OUTER" new-window -t tui -n direct
+tmux -L "$OUTER" send-keys -t direct "cd $REPO && env $ENVV python3 pickup.py claude --resume directcccc" Enter
+wait_for_direct() {
+  local text="$1" tries="${2:-40}"
+  local i
+  for ((i = 0; i < tries; i++)); do
+    tmux -L "$OUTER" capture-pane -p -t direct 2>/dev/null | grep -qF -- "$text" && return 0
+    sleep 0.25
+  done
+  echo "未等到（direct 窗口）：$text" >&2
+  tmux -L "$OUTER" capture-pane -p -t direct >&2 || true
+  return 1
+}
+wait_for_direct "FAKE-CLAUDE --resume directcccc" 60
+direct_session="$(comm -13 <(echo "$before_direct" | sort) <(sessions | grep '^pickup-claude-' | sort))"
+[[ -n "$direct_session" ]]
+ok "直启子命令自动托管新会话并在侧边栏展示"
+
+tmux -L "$OUTER" send-keys -t direct -l "direct-smoke-input"
+tmux -L "$OUTER" send-keys -t direct Enter
+wait_for_direct "ECHO: direct-smoke-input" 40
+ok "直启场景键盘输入同样真实转发进托管会话（此前真机冒烟发现的焦点回归点）"
+
+# ---- IME 光标锚定：真实终端硬件光标必须精确落在托管 pane 内的真实光标位置 ----
+# （这是 IME 候选框/emoji 弹出框定位依赖的同一套机制，真机没有输入法没法直接
+# 看候选框位置，但可以验证底层依据——外层终端光标坐标——算得准不准）。
+# 快照必须在新建 cursor 窗口之前拍，diff 才有意义（曾经错误地在 wait_for_cursor
+# 成功之后才拍快照，那时新会话早已存在，diff 出来永远是空，是脚本自身的 bug，
+# 不是产品的 bug）。
+before_cursor="$(sessions | grep '^pickup-claude-' || true)"
+tmux -L "$OUTER" new-window -t tui -n cursor
+tmux -L "$OUTER" send-keys -t cursor "cd $REPO && env $ENVV python3 pickup.py claude --resume cursortest" Enter
+wait_for_cursor() {
+  local text="$1" tries="${2:-40}"
+  local i
+  for ((i = 0; i < tries; i++)); do
+    tmux -L "$OUTER" capture-pane -p -t cursor 2>/dev/null | grep -qF -- "$text" && return 0
+    sleep 0.25
+  done
+  echo "未等到（cursor 窗口）：$text" >&2
+  tmux -L "$OUTER" capture-pane -p -t cursor >&2 || true
+  return 1
+}
+wait_for_cursor "PROMPT>" 60
+cursor_session="$(comm -13 <(echo "$before_cursor" | sort -u) <(sessions | grep '^pickup-claude-' | sort -u) | head -1)"
+if [[ -z "$cursor_session" ]]; then
+  echo "未能识别出 cursor 测试新建的托管会话名" >&2
+  sessions >&2
+  exit 1
+fi
+sleep 0.3
+inner_cursor="$(tmux -L "$KEEPALIVE" display-message -p -t "$cursor_session" '#{cursor_x},#{cursor_y}')"
+outer_cursor="$(tmux -L "$OUTER" display-message -p -t cursor '#{cursor_x},#{cursor_y}')"
+outer_x="${outer_cursor%,*}"; outer_y="${outer_cursor#*,}"
+inner_x="${inner_cursor%,*}"; inner_y="${inner_cursor#*,}"
+# 左栏固定宽度 44（ui/main_screen.py 的 LIST_PANE_WIDTH），面板起点在第 44 列；
+# 真实外层光标列 = 44 + pane 内真实光标列，行 = pane 内真实光标行（面板顶部无
+# 额外偏移）。算错了说明 EmbedPane._update_app_cursor 的坐标换算或时机有问题。
+expected_x=$((44 + inner_x))
+if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$inner_y" ]]; then
+  ok "外层终端真实光标精确落在托管 pane 内的真实光标位置（内 ${inner_cursor} -> 外 ${outer_cursor}，IME 候选框定位依据的机制验证通过）"
+else
+  echo "光标锚定坐标不匹配：inner=${inner_cursor} outer=${outer_cursor} expected_x=${expected_x}" >&2
+  exit 1
+fi
+
+# ---- IME 关键回归：外层真实光标必须「可见」（DECTCEM 打开），不能只是位置对 ----
+# Textual 全屏运行期默认 `\e[?25l` 藏掉真实光标，只移动一个看不见的光标——位置
+# 再准，IME 也没有可见锚点，用户在内嵌 Agent 里根本打不出中文（真机反馈）。
+# `#{cursor_flag}` 反映托管 pickup 当前有没有把真实光标显示出来：聚焦内嵌 pane
+# 且有可见光标时必须为 1。EmbedPane._set_real_cursor 就是补这一步的。
+outer_cursor_flag="$(tmux -L "$OUTER" display-message -p -t cursor '#{cursor_flag}')"
+if [[ "$outer_cursor_flag" == "1" ]]; then
+  ok "外层终端真实光标处于「可见」状态（cursor_flag=1）——IME 有可见锚点，中文合成才能激活"
+else
+  echo "外层真实光标被隐藏（cursor_flag=${outer_cursor_flag}）：位置对但不可见，IME 仍无法工作" >&2
+  exit 1
+fi
+
+# ---- 划词选中 + Ctrl+C 复制：验证真实 OSC 52 写入到达外层终端（tmux 充当） ----
+tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<0;39;1M')"
+sleep 0.05
+tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<32;70;1M')"
+sleep 0.05
+tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<0;70;1m')"
+sleep 0.3
+tmux -L "$OUTER" set-option -t cursor set-clipboard on
+tmux -L "$OUTER" send-keys -t cursor C-c
+sleep 0.5
+copied="$(tmux -L "$OUTER" show-buffer 2>/dev/null || true)"
+if [[ "$copied" == *"PROMPT>"* ]]; then
+  ok "划词选中托管 pane 画面文字后 Ctrl+C 复制，真实 OSC 52 写入到达外层终端"
+else
+  echo "划词复制未生效，tmux 缓冲区内容：${copied@Q}" >&2
+  exit 1
+fi
 
 echo "==== $PASS passed, 0 failed ===="

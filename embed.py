@@ -13,15 +13,18 @@ pickup-* 命名空间：e 键全屏接管、keepalive.annotate() 状态标注、
 
 from __future__ import annotations
 
-import curses
+import collections
 import functools
 import re
 import shutil
 import subprocess
 import threading
+import time
 import unicodedata
-from collections import OrderedDict
 from dataclasses import dataclass
+
+from rich.color import Color
+from rich.style import Style
 
 import keepalive
 from models import LaunchPlan
@@ -50,15 +53,31 @@ def available(disabled_flag: bool = False) -> bool:
     return shutil.which("tmux") is not None
 
 
-def host_session(plan: LaunchPlan, runtime_id: str, ident: str, width: int, height: int) -> str:
+def host_session(
+    plan: LaunchPlan, runtime_id: str, ident: str, width: int, height: int,
+    osc_report: bytes | None = None,
+) -> str:
     """把启动计划以 detached 方式托管进保活 socket，返回 tmux 会话名。
 
     与 keepalive.wrap_plan 同命名空间、同环境变量注入；区别在不 attach（-d），
     并按面板实际尺寸创建（-x/-y），避免先 80x24 再 resize 的重排闪烁。
     会话名已存在（极端情况下同名残留）时视为复用，直接返回名字。
     创建时经 -P 顺带取回 pane_id 记入 _pane_ids——refresh -r 背景色注入需要
-    pane_id 寻址，创建时就拿可以省掉一次 display-message 往返，让注入抢在
-    agent 启动主题检测之前完成。
+    pane_id 寻址，创建时就拿可以省掉一次 display-message 往返。
+
+    `osc_report` 非空且 tmux 支持 refresh-client -r 时，创建成功后立即（用一个
+    专属的、会保持连接的控制通道）注入背景色，而不是等调用方后续聚焦面板时
+    才注入——尽量把窗口提前。
+
+    真机排查记录（这条限制目前无法从 pickup 这一侧完全消除，如实记录）：
+    refresh-client -r 依赖"当前有一个控制模式客户端连接着"这个前提——一旦
+    注入用的通道关闭，效果会跟着消失（实测：一次性开关道注入后立刻关闭，
+    托管进程此后一次都查不到颜色，比完全不做早注入还差）；且它只影响"pane
+    尚未被回答过"的后续查询，一旦某次查询已经被 tmux 用默认猜测值（通常是
+    纯黑）答复过，那次查询的结果就定死了，之后再注入也不能让已经用掉错误
+    答案的进程回头重新查一遍。也就是说，创建会话到真实 agent 自己发起第一次
+    查询之间，仍然存在无法从时序上完全消灭的竞态窗口——这是 tmux 控制协议本
+    身的限制，不是可以单靠调整 pickup 这边调用顺序解决的。
     """
     name = keepalive._session_name(runtime_id, ident)
     argv = [
@@ -89,6 +108,11 @@ def host_session(plan: LaunchPlan, runtime_id: str, ident: str, width: int, heig
         raise EmbedError(f"无法创建内嵌会话 {name}") from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EmbedError(f"无法创建内嵌会话 {name}：{exc}") from exc
+    if osc_report and supports_theme_report():
+        open_channel(name)  # 让 report_theme 依赖的"当前有客户端连接"前提尽早成立
+        channel = active_channel(name)
+        if channel is not None:
+            report_theme(channel, osc_report)
     return name
 
 
@@ -352,6 +376,11 @@ _channel_lock = threading.Lock()
 def open_channel(name: str, on_output=None) -> ControlChannel | None:
     """聚焦托管会话时打开控制通道；同时只维护一条，切换会话时自动关旧开新。
 
+    同名复用时也要把 on_output 换成最新调用者传入的回调——host_session 会在
+    真实命令跑起来前就为注入背景色调用一次（回调是 None），EmbedPane 稍后
+    聚焦同一个会话时如果不更新回调，会一直沿用 None，导致「抓到新输出立即
+    唤醒重绘」这个事件驱动机制失效、退化成慢速轮询。
+
     打开失败（tmux 缺失、会话刚退出）返回 None，全部发送路径自动回退外部 fork。
     """
     global _channel
@@ -364,6 +393,8 @@ def open_channel(name: str, on_output=None) -> ControlChannel | None:
                 _channel = ControlChannel(name, on_output)
             except OSError:
                 _channel = None
+        elif on_output is not None:
+            _channel.on_output = on_output
         return _channel
 
 
@@ -409,6 +440,59 @@ def sgr_mouse_sequence(button: int, x: int, y: int) -> str:
     return f"\x1b[<{button};{x};{y}M"
 
 
+# ---- SGR 鼠标序列后台发送 ----
+#
+# 新版 Claude Code（v2.1.88 起默认全屏渲染并申请鼠标捕获）下，滚轮事件要转成
+# SGR 序列直达内层程序。触控板惯性滚动一秒能产生上百个事件，而 send_literal
+# 的 force_fork 路径每次约 10ms——在 UI 主线程同步发送会把整个界面堵死
+# （2026-07-19 真机定位的滚动卡顿根因）。这里统一排队到专用后台线程发送：
+# 主线程零 fork；积压超过上限时丢弃最旧事件——内层程序重绘不过来时，跳过
+# 中间几步比停手后还在"追滚动"体验好，与 tmux 自身丢弃鼠标事件的策略一致。
+# 发送仍走 force_fork 外部子进程（tmuxy 实测：转义密集的 SGR 内容走外部比
+# 控制通道稳），只是不再阻塞调用方。
+
+_WHEEL_SEND_INTERVAL = 0.02  # 发送限速（秒）：内层程序每个滚轮事件都要整屏重绘，更快没意义
+_WHEEL_QUEUE_MAX = 12        # 单会话积压上限，超出丢最旧
+_wheel_lock = threading.Lock()
+_wheel_queues: dict[str, "collections.deque[str]"] = {}
+_wheel_wake = threading.Event()
+_wheel_thread: threading.Thread | None = None
+
+
+def send_mouse_sequence(name: str, seq: str) -> None:
+    """非阻塞发送 SGR 鼠标序列：排队到后台线程发送，UI 主线程可安全调用。"""
+    global _wheel_thread
+    with _wheel_lock:
+        queue = _wheel_queues.setdefault(name, collections.deque())
+        queue.append(seq)
+        while len(queue) > _WHEEL_QUEUE_MAX:
+            queue.popleft()
+        if _wheel_thread is None or not _wheel_thread.is_alive():
+            _wheel_thread = threading.Thread(
+                target=_wheel_send_loop, daemon=True, name="embed-mouse-sender")
+            _wheel_thread.start()
+    _wheel_wake.set()
+
+
+def _wheel_send_loop() -> None:
+    while True:
+        with _wheel_lock:
+            name = next((n for n, q in _wheel_queues.items() if q), None)
+            seq = _wheel_queues[name].popleft() if name is not None else None
+            if name is not None and not _wheel_queues[name]:
+                del _wheel_queues[name]
+        if seq is None:
+            # 无事时挂起等唤醒；5s 兜底心跳防止极端竞争下漏唤醒
+            _wheel_wake.wait(5.0)
+            _wheel_wake.clear()
+            continue
+        started = time.monotonic()
+        send_literal(name, seq, force_fork=True)
+        remaining = _WHEEL_SEND_INTERVAL - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+
 # ---- 终端背景色注入：refresh-client -r（tmux 3.5a+）----
 
 @functools.lru_cache(maxsize=1)
@@ -446,42 +530,42 @@ def report_theme(channel: ControlChannel, report: bytes) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 按键翻译：curses getch 返回的键码 → tmux send-keys 键名 / 字面文本
+# 按键翻译：Textual 按键事件的 key 名 → tmux send-keys 键名
 # ---------------------------------------------------------------------------
 
-_KEY_NAMES = {
-    curses.KEY_UP: "Up",
-    curses.KEY_DOWN: "Down",
-    curses.KEY_LEFT: "Left",
-    curses.KEY_RIGHT: "Right",
-    curses.KEY_HOME: "Home",
-    curses.KEY_END: "End",
-    curses.KEY_PPAGE: "PPage",
-    curses.KEY_NPAGE: "NPage",
-    curses.KEY_DC: "DC",
-    curses.KEY_IC: "IC",
-    curses.KEY_BACKSPACE: "BSpace",
+_TEXTUAL_KEY_NAMES = {
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PPage",
+    "pagedown": "NPage",
+    "delete": "DC",
+    "insert": "IC",
 }
-_KEY_NAMES.update({getattr(curses, f"KEY_F{n}"): f"F{n}" for n in range(1, 13)})
+_TEXTUAL_KEY_NAMES.update({f"f{n}": f"F{n}" for n in range(1, 13)})
 
 
-def translate_key(ch: int) -> tuple[str, str] | None:
-    """把 curses 键码翻译成 ("literal", 文本) 或 ("keys", tmux 键名)；无法翻译返回 None。
+def translate_textual_key(key: str) -> tuple[str, str] | None:
+    """把 Textual 按键事件的 key 名翻译成 ("keys", tmux 键名)；无法翻译返回 None。
 
-    可打印 ASCII 与高位字节（UTF-8 片段，由调用方先按字节攒批、解码后再调
-    send_literal）不经过这里；这里只处理控制键与特殊键。
+    可打印字符经 Textual 的 event.character 直接走 send_literal，不经过这里；
+    这里只处理控制键与特殊键名（Textual 的 key 是稳定字符串，如 "up"/"ctrl+c"，
+    不再是 curses 那种平台相关的整数键码）。
     """
-    if ch in (10, 13, curses.KEY_ENTER):
+    if key in ("enter", "return"):
         return ("keys", "Enter")
-    if ch == 9:
+    if key == "tab":
         return ("keys", "Tab")
-    if ch in (8, 127):
+    if key == "backspace":
         return ("keys", "BSpace")
-    if ch == 27:
+    if key == "escape":
         return ("keys", "Escape")
-    if 1 <= ch <= 26:
-        return ("keys", f"C-{chr(ord('a') + ch - 1)}")
-    name = _KEY_NAMES.get(ch)
+    if key.startswith("ctrl+") and len(key) == 6 and key[5].isalpha():
+        return ("keys", f"C-{key[5]}")
+    name = _TEXTUAL_KEY_NAMES.get(key)
     if name is not None:
         return ("keys", name)
     return None
@@ -660,66 +744,48 @@ def parse_screen(text: str, width: int, height: int) -> list[list[Cell]]:
 
 
 # ---------------------------------------------------------------------------
-# curses 颜色对池：内嵌画面的 fg/bg 组合不可预知，按需 init_pair + LRU 复用
+# 画面单元格 → Rich Style：渲染框架中立，供任意能画 Rich Text 的界面复用
 # ---------------------------------------------------------------------------
 
-class PairPool:
-    """动态颜色对分配器。
-
-    curses 的 COLOR_PAIRS 有限（常见 256 或 32767），pickup.py 的静态颜色对占用前
-    15 个，池子从 first 开始分配。组合数超出容量时按 LRU 回收颜色对编号重新
-    init_pair；连默认背景组合都放不下时退化为无颜色，保证不崩。
+@functools.lru_cache(maxsize=4096)
+def cell_style(cell: Cell) -> Style:
+    """把一个单元格的颜色/属性组合编译成 Rich Style；结果按组合缓存（Cell 是
+    frozen dataclass，可哈希），避免每帧对同一批组合重复构造 Style 对象。
     """
+    return Style(
+        color=Color.from_ansi(cell.fg) if cell.fg >= 0 else None,
+        bgcolor=Color.from_ansi(cell.bg) if cell.bg >= 0 else None,
+        bold=cell.bold or None,
+        dim=cell.dim or None,
+        underline=cell.underline or None,
+        reverse=cell.reverse or None,
+    )
 
-    def __init__(self, first: int = 16, use_default: bool = True):
-        self.first = first
-        self.use_default = use_default
-        self.capacity = max(0, min(curses.COLOR_PAIRS, 512) - first)
-        self._pairs: OrderedDict[tuple[int, int], int] = OrderedDict()
 
-    def _color(self, value: int, fallback: int) -> int:
-        if value == -1 and not self.use_default:
-            return fallback
-        return value
-
-    def _pair_number(self, fg: int, bg: int) -> int | None:
-        key = (fg, bg)
-        existing = self._pairs.get(key)
-        if existing is not None:
-            self._pairs.move_to_end(key)
-            return existing
-        if not self.capacity:
-            return None
-        if len(self._pairs) >= self.capacity:
-            _, number = self._pairs.popitem(last=False)  # 回收最久未用的编号
-        else:
-            number = self.first + len(self._pairs)
-        try:
-            curses.init_pair(number, fg, bg)
-        except curses.error:
-            return None
-        self._pairs[key] = number
-        return number
-
-    def attr(self, cell: Cell) -> int:
-        attr = 0
-        if cell.bold:
-            attr |= curses.A_BOLD
-        if cell.dim:
-            attr |= curses.A_DIM
-        if cell.underline:
-            attr |= curses.A_UNDERLINE
-        if cell.reverse:
-            attr |= curses.A_REVERSE
-        fg = self._color(cell.fg, curses.COLOR_WHITE)
-        bg = self._color(cell.bg, curses.COLOR_BLACK)
-        if fg == -1 and bg == -1:
-            return attr
-        number = self._pair_number(fg, bg)
-        if number is None:
-            # 池满：先丢背景色再试一次，仍失败就放弃颜色只留属性
-            if bg != -1:
-                number = self._pair_number(fg, -1 if self.use_default else curses.COLOR_BLACK)
-            if number is None:
-                return attr
-        return attr | curses.color_pair(number)
+def grid_to_text(grid: list[list[Cell]]) -> list[tuple[str, list[tuple[int, int, Style]]]]:
+    """把单元格网格编译成每行 (纯文本, 样式段列表) ——样式段是 (起始列, 结束列, Style)，
+    相邻同样式单元格合并成一段。调用方（如 Textual 的 EmbedPane）据此构造
+    `rich.text.Text` 并按段调用 `stylize`，避免逐格构造 Style/Span 的开销。
+    """
+    rows: list[tuple[str, list[tuple[int, int, Style]]]] = []
+    for row in grid:
+        chars: list[str] = []
+        spans: list[tuple[int, int, Style]] = []
+        x = 0
+        span_start = 0
+        span_style: Style | None = None
+        for cell in row:
+            if cell.wide_cont:
+                continue
+            chars.append(cell.ch)
+            style = cell_style(cell)
+            if style != span_style:
+                if span_style is not None and x > span_start:
+                    spans.append((span_start, x, span_style))
+                span_start = x
+                span_style = style
+            x += 1
+        if span_style is not None and x > span_start:
+            spans.append((span_start, x, span_style))
+        rows.append(("".join(chars), spans))
+    return rows
