@@ -69,7 +69,7 @@ python3 -m unittest -v
 
 涉及界面时还要运行一次真实终端冒烟。标题后台生成会调用本机 agent CLI、消耗对应账号额度；只验证界面时，在临时目录把 `claude`、`codex` 指向本机 `true`，放到 `PATH` 最前面，再启动 `python3 pickup.py --limit 5`，确认：
 
-- 底部 Textual `Footer` 显示 `a 高级操作`（`ui/main_screen.py` 的 `MainScreen.BINDINGS`，不再是 curses 手绘的底部帮助行）。
+- 底部 Textual `Footer` 显示 `a Advanced`（中文环境下为 `a 高级操作`；`ui/main_screen.py` 的 `MainScreen.BINDINGS`，不再是 curses 手绘的底部帮助行）。
 - 高级操作弹窗（`ui/modals.py` 的 `choose_target_runtime`）动态列出注册表中的运行时。
 - 默认选中第一个已安装的其他运行时。
 - `Esc` 先关闭弹窗，再退出主界面。

@@ -79,5 +79,8 @@ def run_app(store, embed_ok: bool, direct=None, osc_report: bytes | None = None)
     终端 OSC 10/11 应答（见 pickup._probe_osc_colours），用于内嵌面板聚焦托管
     会话时注入真实背景色。
     """
+    import i18n
+
+    i18n.init()  # 按 PICKUP_LANG / 系统 locale 选定界面语言
     app = PickupApp(store, embed_ok, direct, osc_report)
     return app.run()

@@ -22,6 +22,11 @@ import time
 import unittest
 from unittest import mock
 
+import i18n
+
+# 界面测试固定英文，避免 CI/本机 LANG=zh* 时断言漂移
+i18n.set_lang("en")
+
 import pickup
 from models import LaunchPlan
 from textual import events
@@ -243,21 +248,21 @@ class SessionStoreFailureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(store.loaded)
         self.assertTrue(store.wait_loaded(timeout=0))
-        self.assertIn("会话加载失败", store.get_load_error())
+        self.assertIn("Failed to load sessions", store.get_load_error())
         self.assertIn("历史目录暂时不可读", store.get_load_error())
 
         app = PickupApp(store, embed_ok=False)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.1)
             search = app.screen.query_one("#project-search", Input)
-            self.assertIn("会话加载失败", search.placeholder)
-            self.assertIn("正在自动重试", search.placeholder)
+            self.assertIn("Failed to load sessions", search.placeholder)
+            self.assertIn("retrying", search.placeholder)
 
             self.assertFalse(store.refresh())
             self.assertIsNone(store.get_load_error())
             app.screen._update_header()
-            self.assertNotIn("失败", search.placeholder)
-            self.assertNotIn("正在自动重试", search.placeholder)
+            self.assertNotIn("Failed", search.placeholder)
+            self.assertNotIn("retrying", search.placeholder)
 
 
 class SessionCardVisualTests(unittest.TestCase):
@@ -372,9 +377,9 @@ class SessionCardVisualTests(unittest.TestCase):
 
     def test_running_status_is_green_but_ended_status_is_not(self) -> None:
         cases = (
-            (self._card(live=True), "运行中", True),
-            (self._card(keepalive_name="pickup-opencode-visual"), "运行中(托管)", True),
-            (self._card(), "已结束", False),
+            (self._card(live=True), "Running", True),
+            (self._card(keepalive_name="pickup-opencode-visual"), "Running (hosted)", True),
+            (self._card(), "Ended", False),
         )
         for card, status_text, expected_green in cases:
             with self.subTest(status=status_text), mock.patch.object(
@@ -450,7 +455,7 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             search = app.screen.query_one("#project-search", Input)
             self.assertEqual(list_view.index, 0)  # 固定「+新建会话」项
             self.assertEqual(len(list_view.visible_sessions()), 3)
-            self.assertIn("筛选项目", search.placeholder)
+            self.assertIn("Filter projects", search.placeholder)
 
             await pilot.press("down")
             await pilot.pause()
@@ -552,7 +557,7 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             list_view = app.screen.query_one(SessionListView)
             cards_before = list_view._session_cards()
             self.assertEqual(len(cards_before), 3)
-            self.assertNotIn("运行中", cards_before[0].render().plain)
+            self.assertNotIn("Running", cards_before[0].render().plain)
 
             # 模拟一次后台重扫：s0 的会话字典被替换成新对象（和真实 _merge_scanned
             # 行为一致，扫描结果每次都是新 dict），但会话键集合/顺序没变，
@@ -569,7 +574,7 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
                 "会话集合没变时不应该重新 mount 任何 SessionCard 实例",
             )
             self.assertIs(cards_after[0].session, new_session)
-            self.assertIn("运行中", cards_after[0].render().plain)
+            self.assertIn("Running", cards_after[0].render().plain)
 
     async def test_refresh_detects_detail_changes_and_updates_card_and_pane_in_place(self) -> None:
         old_session = {
@@ -1187,7 +1192,7 @@ class RightPanePreviewTests(unittest.IsolatedAsyncioTestCase):
 
             await _wait_until(lambda: "测试问题" in pane.render().plain and "测试回复" in pane.render().plain)
             detail = pane.render().plain
-            self.assertIn("● 你", detail)
+            self.assertIn("● You", detail)
             self.assertIn("测试问题", detail)
             self.assertIn("测试回复", detail)
             self.assertNotIn("最近提问", detail)
@@ -1223,6 +1228,43 @@ class RightPanePreviewTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
         self.assertIsInstance(app.return_value, pickup.LaunchRequest)
         self.assertEqual(app.return_value.target_runtime_id, "codex")
+
+    async def test_right_pane_detail_scrolls_with_page_and_end(self) -> None:
+        """长对话预览：PgDn / End 必须真正改变可见窗口（此前静态详情被裁成一屏无法滚动）。"""
+        long_msgs = []
+        for i in range(40):
+            long_msgs.append(pickup.ConversationMessage("user", f"问题行-{i}-" + ("x" * 20)))
+            long_msgs.append(pickup.ConversationMessage("assistant", f"回复行-{i}-" + ("y" * 20)))
+        sessions = [{
+            "source": "claude", "id": "s0", "short_id": "s0",
+            "mtime": time.time(), "size_bytes": 1, "size_kb": 1,
+            "native_title": None, "fallback_title": "长对话",
+            "cwd": "/tmp", "live": False,
+        }]
+        store, registry = _make_store(sessions=sessions)
+        registry.get("claude").load_conversation.return_value = long_msgs
+        # 清掉 store.load() 时预热的短对话缓存，强制按新返回值重读
+        store.conversations.clear()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause(delay=0.2)
+            await pilot.press("down")
+            pane = app.screen.query_one(EmbedPane)
+            await _wait_until(
+                lambda: pane._is_detail_view() and "问题行-0" in pane.render().plain,
+                tries=300,
+                interval=0.02,
+            )
+            self.assertEqual(pane.detail_offset, 0)
+            # 直接调滚动 API 验证窗口机制（再测键盘绑定）
+            self.assertTrue(pane.scroll_detail_page(1))
+            self.assertGreater(pane.detail_offset, 0)
+            top_after_page = pane.detail_offset
+            await pilot.press("end")
+            await pilot.pause()
+            self.assertGreaterEqual(pane.detail_offset, top_after_page)
+            self.assertTrue(pane.scroll_detail_home())
+            self.assertEqual(pane.detail_offset, 0)
 
 
 class ModalTests(unittest.IsolatedAsyncioTestCase):
@@ -1266,7 +1308,7 @@ class ModalTests(unittest.IsolatedAsyncioTestCase):
             bell.assert_called_once()
             self.assertIsInstance(app.screen, RuntimePickerModal)  # 未安装项不应关闭弹窗
 
-    async def test_confirm_modal_y_confirms_other_key_cancels(self) -> None:
+    async def test_confirm_modal_other_key_cancels(self) -> None:
         store, _ = _make_store()
         app = PickupApp(store, embed_ok=False)
         async with app.run_test(size=(100, 30)) as pilot:
@@ -1282,9 +1324,25 @@ class ModalTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(delay=0.2)
         self.assertFalse(result_holder.get("result"))
 
+    async def test_confirm_modal_q_confirms(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            result_holder = {}
+
+            async def _open():
+                result_holder["result"] = await app.push_screen_wait(ConfirmModal("确认？"))
+
+            app.run_worker(_open())
+            await pilot.pause(delay=0.3)  # 等 ConfirmModal call_after_refresh 武装
+            await pilot.press("q")
+            await pilot.pause(delay=0.2)
+        self.assertTrue(result_holder.get("result"))
+
 
 class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_x_key_confirm_kills_and_clears_keepalive_name(self) -> None:
+    async def test_q_key_confirm_kills_and_clears_keepalive_name(self) -> None:
         sessions = [{
             "source": "claude", "id": "s0", "short_id": "s0", "mtime": time.time(),
             "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "会话0",
@@ -1296,11 +1354,11 @@ class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await pilot.pause(delay=0.2)
                 await pilot.press("down")
-                await pilot.press("x")
-                await pilot.pause()
+                await pilot.press("q")
+                await pilot.pause(delay=0.3)  # worker 推弹窗 + ConfirmModal 武装
                 self.assertIsInstance(app.screen, ConfirmModal)
-                await pilot.press("y")
-                await pilot.pause()
+                await pilot.press("q")
+                await pilot.pause(delay=0.2)
         kill_mock.assert_called_once_with("pickup-claude-fake")
         current = store.find_session("claude:s0")
         self.assertIsNotNone(current)

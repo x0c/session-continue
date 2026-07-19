@@ -97,10 +97,20 @@ class SessionCard(Widget):
         is_gen = self.is_generating
         is_keepalive = bool(session.get("keepalive_name"))
         is_running = is_keepalive or bool(session.get("live"))
-        status_text = "运行中(托管)" if is_keepalive else ("运行中" if is_running else "已结束")
+        from i18n import t
+
+        status_text = (
+            t("status.running_hosted")
+            if is_keepalive
+            else (t("status.running") if is_running else t("status.ended"))
+        )
 
         project_path = pickup._normalize_cwd(session.get("cwd"))
-        project = os.path.basename(project_path) if project_path else str(session.get("cwd_display") or "未知项目")
+        project = (
+            os.path.basename(project_path)
+            if project_path
+            else str(session.get("cwd_display") or t("project.unknown"))
+        )
         title_prefix = f"{project}: "
         if is_gen:
             title_prefix = f"{self._spin_char} {title_prefix}"
@@ -143,8 +153,10 @@ class NewSessionCard(Widget):
     """
 
     def render(self) -> Text:
+        from i18n import t
+
         # 第二行空行：与会话卡同样把分隔算进本项命中区
-        return Text("＋ 新建会话", style="bold") + Text("\n")
+        return Text(t("list.new_session"), style="bold") + Text("\n")
 
 
 class SessionListView(ListView):
@@ -159,8 +171,11 @@ class SessionListView(ListView):
     """
 
     BINDINGS = [
-        Binding("j", "cursor_down", "选择", show=False),
-        Binding("k", "cursor_up", "选择", show=False),
+        Binding("j", "cursor_down", "Select", show=False),
+        Binding("k", "cursor_up", "Select", show=False),
+        # 覆盖 ScrollableContainer 的 up/down=scroll_*：会话列表应移光标，不是滚视口
+        Binding("down", "cursor_down", "Select", show=False),
+        Binding("up", "cursor_up", "Select", show=False),
     ]
 
     def __init__(self, store: "pickup.SessionStore", nav, **kwargs) -> None:
@@ -292,6 +307,9 @@ class SessionListView(ListView):
                 )
             )
 
+        # clear 前记下是否已有会话卡：用来区分「初次填充」和「用户正停在新建项」
+        had_session_cards = bool(self._session_cards())
+
         # batch_update() 抑制 clear()+extend() 中间那次多余重绘；两步都要 await
         # 完成（DOM 真正更新），批量 API 本身已经把"多次 mount"合成一轮。
         with self.app.batch_update():
@@ -304,7 +322,8 @@ class SessionListView(ListView):
                 new_index = i + 1
         if previous_key is not None:
             self.index = new_index
-        elif self.index is None:
+        elif not had_session_cards:
+            # 初次填充：默认选最近一条会话（进 pickup 回车即恢复）
             self.index = 1 if sessions else 0
         # Textual 已知问题（issue #6300）：clear()+extend() 后紧接着设置 index，
         # 高亮理论上可能只在内部状态里正确、要等用户交互才真正刷新到屏幕。在当前

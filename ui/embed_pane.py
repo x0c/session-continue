@@ -111,6 +111,8 @@ class EmbedPane(Widget):
     # 不能命名为 scroll_offset：这是 Textual Widget 的二维滚动属性，
     # 覆盖成整数会让框架的文本拖选计算变成 Offset + int。
     history_offset: reactive[int] = reactive(0)
+    # 静态对话预览的纵向偏移（行）；与 history_offset 互不共用，避免实时托管状态串扰。
+    detail_offset: reactive[int] = reactive(0)
 
     def __init__(
         self,
@@ -192,6 +194,7 @@ class EmbedPane(Widget):
         self.session_name = name
         self._detail_renderer = fallback_renderer
         self.dead = False
+        self.detail_offset = 0
         self.invalidate_detail()
         self.history_offset = 0
         channel = embed.open_channel(name, on_output=self._on_pane_output)
@@ -214,6 +217,7 @@ class EmbedPane(Widget):
         self._cursor = None
         self._detail_renderer = renderer
         self.dead = False
+        self.detail_offset = 0
         self.invalidate_detail()
 
     def clear(self) -> None:
@@ -224,6 +228,7 @@ class EmbedPane(Widget):
         self._strips = None
         self._cursor = None
         self.dead = False
+        self.detail_offset = 0
         embed.close_channel()
         self.invalidate_detail()
 
@@ -470,16 +475,75 @@ class EmbedPane(Widget):
         """未托管/已结束/尚无首帧这几种非实时状态下要展示的内容，逻辑与旧版
         `render()` 完全一致（只是从"每次渲染都现算"搬到"状态变化时算一次"）。
         """
+        from i18n import t
+
         if self.dead:
-            return Text("会话已结束（回车打开其他会话）")
+            return Text(t("detail.session_ended"))
         if self._detail_renderer is not None:
             rendered = self._detail_renderer()
             return rendered if isinstance(rendered, Text) else Text(str(rendered))
         if self.session_name is None:
-            return Text("选择一个会话查看详情")
+            return Text(t("detail.pick_session"))
         # 会话已聚焦但还没有第一帧：连接/抓帧是后台实现细节，不能暴露成用户
         # 可见的中间态，展示空白终端画布，首帧到达后无缝替换。
         return Text()
+
+    def _is_detail_view(self) -> bool:
+        """右栏正在展示静态对话预览（非实时托管画面）。"""
+        return self.session_name is None and self._detail_renderer is not None and not self.dead
+
+    def _detail_full_strips(self) -> list[Strip]:
+        """把详情全文编译成完整 Strip 列表（高度不限），供窗口切片与滚动上限计算。"""
+        visual = visualize(self, self._static_renderable())
+        return Visual.to_strips(
+            self, visual, self.size.width, None, self.visual_style,
+            apply_selection=False,
+        )
+
+    def _detail_max_offset(self, full_len: int | None = None) -> int:
+        pane_h = max(1, self.size.height)
+        if full_len is None:
+            full_len = len(self._detail_full_strips())
+        return max(0, full_len - pane_h)
+
+    def scroll_detail(self, delta: int) -> bool:
+        """滚动静态对话预览；返回是否处于可滚动的详情态（不论偏移是否真的变了）。"""
+        if not self._is_detail_view():
+            return False
+        max_off = self._detail_max_offset()
+        new_offset = max(0, min(self.detail_offset + delta, max_off))
+        if new_offset != self.detail_offset:
+            self.detail_offset = new_offset
+            self._static_key = None
+            self._static_strips_cache = None
+            self.refresh()
+        return True
+
+    def scroll_detail_home(self) -> bool:
+        if not self._is_detail_view():
+            return False
+        if self.detail_offset != 0:
+            self.detail_offset = 0
+            self._static_key = None
+            self._static_strips_cache = None
+            self.refresh()
+        return True
+
+    def scroll_detail_end(self) -> bool:
+        if not self._is_detail_view():
+            return False
+        max_off = self._detail_max_offset()
+        if self.detail_offset != max_off:
+            self.detail_offset = max_off
+            self._static_key = None
+            self._static_strips_cache = None
+            self.refresh()
+        return True
+
+    def scroll_detail_page(self, direction: int) -> bool:
+        """direction: -1 上翻一页，+1 下翻一页。"""
+        pane_h = max(1, self.size.height)
+        return self.scroll_detail(direction * max(1, pane_h - 1))
 
     def _ensure_static_strips(self) -> list[Strip]:
         """把 `_static_renderable()` 编译成整屏 Strip 列表并按状态缓存。
@@ -487,22 +551,39 @@ class EmbedPane(Widget):
         这类画面（详情/占位/已结束提示）刷新频率远低于托管会话实时画面，不需要
         像 `_sync_strips` 那样按行 diff；但 `render_line` 每次重绘要为每一可见行
         各调用一次，若不缓存就要对同一份内容反复重新换行——缓存键覆盖全部
-        决定内容的稳定状态（会话名、是否已结束、详情渲染器身份、当前尺寸），
-        命中即复用。renderer 捕获的标题缓存、状态或摘要发生变化时，调用方必须
-        调用公开的 `invalidate_detail()`；`show_detail()`/`focus_session()`/
-        `clear()`/resize 已在本类内部自动失效。
+        决定内容的稳定状态（会话名、是否已结束、详情渲染器身份、当前尺寸、
+        预览滚动偏移），命中即复用。renderer 捕获的标题缓存、状态或摘要发生
+        变化时，调用方必须调用公开的 `invalidate_detail()`；`show_detail()`/
+        `focus_session()`/`clear()`/resize 已在本类内部自动失效。
         转换本身复用 Textual 内置的 `Visual.to_strips`（与 Widget 基类默认的
         Rich-renderable 渲染路径同一套换行/对齐/宽字符处理），不用自己重新
         实现文本折行和 `content-align: left top` 这条 CSS 的效果。
+
+        静态对话预览：先按无高度上限整篇排版，再按 `detail_offset` 切一屏窗口；
+        这样长对话不会被裁掉，键盘/滚轮可以上下翻看。
         """
-        key = (self.session_name, self.dead, id(self._detail_renderer), self.size)
+        key = (
+            self.session_name, self.dead, id(self._detail_renderer),
+            self.size, self.detail_offset,
+        )
         if self._static_key == key and self._static_strips_cache is not None:
             return self._static_strips_cache
-        visual = visualize(self, self._static_renderable())
-        strips = Visual.to_strips(
-            self, visual, self.size.width, self.size.height, self.visual_style,
-            apply_selection=False,
-        )
+        pane_h = max(1, self.size.height)
+        width = max(1, self.size.width)
+        if self._is_detail_view():
+            full = self._detail_full_strips()
+            max_off = max(0, len(full) - pane_h)
+            offset = max(0, min(self.detail_offset, max_off))
+            window = list(full[offset:offset + pane_h])
+            while len(window) < pane_h:
+                window.append(Strip.blank(width))
+            strips = window
+        else:
+            visual = visualize(self, self._static_renderable())
+            strips = Visual.to_strips(
+                self, visual, width, pane_h, self.visual_style,
+                apply_selection=False,
+            )
         self._static_key = key
         self._static_strips_cache = strips
         return strips
@@ -608,6 +689,25 @@ class EmbedPane(Widget):
     # ---- 输入转发 ----
 
     async def _on_key(self, event: events.Key) -> None:
+        if self._is_detail_view():
+            # 面板聚焦时方向键/翻页也滚预览（列表聚焦时由 MainScreen 优先级绑定处理）
+            handled = False
+            if event.key == "up":
+                handled = self.scroll_detail(-1)
+            elif event.key == "down":
+                handled = self.scroll_detail(1)
+            elif event.key == "pageup":
+                handled = self.scroll_detail_page(-1)
+            elif event.key == "pagedown":
+                handled = self.scroll_detail_page(1)
+            elif event.key == "home":
+                handled = self.scroll_detail_home()
+            elif event.key == "end":
+                handled = self.scroll_detail_end()
+            if handled:
+                event.stop()
+                event.prevent_default()
+            return
         name = self.session_name
         if not name or self.dead:
             return
@@ -664,9 +764,8 @@ class EmbedPane(Widget):
         event.stop()
 
     def _wheel(self, sgr_button: int, x: float, y: float, local_delta: int) -> None:
-        """滚轮事件：托管程序自己申请了鼠标上报（如新版 Claude Code 全屏模式、
-        less/vim 内建翻页）时转成 SGR 序列直达内层程序让它自己处理；否则退化为
-        面板自己的回滚（tmux capture-pane 历史窗口）。
+        """滚轮事件：静态对话预览直接滚 `detail_offset`；托管会话则按鼠标上报/
+        tmux 历史回滚处理（见函数体）。
 
         转发只发 press 序列（xterm 规范：滚轮 64/65 没有 release 事件），且经
         `embed.send_mouse_sequence` 排队到后台线程发送——触控板惯性滚动一秒能
@@ -675,6 +774,9 @@ class EmbedPane(Widget):
         `mouse_any`/`mouse_sgr` 读的是后台抓帧线程缓存的字段，这里绝不发起新的
         embed.pane_state 阻塞调用。
         """
+        if self._is_detail_view():
+            self.scroll_detail(local_delta)
+            return
         name = self.session_name
         if not name or self.dead:
             return

@@ -16,6 +16,10 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input
 from textual.worker import get_current_worker
 
+import dataclasses
+
+import i18n
+from i18n import t
 from ui.embed_pane import EmbedPane
 from ui.modals import ConfirmModal, choose_target_runtime, new_session_flow
 from ui.nav import NavState
@@ -32,17 +36,39 @@ _IDLE_ROUNDS_BEFORE_BACKOFF = 3  # 连续几轮扫描都没变化才开始拉长
 CACHE_POLL_INTERVAL = 0.5  # 秒，标题缓存文件轮询间隔（比会话重扫轻得多，保持高频）
 LIST_PANE_WIDTH = 39  # 分栏时左栏固定宽度，对应旧版 EMBED_LEFT_BAND
 
+# 动作名 → 文案 key；实例化时只改 description，不能整表替换（会丢掉 ListView/Screen 继承绑键）
+_ACTION_I18N = {
+    "handoff": "action.advanced",
+    "new_session": "action.new",
+    "fullscreen": "action.fullscreen",
+    "kill_keepalive": "action.kill_session",
+    "close_pane": "action.close_pane",
+    "toggle_mouse": "action.mouse",
+    "save_screenshot": "action.screenshot",
+    "preview_home": "action.preview_home",
+    "preview_end": "action.preview_end",
+    "preview_page_up": "action.preview_page_up",
+    "preview_page_down": "action.preview_page_down",
+    "quit_app": "action.quit",
+}
 
-class MainScreen(Screen):
-    BINDINGS = [
-        Binding("a", "handoff", "高级操作"),
-        Binding("n", "new_session", "新建"),
-        Binding("e", "fullscreen", "全屏"),
-        Binding("q", "kill_keepalive", "结束会话"),
-        Binding("c", "close_pane", "关闭面板", show=False),
-        Binding("m", "toggle_mouse", "鼠标", show=False),
-        Binding("f12", "save_screenshot", "截图", show=False),
-        Binding("escape", "quit_app", "退出"),
+
+def _main_bindings() -> list[Binding]:
+    """按当前语言生成底部快捷键说明。"""
+    return [
+        Binding("a", "handoff", t("action.advanced")),
+        Binding("n", "new_session", t("action.new")),
+        Binding("e", "fullscreen", t("action.fullscreen")),
+        Binding("q", "kill_keepalive", t("action.kill_session")),
+        Binding("c", "close_pane", t("action.close_pane"), show=False),
+        Binding("m", "toggle_mouse", t("action.mouse"), show=False),
+        Binding("f12", "save_screenshot", t("action.screenshot"), show=False),
+        # 右栏静态对话预览滚动（列表聚焦时也生效；优先级高于 ListView 的同名键）
+        Binding("home", "preview_home", t("action.preview_home"), show=False, priority=True),
+        Binding("end", "preview_end", t("action.preview_end"), show=False, priority=True),
+        Binding("pageup", "preview_page_up", t("action.preview_page_up"), show=False, priority=True),
+        Binding("pagedown", "preview_page_down", t("action.preview_page_down"), show=False, priority=True),
+        Binding("escape", "quit_app", t("action.quit")),
         # 不再单独绑 ctrl+c 退出：Textual 的 Screen 基类自带 ctrl+c -> copy_text
         # （划词后复制选中文本），子类 BINDINGS 里重复同一个键会按键位覆盖掉
         # 基类那条，绑了就会让"划词选中 EmbedPane 里的文字后按 Ctrl+C 复制"失效。
@@ -51,8 +77,24 @@ class MainScreen(Screen):
         # 会走 Textual 默认的 help/quit 提示而非直接退出，但不影响 Esc 正常退出。
     ]
 
+
+def _localize_binding_descriptions(node) -> None:
+    """就地刷新已合并绑键的 description，保留继承来的 up/down/enter 等。"""
+    for key, bindings in list(node._bindings.key_to_bindings.items()):
+        node._bindings.key_to_bindings[key] = [
+            dataclasses.replace(b, description=t(_ACTION_I18N[b.action]))
+            if b.action in _ACTION_I18N
+            else b
+            for b in bindings
+        ]
+
+
+class MainScreen(Screen):
+    BINDINGS = _main_bindings()
+
     def __init__(self, store, embed_ok: bool, direct=None, osc_report: bytes | None = None) -> None:
         super().__init__()
+        _localize_binding_descriptions(self)
         self.store = store
         self.embed_ok = embed_ok
         self.direct = direct
@@ -67,7 +109,7 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="list-pane"):
-                yield Input(placeholder="筛选项目…", id="project-search")
+                yield Input(placeholder=t("filter.placeholder"), id="project-search")
                 yield SessionListView(self.store, self.nav, id="session-list")
             if self.embed_ok:
                 yield EmbedPane(id="embed-pane", on_focus_list=self._focus_list, osc_report=self.osc_report)
@@ -201,14 +243,16 @@ class MainScreen(Screen):
         # 里同步扫完就直接打印错误退出，扫描挪到后台 worker 后这个判断只能挪到这里，
         # 扫描没跑完之前（store.loaded 为 False）不能误判为"确实没有会话"。
         if load_error:
-            search.placeholder = f"筛选项目… — {load_error}；正在自动重试"
+            search.placeholder = t("filter.load_error", error=load_error)
         elif self.store.loaded and count == 0 and not any(self.store.sessions.values()):
-            names = "、".join(runtime.display_name for runtime in self.store.registry)
-            search.placeholder = f"筛选项目… — 未找到任何 {names} 会话记录"
+            names = i18n.join_names(
+                [runtime.display_name for runtime in self.store.registry]
+            )
+            search.placeholder = t("filter.no_sessions", names=names)
         elif self.nav.project_query.strip():
-            search.placeholder = f"筛选项目… ({count})"
+            search.placeholder = t("filter.placeholder_count_active", count=count)
         else:
-            search.placeholder = f"筛选项目 ({count})"
+            search.placeholder = t("filter.placeholder_count", count=count)
 
     # ---- 选择跟随：右栏默认展示左栏当前选中项 ----
 
@@ -225,7 +269,7 @@ class MainScreen(Screen):
         if pane.has_focus:
             return
         if session_list.is_new_session_selected():
-            pane.show_detail(lambda: Text("新建会话：选择项目与运行时"))
+            pane.show_detail(lambda: Text(t("detail.new_session_hint")))
             return
         session = session_list.selected_session()
         if session is None:
@@ -243,8 +287,10 @@ class MainScreen(Screen):
 
         title = self.store.get_title(session)
         runtime = self.store.registry.get(str(session.get("source") or ""))
-        status = "运行中" if session.get("live") else "已结束"
-        project = str(session.get("cwd") or session.get("cwd_display") or "未知项目")
+        status = t("status.running") if session.get("live") else t("status.ended")
+        project = str(
+            session.get("cwd") or session.get("cwd_display") or t("project.unknown")
+        )
         out = Text(title, style="bold")
         out.append("\n")
         out.append(runtime.display_name, style=pickup.runtime_label_style(runtime.id))
@@ -565,7 +611,7 @@ class MainScreen(Screen):
             return
         title = self.store.get_title(session)
         confirmed = await self.app.push_screen_wait(
-            ConfirmModal(f"结束会话「{title}」？未保存的当前任务进度将丢失")
+            ConfirmModal(t("confirm.kill_session", title=title))
         )
         if not confirmed:
             return
@@ -578,6 +624,22 @@ class MainScreen(Screen):
             return
         self.query_one(EmbedPane).clear()
         self._focus_list()
+
+    def action_preview_home(self) -> None:
+        if self.embed_ok:
+            self.query_one(EmbedPane).scroll_detail_home()
+
+    def action_preview_end(self) -> None:
+        if self.embed_ok:
+            self.query_one(EmbedPane).scroll_detail_end()
+
+    def action_preview_page_up(self) -> None:
+        if self.embed_ok:
+            self.query_one(EmbedPane).scroll_detail_page(-1)
+
+    def action_preview_page_down(self) -> None:
+        if self.embed_ok:
+            self.query_one(EmbedPane).scroll_detail_page(1)
 
     def action_toggle_mouse(self) -> None:
         self.mouse_forward_enabled = not self.mouse_forward_enabled
@@ -593,7 +655,7 @@ class MainScreen(Screen):
             pickup._log_embed_error("TUI 截图", exc)
             self.app.bell()
             return
-        self.notify(f"已截图 {path}", title="pickup", timeout=4)
+        self.notify(t("notify.screenshot", path=path), title="pickup", timeout=4)
 
     def action_fullscreen(self) -> None:
         session_list = self.query_one(SessionListView)

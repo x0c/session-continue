@@ -91,12 +91,14 @@ def _format_relative_time(mtime: float, now: float | None = None) -> str:
     if now is None:
         now = datetime.now().timestamp()
     delta = now - mtime
+    from i18n import t
+
     if delta < 60:  # 含未来时间 / 时钟漂移导致的负值
-        return "刚刚"
+        return t("time.just_now")
     if delta < 3600:
-        return f"{int(delta // 60)}分钟前"
+        return t("time.minutes_ago", n=int(delta // 60))
     if delta < 86400:
-        return f"{int(delta // 3600)}小时前"
+        return t("time.hours_ago", n=int(delta // 3600))
     return datetime.fromtimestamp(mtime).strftime("%m-%d %H:%M")
 
 
@@ -191,8 +193,10 @@ def _preview_lines(
     单独叠绘，不和角色名共用同一个高亮色），消息缺时间戳（老格式历史）或其余行留空。
     """
     content_width = max(1, width - 2)
+    from i18n import t
+
     if not messages:
-        return [("dim", "没有可预览的用户消息或最终答复", "")]
+        return [("dim", t("detail.empty_preview"), "")]
 
     lines: list[tuple[str, str, str]] = []
     for message in messages:
@@ -200,7 +204,7 @@ def _preview_lines(
             lines.append(("blank", "", ""))
         time_suffix = f"  · {format_message_time(message.timestamp)}" if message.timestamp else ""
         if message.role == "user":
-            lines.append(("user", "● 你", time_suffix))
+            lines.append(("user", t("preview.you"), time_suffix))
         else:
             lines.append(("assistant", f"◆ {runtime_name}", time_suffix))
         lines.extend(
@@ -212,7 +216,34 @@ def _preview_lines(
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # braille 转圈圈，每帧占 1 列宽
 
-UNKNOWN_PROJECT_LABEL = "(未知目录)"
+class _LocalizedLabel:
+    """可当字符串用的惰性文案：比较/拼接时按当前语言求值。"""
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+
+    def __str__(self) -> str:
+        from i18n import t
+
+        return t(self._key)
+
+    def __eq__(self, other: object) -> bool:
+        return str(self) == other
+
+    def __hash__(self) -> int:
+        return hash(self._key)
+
+    def __format__(self, spec: str) -> str:
+        return format(str(self), spec)
+
+    def __add__(self, other: object) -> str:
+        return str(self) + str(other)
+
+    def __radd__(self, other: object) -> str:
+        return str(other) + str(self)
+
+
+UNKNOWN_PROJECT_LABEL = _LocalizedLabel("project.unknown_dir")
 
 
 def _normalize_cwd(cwd: object) -> str:
@@ -409,7 +440,9 @@ class SessionStore:
             # 永远等不到完成事件。保留中文错误给页头展示，后台 refresh 仍会继续
             # 尝试并在成功后自动清除。
             with self.lock:
-                self.load_error = f"会话加载失败：{exc}"
+                from i18n import t
+
+                self.load_error = t("store.load_failed", error=exc)
         finally:
             with self.lock:
                 self.loaded = True
@@ -448,7 +481,9 @@ class SessionStore:
             changed = self._sessions_signature() != before
         except Exception as exc:
             with self.lock:
-                self.load_error = f"会话刷新失败：{exc}"
+                from i18n import t
+
+                self.load_error = t("store.refresh_failed", error=exc)
             raise
         with self.lock:
             self.load_error = None

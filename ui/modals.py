@@ -130,7 +130,11 @@ class RuntimePickerModal(ModalScreen[str | None]):
 
 
 class ConfirmModal(ModalScreen[bool]):
-    """y 确认 / 其他键取消的确认框，取代 _confirm_kill_keepalive。"""
+    """q 确认 / 其他键取消的确认框，取代 _confirm_kill_keepalive。
+
+    打开瞬间会短暂忽略按键：结束会话本身由 `q` 触发，若同一按键落到弹窗里会
+    立刻被当成确认。挂载后等一帧再接收确认/取消。
+    """
 
     DEFAULT_CSS = """
     ConfirmModal {
@@ -148,15 +152,26 @@ class ConfirmModal(ModalScreen[bool]):
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
+        self._armed = False
 
     def compose(self) -> ComposeResult:
+        from i18n import t
+
         with Vertical():
             yield Label(self._message)
-            yield Label("y 确认   其他键取消", classes="hint")
+            yield Label(t("modal.confirm_hint"), classes="hint")
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._arm)
+
+    def _arm(self) -> None:
+        self._armed = True
 
     def _on_key(self, event: events.Key) -> None:
         event.stop()
-        self.dismiss(event.key in ("y", "Y"))
+        if not self._armed:
+            return
+        self.dismiss(event.key in ("q", "Q"))
 
 
 # ---------------------------------------------------------------------------

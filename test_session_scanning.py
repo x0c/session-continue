@@ -11,6 +11,10 @@ from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 
+import i18n
+
+i18n.set_lang("en")
+
 import scan_claude
 import scan_codex
 import scan_kimi
@@ -2152,10 +2156,10 @@ class TuiLayoutTests(unittest.TestCase):
 
     def test_format_relative_time_thresholds(self) -> None:
         now = 1_000_000.0
-        self.assertEqual(pickup._format_relative_time(now - 5, now), "刚刚")
-        self.assertEqual(pickup._format_relative_time(now + 100, now), "刚刚")  # 时钟漂移/未来
-        self.assertEqual(pickup._format_relative_time(now - 120, now), "2分钟前")
-        self.assertEqual(pickup._format_relative_time(now - 3 * 3600, now), "3小时前")
+        self.assertEqual(pickup._format_relative_time(now - 5, now), "just now")
+        self.assertEqual(pickup._format_relative_time(now + 100, now), "just now")  # 时钟漂移/未来
+        self.assertEqual(pickup._format_relative_time(now - 120, now), "2m ago")
+        self.assertEqual(pickup._format_relative_time(now - 3 * 3600, now), "3h ago")
         # 超过一天退回绝对日期时间（沿用 MM-DD HH:MM）
         old = now - 3 * 86400
         self.assertEqual(
@@ -2197,9 +2201,9 @@ class TuiLayoutTests(unittest.TestCase):
         lines = pickup._preview_lines(messages, "Codex", 16)
         text_lines = [line for _, line, _ in lines]
 
-        self.assertEqual(text_lines[0], "● 你")
+        self.assertEqual(text_lines[0], "● You")
         self.assertIn("◆ Codex", text_lines)
-        self.assertEqual(text_lines.count("● 你"), 2)
+        self.assertEqual(text_lines.count("● You"), 2)
         self.assertEqual(text_lines.count("◆ Codex"), 2)
         self.assertTrue(all(pickup._text_width(line) <= 16 for line in text_lines))
 
@@ -2213,7 +2217,7 @@ class TuiLayoutTests(unittest.TestCase):
         lines = pickup._preview_lines(messages, "Claude", 40)
         role_lines = [(kind, line, suffix) for kind, line, suffix in lines if kind in ("user", "assistant")]
 
-        self.assertEqual(role_lines[0][1], "● 你")
+        self.assertEqual(role_lines[0][1], "● You")
         self.assertIn(pickup.format_message_time(ts), role_lines[0][2])
         self.assertEqual(role_lines[1][1], "◆ Claude")
         self.assertEqual(role_lines[1][2], "")

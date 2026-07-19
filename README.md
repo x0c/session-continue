@@ -98,6 +98,8 @@ pickup --json --limit 5 # script-friendly small result set
 
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
 
+The TUI defaults to English. If your system locale is Chinese (`zh*`), the interface switches to Chinese automatically. Force a language with `PICKUP_LANG=en` or `PICKUP_LANG=zh`.
+
 ## Embedded Panes (work on multiple sessions at once)
 
 `pickup` is a unified, time-ordered session timeline: Claude Code, Codex CLI, OpenCode, and Kimi
@@ -109,7 +111,7 @@ sessions render their live terminal, while history that is not currently hosted 
 summary without starting a process. Once the list is shown its order is stable — cards never jump
 around when their content updates; only genuinely new sessions appear, always prepended at the top.
 
-- The first row is a pinned `＋ 新建会话` (new session) item that never scrolls away: press
+- The first row is a pinned `+ New session` item (Chinese locale: `＋ 新建会话`) that never scrolls away: press
   `Enter` on it to pick a project directory and an agent runtime, and the blank session starts
   hosted in the right-hand pane, ready for input. `n` does the same without prompts, using the
   current project filter (or the selected session's directory) and the current runtime.
@@ -140,8 +142,8 @@ around when their content updates; only genuinely new sessions appear, always pr
   `Shift`/`Option`-drag, which bypasses mouse reporting).
 - `c` closes the split and returns to the full-width list; hosted sessions keep running in the
   background and can be reopened with `Enter`.
-- `q` on a backgrounded / in-progress session kills it (with confirmation); quitting `pickup` with
-  `Esc` never kills anything — everything stays alive in tmux.
+- `q` on a backgrounded / in-progress session ends it after a second `q` confirmation;
+  quitting `pickup` with `Esc` never kills anything — everything stays alive in tmux.
 
 ## Direct Launch
 
@@ -182,7 +184,7 @@ the remote machine. Reopen `pickup` and the session shows `后台运行中` (run
 
 - Press `Ctrl-\` (no prefix needed) to detach and return to your shell while the session keeps running;
   the standard `Ctrl-b d` also works.
-- Press `x` on a backgrounded session to kill it manually (with a confirmation prompt).
+- Press `q` on a backgrounded / in-progress session to end it (press `q` again to confirm).
 - Idle sessions (no tmux activity) are auto-reaped after 24h by default; tune with
   `PICKUP_KEEPALIVE_IDLE_HOURS` (`0` disables reaping; the legacy name `SC_KEEPALIVE_IDLE_HOURS`
   still works). Reaping only closes the background tmux session — history stays on disk.
@@ -229,11 +231,11 @@ agent workflows.
 | --- | --- |
 | `Up` / `Down` / `j` / `k` | Move selection |
 | `/` | Focus the project search box (case-insensitive fuzzy match on project name and session title) |
-| `Home` / `End` | Jump in the right-pane conversation preview |
-| `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background); on the pinned first row `＋ 新建会话`, start the new-session flow instead |
+| `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background); on the pinned first row `+ New session` (Chinese: `＋ 新建会话`), start the new-session flow instead |
 | `a` | Open advanced handoff actions |
 | `n` | New blank session in the current project with the current runtime (no prompts) |
-| `q` | End a backgrounded / in-progress (keep-alive) session, with confirmation |
+| `q` | End a backgrounded / in-progress (keep-alive) session; press `q` again in the confirm dialog |
+| `Home` / `End` / `PgUp` / `PgDn` | Scroll the right-pane conversation preview (also mouse wheel over the pane) |
 | `Esc` | Clear search / close dialog, or quit |
 
 `pickup` waits briefly for an escape sequence to complete, so `Esc` can close the current
