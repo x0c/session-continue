@@ -304,6 +304,7 @@
 - GitHub 公开仓库是 `https://github.com/x0c/pickup`，本地远端名为 `github`；原 `origin` 仍指向内部 Forgejo，用于同步备份。
 - 项目历史版本线已经到 `v0.2.x`，新增公开发布版本必须沿现有标签递增，不能从 `0.1.0` 重新开始。
 - 打包元数据同时维护 `pyproject.toml` 和 `setup.cfg`。当前环境的旧版 setuptools 会把只写在 `pyproject.toml` 的包名解析成 `UNKNOWN-0.0.0`，所以改版本号、入口、描述或项目链接时要同步两处。
+- `.github/workflows/test.yml` 必须先执行 `python -m pip install .` 再编译和跑测试，不能假设 GitHub Runner 预装运行依赖。项目从零依赖迁移到 Textual 后曾因 CI 只 checkout 源码就直接跑 `unittest`，导致 `rich`/`textual` 导入失败、Python 3.10–3.13 全矩阵同时报红；新增或调整依赖时要把“全新环境能按项目元数据安装”作为 CI 的第一道验证。
 - 发布前至少构建一次 wheel，确认产物名形如 `pickup-<version>-py3-none-any.whl`，并用临时目录安装后检查 `pickup = pickup:main` 入口元数据。
 - 开源前隐私扫描要覆盖准备提交的文件和完整 Git 历史补丁内容；本机 `.git/config` 里的内部远端不进入仓库内容，但真实文件、历史提交、Release 说明和 README 不能包含密钥、个人路径、内网地址或占位符。
 - GitHub Release 发布后检查 Actions、Release、topics 和仓库可见性；当前仓库 topics 为 `claude-code`、`codex-cli`、`terminal`、`tui`、`session-manager`、`ai-coding-agent`。

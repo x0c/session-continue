@@ -493,7 +493,14 @@ def _wheel_send_loop() -> None:
             time.sleep(remaining)
 
 
-# ---- 终端背景色注入：refresh-client -r（tmux 3.5a+）----
+# ---- tmux 版本探测：硬性最低版本（pickup._require_tmux）+ 背景色注入软性检查 ----
+
+# `new-session -e` 环境变量注入（PICKUP_RUNTIME/PICKUP_SESSION_ID 等托管元数据的
+# 唯一注入点）与 pause-after 流控通知（%pause）都要求 tmux 3.2+（2021-04 发布）；
+# 更旧的版本上 host_session()/wrap_plan() 会在创建会话时报一个笼统的
+# EmbedError，看不出是版本问题。pickup._require_tmux() 用这个常量做硬性拦截。
+MIN_TMUX_VERSION = (3, 2)
+
 
 @functools.lru_cache(maxsize=1)
 def _tmux_version() -> tuple[int, int] | None:
