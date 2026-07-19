@@ -8,7 +8,9 @@
 
 ## 文档导航
 
-- [cli/AGENTS.md](cli/AGENTS.md)：改、评审或发布 pickup CLI 工具前必读（含界面改动后的截图验收）。Remote：`ssh://git@10.10.10.2:2222/Max/pickup.git`
+> 以下文档在涉及对应领域的开发、评审或排查时先读取。领域知识库与验证细则见组件内说明。
+
+- [cli/AGENTS.md](cli/AGENTS.md)：改、评审或发布 pickup CLI 工具前必读（含领域知识库与截图验收）。Remote：`ssh://git@10.10.10.2:2222/Max/pickup.git`
 
 ## 组件一览
 
@@ -16,17 +18,48 @@
 |---|---|---|
 | `cli/` | Python | 活跃 |
 
+## 领域地图（doc-init）
+
+<!-- 覆盖度复核基线：2026-07-19 · 源码指纹 扫描 88 文件 / Python 41 / 1 子模块 · 基线提交 237aff9 -->
+
+| 领域 | 入口锚点 |
+|------|---------|
+| 终端界面 | cli/ui/ · cli/pickup.py · cli/i18n.py |
+| 内嵌实时终端 | cli/embed.py · cli/ui/embed_pane.py |
+| 会话扫描与对话内容 | cli/scan_claude.py · cli/scan_codex.py · cli/scan_opencode.py · cli/scan_kimi.py · cli/scan_cursor.py · cli/scan_common.py · cli/models.py · cli/runtime/ |
+| 跨助手接力与启动 | cli/runtime/ · cli/models.py |
+| 新助手接入 | cli/runtime/ · cli/scan_claude.py · cli/scan_codex.py · cli/scan_opencode.py · cli/scan_kimi.py · cli/scan_cursor.py |
+| 可观测与诊断 | cli/observe.py · cli/agent_api.py |
+| 会话保活 | cli/keepalive.py |
+| 直启子命令 | cli/pickup.py |
+| 标题补全 | cli/titles.py · cli/titlegen.py |
+| Agent 只读查询 | cli/agent_api.py |
+| 开源发布与一键安装 | cli/install.sh · cli/.github/workflows/ |
+| 隐私与本地数据边界 | cli/PRIVACY.md |
+
+## 待补充知识库（doc-init backlog）
+
+（当前无待补充项；会话保活、标题补全、Agent 只读查询、直启、开源发布仍以组件内维护指南 / SKILL 为主，需要独立知识库时再登记。）
+
 <!-- managed:inherited-agents:end -->
 
 # pickup 项目规范
 
 ## 文档导航
 
-- `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力前必读。
-- `docs/MAINTAINER_GUIDE.md`：修改、评审、排查或优化标题生成、扫描排序、扫描性能/启动耗时（含首屏异步 `store.load`）、界面列宽/侧边栏配色与标题省略、runtime 名配色（`pickup.runtime_label_style`）、TUI 可观测性（`observe.py` / `events.log` / F12 截图 / `pickup diagnose`）、TUI 刷新（列表原地更新、spinner 省刷）、状态列/会话存活判断、会话预览（右栏完整对话、消息级时间戳、缓存按 mtime 失效）、运行时边界（含跨运行时接手提示词的对话摘录）、会话保活（`keepalive.py`，含 tmux 隔离、pid 祖先链匹配、回收策略）、内嵌面板（`embed.py` + `ui/embed_pane.py` 的 `EmbedPane`，含控制模式通道与抓帧 `request()`、真彩色直通、Line API 局部重绘、输入延迟、跨终端/触控板滚动兼容、回滚状态、鼠标拖拽选词的取舍、IME 光标锚定、深/浅主题背景色注入、「连接中…」卡死）、直启子命令（`pickup claude`/`pickup codex`，含 `auto_approve_args` 设计取舍）、`agent_api.py` 机器接口（含新增字段/参数、只读边界取舍、`AgentApiTests` 测试写法）、打包发布和 GitHub 开源维护前必读。
-- `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义前必读（含 `diagnose` 与界面异常排查）；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里。
-- `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界前必读。
-- `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求前必读。
+> 以下文档在涉及对应领域的开发、评审或排查时先读取。
+
+- `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力
+- `docs/TERMINAL_UI_KNOWLEDGE_BASE.md`：终端界面、侧边栏筛选/新建会话、对话预览、高级操作弹窗、Footer 按键、多语言文案、截图验收
+- `docs/EMBEDDED_TERMINAL_KNOWLEDGE_BASE.md`：内嵌实时终端、右栏托管画面、抓帧与按键转发、全屏/结束会话、连接中卡死、控制通道
+- `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md`：会话扫描、对话预览数据、判活、扫描性能、各助手历史格式
+- `docs/CROSS_RUNTIME_HANDOFF_KNOWLEDGE_BASE.md`：跨助手接力、高级操作、原生恢复、空白新建、启动计划与接力提示词
+- `docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md`：新增一种 AI 助手、补扫描/预览/恢复/接力/空白新建与注册验收
+- `docs/OBSERVABILITY_KNOWLEDGE_BASE.md`：事件日志、诊断、F12 截图观测、界面异常排查
+- `docs/MAINTAINER_GUIDE.md`：标题生成、会话保活、直启、Agent 只读接口、开源发布及上述领域的维护级细节与历史踩坑
+- `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义（含 `diagnose`）；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里
+- `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界
+- `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求
 
 ## 架构约束
 
@@ -109,3 +142,26 @@ python3 -c "import pickup; print(pickup.__file__); print(pickup.runtime_label_st
 ```
 
 确认没有运行另一台机器或旧目录中的副本；改完配色/布局后必须**重启**已打开的 TUI，旧进程不会热加载。
+
+## 领域地图（doc-init）
+
+<!-- 覆盖度复核基线：2026-07-19 · 源码指纹 扫描 78 文件 / Python 40 / 0 子模块 · 基线提交 237aff9 -->
+
+| 领域 | 入口锚点 |
+|------|---------|
+| 终端界面 | ui/ · pickup.py/ · i18n.py/ |
+| 内嵌实时终端 | embed.py/ · ui/embed_pane.py |
+| 会话扫描与对话内容 | scan_claude.py/ · scan_codex.py/ · scan_opencode.py/ · scan_kimi.py/ · scan_cursor.py/ · scan_common.py/ · models.py/ · runtime/ |
+| 跨助手接力与启动 | runtime/ · models.py/ |
+| 新助手接入 | runtime/ · scan_claude.py/ · scan_codex.py/ · scan_opencode.py/ · scan_kimi.py/ · scan_cursor.py/ |
+| 可观测与诊断 | observe.py/ · agent_api.py/ |
+| 会话保活 | keepalive.py/ |
+| 直启子命令 | pickup.py/ |
+| 标题补全 | titles.py/ · titlegen.py/ |
+| Agent 只读查询 | agent_api.py/ |
+| 开源发布与一键安装 | install.sh/ · .github/workflows/ |
+| 隐私与本地数据边界 | PRIVACY.md/ |
+
+## 待补充知识库（doc-init backlog）
+
+（当前无待补充项；会话保活、标题补全、Agent 只读查询、直启、开源发布仍以维护指南 / SKILL 为主，需要独立知识库时再登记。）

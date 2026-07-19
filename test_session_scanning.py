@@ -2980,7 +2980,7 @@ class CursorScanTests(unittest.TestCase):
                 has_conversation=False,
             )
             with mock.patch.object(scan_cursor, "CHATS_DIR", str(root)), mock.patch.object(
-                scan_cursor, "live_pids_by_process_name", return_value={}
+                scan_cursor, "live_processes", return_value=[]
             ):
                 sessions = scan_cursor.scan_sessions(limit=10)
             self.assertEqual(len(sessions), 1)
@@ -3033,6 +3033,80 @@ class CursorScanTests(unittest.TestCase):
                     ("assistant", "先摸清现有运行时适配器的模式"),
                 ],
             )
+
+    def test_live_flags_bind_resume_and_new_agents_separately_in_same_cwd(self) -> None:
+        """同 cwd 下旧 --resume 与接力新建的 agent 不得串到同一条会话。
+
+        真实故障：cwd→单 pid 折叠后，新接续会话标题挂上旧保活画面。
+        """
+        import scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = str(root / "proj")
+            Path(cwd).mkdir()
+            old_id = "ba6f7c50-b53e-4beb-ae6d-7e4345cfbfa2"
+            new_id = "961e443e-5e59-4b7d-bb7a-213b016bf119"
+            self._chat(
+                root,
+                "ws1",
+                old_id,
+                title="Hello There",
+                cwd=cwd,
+                updated_ms=1_700_000_000_000,
+                prompts=["旧会话"],
+            )
+            self._chat(
+                root,
+                "ws1",
+                new_id,
+                title="HY2 Node Debug",
+                cwd=cwd,
+                updated_ms=1_700_000_100_000,
+                prompts=["新接续"],
+            )
+            real_cwd = os.path.realpath(cwd)
+            agents = [
+                (22807, real_cwd),  # 接力新建，无 --resume
+                (25594, real_cwd),  # 旧会话 --resume
+            ]
+            cmdlines = {
+                22807: (
+                    "/Users/x/.local/bin/agent --force --add-dir /tmp/history "
+                    "你正在接力一个来自 Claude 的会话"
+                ),
+                25594: (
+                    f"/Users/x/.local/bin/agent --force --resume {old_id}"
+                ),
+            }
+
+            def fake_cmdline(pid: int) -> str:
+                return cmdlines[pid]
+
+            with mock.patch.object(scan_cursor, "CHATS_DIR", str(root)), mock.patch.object(
+                scan_cursor, "live_processes", return_value=agents
+            ), mock.patch.object(
+                scan_cursor, "process_command_line", side_effect=fake_cmdline
+            ):
+                sessions = scan_cursor.scan_sessions(limit=10)
+
+            by_id = {s["id"]: s for s in sessions}
+            self.assertTrue(by_id[old_id]["live"])
+            self.assertEqual(by_id[old_id]["pid"], 25594)
+            self.assertTrue(by_id[new_id]["live"])
+            self.assertEqual(by_id[new_id]["pid"], 22807)
+
+    def test_resume_id_from_cmdline_parses_equals_and_skips_minus_one(self) -> None:
+        import scan_cursor
+
+        self.assertEqual(
+            scan_cursor._resume_id_from_cmdline(
+                "agent --resume=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            ),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --resume=-1"))
+        self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --force"))
 
 
 class StartupLatencyTests(unittest.TestCase):

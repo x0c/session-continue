@@ -37,22 +37,24 @@ def parse_timestamp(value) -> float | None:
         return None
 
 
-def live_pids_by_process_name(process_name: str) -> dict[str, int]:
-    """返回「工作目录 -> pid」映射，供没有 pid 注册表、也不能靠 lsof 定位单个
-    历史文件的运行时（OpenCode、Kimi Code）复用同一套判活思路：找到存活的
-    同名进程，读取其当前工作目录，与会话记录的工作目录字段匹配。
+def live_processes(process_name: str) -> list[tuple[int, str]]:
+    """返回全部存活同名进程的 ``(pid, 归一化 cwd)`` 列表。
+
+    与 `live_pids_by_process_name` 不同，这里**不会**按 cwd 去重——同一工作目录
+    下可以同时跑多个 agent（例如跨助手接力新建的 Cursor 与旧的 `--resume`
+    会话并存）。调用方若只能保守地标「该目录最新一条」，再自行折叠；若能从
+    命令行解析出会话 ID，则应逐进程精确绑定。
 
     已知局限：同名的其它子命令进程（如 `<name> serve`/`<name> run`）会被一并
-    计入；同一目录下的多个历史会话，调用方需要自行只把最新一条标记存活。
-    任一环节失败都静默降级为空集，不抛异常。
+    计入。任一环节失败都静默降级为空列表，不抛异常。
     """
-    live: dict[str, int] = {}
+    found: list[tuple[int, str]] = []
     try:
         pids = subprocess.check_output(
             ["pgrep", "-x", process_name], stderr=subprocess.DEVNULL
         ).decode().split()
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return live
+        return found
 
     for pid_str in pids:
         try:
@@ -79,5 +81,35 @@ def live_pids_by_process_name(process_name: str) -> dict[str, int]:
         else:
             continue
         if cwd:
-            live[os.path.realpath(cwd)] = pid
+            found.append((pid, os.path.realpath(cwd)))
+    return found
+
+
+def live_pids_by_process_name(process_name: str) -> dict[str, int]:
+    """返回「工作目录 -> pid」映射，供没有 pid 注册表、也不能靠 lsof 定位单个
+    历史文件的运行时（OpenCode、Kimi Code）复用同一套判活思路：找到存活的
+    同名进程，读取其当前工作目录，与会话记录的工作目录字段匹配。
+
+    同一 cwd 有多个同名进程时只保留其中一个（遍历顺序下的最后一个）。调用方
+    需要自行只把该目录最新一条会话标记存活。需要保留全部进程时改用
+    `live_processes`。任一环节失败都静默降级为空集，不抛异常。
+    """
+    live: dict[str, int] = {}
+    for pid, cwd in live_processes(process_name):
+        live[cwd] = pid
     return live
+
+
+def process_command_line(pid: int) -> str:
+    """读取进程命令行；失败返回空串。供扫描器从 `--resume <id>` 等参数精确绑会话。"""
+    try:
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\x00", b" ").decode(errors="replace").strip()
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="],
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode(errors="replace").strip()
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return ""

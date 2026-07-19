@@ -24,12 +24,17 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import titles
 from models import ConversationMessage, effective_session_time, format_message_time
-from scan_common import live_pids_by_process_name
+from scan_common import live_processes, process_command_line
 from scan_common import shorten_cwd as _shorten_cwd
 
 CHATS_DIR = os.path.expanduser("~/.cursor/chats")
 
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
+# Cursor CLI：`agent --resume <uuid>` / `--resume=<uuid>`；`-1` 表示续最近一条，无法精确绑定。
+_RESUME_ID_RE = re.compile(
+    r"--resume(?:=|\s+)(?P<id>-1|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 
 
 def _read_json(path: str):
@@ -195,14 +200,63 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     if not results:
         return results
 
-    live_by_cwd = live_pids_by_process_name("agent")
-    for info in results:
-        cwd = info.get("cwd") or ""
-        pid = live_by_cwd.pop(os.path.realpath(cwd), None) if cwd else None
-        if pid is not None:
-            info["live"] = True
-            info["pid"] = pid
+    _apply_live_flags(results)
     return results
+
+
+def _resume_id_from_cmdline(cmdline: str) -> str | None:
+    """从 agent 命令行解析 `--resume <chatId>`；无精确 ID（含 `-1`）时返回 None。"""
+    match = _RESUME_ID_RE.search(cmdline or "")
+    if not match:
+        return None
+    resume_id = match.group("id")
+    if resume_id == "-1":
+        return None
+    return resume_id
+
+
+def _apply_live_flags(sessions: list[dict]) -> None:
+    """给 Cursor 会话列表就地标注 live/pid。
+
+    同一工作目录常会同时跑多个 `agent`（旧会话 `--resume` + 跨助手接力新建）。
+    若仍按「cwd → 单个 pid」折叠，新接续会话的标题会绑到旧进程的保活画面，
+    表现为侧边栏是新会话、右栏却是另一个旧会话。
+
+    绑定优先级：
+    1. 命令行带 `--resume <chatId>` 的进程，精确挂到对应会话；
+    2. 其余无 resume 的进程，按 cwd 挂到尚未标记、且 mtime 最新的会话。
+    """
+    by_id = {str(session.get("id") or ""): session for session in sessions}
+    unmatched_by_cwd: dict[str, list[int]] = {}
+
+    for pid, cwd in live_processes("agent"):
+        resume_id = _resume_id_from_cmdline(process_command_line(pid))
+        if resume_id and resume_id in by_id:
+            session = by_id[resume_id]
+            if not session.get("live"):
+                session["live"] = True
+                session["pid"] = pid
+            continue
+        unmatched_by_cwd.setdefault(cwd, []).append(pid)
+
+    if not unmatched_by_cwd:
+        return
+
+    candidates_by_cwd: dict[str, list[dict]] = {}
+    for session in sessions:
+        if session.get("live"):
+            continue
+        cwd = str(session.get("cwd") or "")
+        if not cwd:
+            continue
+        candidates_by_cwd.setdefault(os.path.realpath(cwd), []).append(session)
+
+    for cwd, pids in unmatched_by_cwd.items():
+        candidates = candidates_by_cwd.get(cwd) or []
+        # sessions 已按 mtime 降序；同 cwd 候选保持该顺序，逐个消费未绑定进程。
+        for pid, session in zip(pids, candidates):
+            session["live"] = True
+            session["pid"] = pid
 
 
 def _text_from_content(content) -> str:

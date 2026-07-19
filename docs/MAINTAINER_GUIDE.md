@@ -210,6 +210,7 @@
 - 列表轻扫：`meta.json` + `prompt_history.json`（最新在前）；`path` 优先指向 `store.db`。
 - 完整对话：`load_conversation` 只读 `store.db` JSON blobs，提取 `<user_query>` 与 assistant 文本。
 - 运行时 id=`cursor`，可执行文件=`agent`，`auto_approve_args=("--force",)`；恢复 `agent --force --resume <id>`。
+- **同 cwd 多 agent 判活（2026-07 真机实报后修）**：跨助手接力会在项目目录新建一个无 `--resume` 的 `agent`，同时旧 Cursor 会话可能仍以 `--resume <chatId>` 跑着。旧实现用 `live_pids_by_process_name("agent")` 按 cwd 只留一个 pid，再标「该目录最新会话」存活——结果是新接续会话卡片标题正确，但 `keepalive.annotate` 把旧 tmux 画面绑上去，侧边栏/右栏串台。现改走 `live_processes` 保留全部进程：命令行能解析出 `--resume <uuid>` 的精确挂到对应会话；其余无 resume 的再按 cwd 挂到尚未标记、mtime 最新的会话。回归：`CursorScanTests.test_live_flags_bind_resume_and_new_agents_separately_in_same_cwd`。OpenCode/Kimi 仍用 cwd→单 pid 的保守策略（它们没有稳定的 resume 参数可解析）。
 
 ## 直启子命令（`pickup claude` / `pickup codex` / `pickup opencode` / `pickup kimi`）
 
