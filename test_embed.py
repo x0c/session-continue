@@ -5,6 +5,7 @@ tmux 子进程一律 mock，不需要真实 tmux，可在无终端环境跑。
 
 from __future__ import annotations
 
+import queue
 import shutil
 import subprocess
 import threading
@@ -18,6 +19,81 @@ from models import LaunchPlan
 
 def _run_completed_ok(*_args, **_kwargs):
     return subprocess.CompletedProcess(args=[], returncode=0)
+
+
+class _FakeLinePipe:
+    """供 ControlChannel 协议测试使用的可阻塞逐行 stdout。"""
+
+    _EOF = object()
+
+    def __init__(self, lines=()):
+        self._lines = queue.Queue()
+        self.closed = False
+        for line in lines:
+            self.feed(line)
+
+    def feed(self, line: str) -> None:
+        self._lines.put(line.encode())
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._lines.get()
+        if item is self._EOF:
+            raise StopIteration
+        return item
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._lines.put(self._EOF)
+
+
+class _FakeStdin:
+    def __init__(self, on_write=None):
+        self.on_write = on_write
+        self.closed = False
+        self.writes = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+        if self.on_write is not None:
+            self.on_write(data)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeControlProcess:
+    """只实现 ControlChannel 使用到的 Popen 契约，并记录资源是否完整回收。"""
+
+    def __init__(self, *, startup_ready=True, on_write=None):
+        startup = ("%begin 1 1\n", "%end 1 1\n") if startup_ready else ()
+        self.stdout = _FakeLinePipe(startup)
+        self.stdin = _FakeStdin(on_write)
+        self.returncode = None
+        self.waited = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+        self.stdout.close()
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self.stdout.close()
+
+    def wait(self, timeout=None):
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
 
 
 class AvailableTests(unittest.TestCase):
@@ -261,7 +337,10 @@ class ControlModeTests(unittest.TestCase):
             self.assertEqual(embed.capture("s", scroll_offset=10, pane_height=40),
                              "screen text")
         argv = captured["argv"]
-        self.assertEqual(argv[4:8], ["-S", "-10", "-E", "29"])
+        # -S/-E 现在跟在 -p -e 之后、-t name 之前（原实现插在 capture-pane 与
+        # -p 之间）——tmux 对 capture-pane 的标志解析不依赖顺序，位置调整是路由
+        # 到 ControlChannel.request() 时统一构造 args 列表的自然结果，不是回归。
+        self.assertEqual(argv[6:10], ["-S", "-10", "-E", "29"])
 
     def test_capture_live_without_range_flags(self):
         captured = {}
@@ -276,6 +355,140 @@ class ControlModeTests(unittest.TestCase):
         self.assertNotIn("-S", captured["argv"])
 
 
+class ControlChannelProtocolTests(unittest.TestCase):
+    """用可控 fake 管道钉死控制模式握手、响应配对和关闭时序。"""
+
+    @staticmethod
+    def _build_channel(process, on_output=None):
+        with mock.patch.object(embed.subprocess, "Popen", return_value=process), \
+                mock.patch.object(embed.ControlChannel, "_query_pane_id", return_value="%1"):
+            return embed.ControlChannel("fake-session", on_output=on_output)
+
+    @staticmethod
+    def _wait_until(predicate, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError("等待控制通道状态收敛超时")
+
+    def test_constructor_waits_until_attach_startup_guard_is_drained(self):
+        process = _FakeControlProcess(startup_ready=False)
+        result = []
+        errors = []
+
+        def build():
+            try:
+                result.append(self._build_channel(process))
+            except Exception as exc:  # 测试线程的异常要带回主线程断言
+                errors.append(exc)
+
+        thread = threading.Thread(target=build)
+        thread.start()
+        time.sleep(0.05)
+        self.assertTrue(thread.is_alive(), "attach 启动响应未结束前构造函数不得返回")
+        process.stdout.feed("%begin 1 1\n")
+        process.stdout.feed("%end 1 1\n")
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(len(result), 1)
+        result[0].close()
+
+    def test_fast_response_cannot_arrive_before_waiter_registration(self):
+        holder = {}
+        process = _FakeControlProcess()
+
+        def respond(_data):
+            channel = holder["channel"]
+            # write 回调发生在 flush 之前；此时 waiter 必须已经登记在 FIFO。
+            self.assertEqual(len(channel._pending), 1)
+            process.stdout.feed("%begin 2 1\n")
+            process.stdout.feed("FAST\n")
+            process.stdout.feed("%end 2 1\n")
+
+        channel = self._build_channel(process)
+        holder["channel"] = channel
+        process.stdin.on_write = respond
+        try:
+            self.assertEqual(channel.request("display-message", "-p", "ok"), ["FAST"])
+            self.assertFalse(channel._pending)
+            self.assertIsNone(channel._active_waiter)
+        finally:
+            channel.close()
+
+    def test_async_output_inside_response_is_not_returned_as_body(self):
+        fired = threading.Event()
+        process = _FakeControlProcess()
+
+        def respond(_data):
+            process.stdout.feed("%begin 3 1\n")
+            process.stdout.feed("%output %1 pane-data\n")
+            process.stdout.feed("BODY\n")
+            process.stdout.feed("%end 3 1\n")
+
+        process.stdin.on_write = respond
+        channel = self._build_channel(process, on_output=fired.set)
+        try:
+            self.assertEqual(channel.request("capture-pane", "-p"), ["BODY"])
+            self.assertTrue(fired.wait(1.0), "%output 应触发画面刷新回调")
+        finally:
+            channel.close()
+
+    def test_request_timeout_closes_channel_and_clears_waiters(self):
+        process = _FakeControlProcess()
+        channel = self._build_channel(process)
+        self.assertIsNone(channel.request("capture-pane", "-p", timeout=0.01))
+        self.assertTrue(channel.dead)
+        self.assertTrue(channel._closed)
+        self.assertFalse(channel._pending)
+        self.assertIsNone(channel._active_waiter)
+        self.assertFalse(channel._reader.is_alive())
+        self.assertTrue(process.waited)
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+
+    def test_close_wakes_active_and_queued_requests_and_is_idempotent(self):
+        process = _FakeControlProcess()
+        writes = 0
+
+        def respond(_data):
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                # 第一条只给 begin、不结束，让 reader 持有 active waiter。
+                process.stdout.feed("%begin 4 1\n")
+
+        process.stdin.on_write = respond
+        channel = self._build_channel(process)
+        results = {}
+
+        def request(key):
+            results[key] = channel.request("capture-pane", key, timeout=5.0)
+
+        first = threading.Thread(target=request, args=("first",))
+        second = threading.Thread(target=request, args=("second",))
+        first.start()
+        self._wait_until(lambda: channel._active_waiter is not None)
+        second.start()
+        self._wait_until(lambda: len(channel._pending) == 1)
+
+        channel.close()
+        channel.close()
+        first.join(1.0)
+        second.join(1.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(results, {"first": None, "second": None})
+        self.assertFalse(channel._pending)
+        self.assertIsNone(channel._active_waiter)
+        self.assertFalse(channel._reader.is_alive())
+        self.assertIsNotNone(process.poll())
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+
+
 class TranslateTextualKeyTests(unittest.TestCase):
     def test_enter_tab_backspace_escape(self):
         self.assertEqual(embed.translate_textual_key("enter"), ("keys", "Enter"))
@@ -283,6 +496,12 @@ class TranslateTextualKeyTests(unittest.TestCase):
         self.assertEqual(embed.translate_textual_key("tab"), ("keys", "Tab"))
         self.assertEqual(embed.translate_textual_key("backspace"), ("keys", "BSpace"))
         self.assertEqual(embed.translate_textual_key("escape"), ("keys", "Escape"))
+
+    def test_shift_tab_maps_to_btab(self):
+        # tmux 没有 S-Tab：Shift+Tab 在终端里是 backtab，tmux 的具名键是 BTab
+        # （tmux(1) 手册）。Claude Code 用这个键循环 plan/权限模式，漏译此前
+        # 会在内嵌面板里表现为「按了没反应」（真实缺口回归）。
+        self.assertEqual(embed.translate_textual_key("shift+tab"), ("keys", "BTab"))
 
     def test_control_letters(self):
         self.assertEqual(embed.translate_textual_key("ctrl+c"), ("keys", "C-c"))
@@ -318,7 +537,7 @@ class ParseScreenTests(unittest.TestCase):
     def test_256_and_truecolor(self):
         grid = embed.parse_screen("\x1b[38;5;200mx\x1b[48;2;255;0;0my", 2, 1)
         self.assertEqual(grid[0][0].fg, 200)
-        self.assertEqual(grid[0][1].bg, 196)  # 纯红量化到 196
+        self.assertEqual(grid[0][1].bg, (255, 0, 0))  # 真彩色原样保留，不再量化
 
     def test_bright_colors_and_reverse(self):
         grid = embed.parse_screen("\x1b[92;7mz", 1, 1)
@@ -351,18 +570,6 @@ class ParseScreenTests(unittest.TestCase):
         grid = embed.parse_screen("l1\nl2\nl3", 2, 2)
         self.assertEqual(len(grid), 2)
         self.assertEqual(grid[1][0].ch, "l")
-
-
-class RgbQuantizeTests(unittest.TestCase):
-    def test_pure_colors(self):
-        self.assertEqual(embed._rgb_to_256(255, 0, 0), 196)
-        self.assertEqual(embed._rgb_to_256(0, 255, 0), 46)
-
-    def test_grays(self):
-        self.assertEqual(embed._rgb_to_256(0, 0, 0), 16)
-        self.assertEqual(embed._rgb_to_256(255, 255, 255), 231)
-        mid = embed._rgb_to_256(128, 128, 128)
-        self.assertTrue(232 <= mid <= 255)
 
 
 class CellStyleTests(unittest.TestCase):
@@ -401,8 +608,20 @@ class GridToTextTests(unittest.TestCase):
 
     def test_wide_char_continuation_cell_excluded_from_text(self):
         grid = embed.parse_screen("a好b", 4, 1)
-        text, _ = embed.grid_to_text(grid)[0]
+        text, spans = embed.grid_to_text(grid)[0]
         self.assertEqual(text, "a好b")
+        self.assertEqual([(start, end) for start, end, _ in spans], [(0, 3)])
+
+    def test_combining_character_keeps_following_text_and_python_span_offsets(self):
+        # parse_screen 会把组合音标并入前一个 Cell.ch；span 必须按 Python 字符
+        # 下标累计（e + 组合音标占 2），不能按终端 cell 数累计，否则后面的 x
+        # 在 Strip 字符串切片时会被截掉。
+        grid = embed.parse_screen("e\u0301\x1b[31mx", 2, 1)
+        text, spans = embed.row_text_and_spans(grid[0])
+        self.assertEqual(text, "e\u0301x")
+        self.assertEqual([(start, end) for start, end, _ in spans], [(0, 2), (2, 3)])
+        self.assertNotEqual(spans[0][2], spans[1][2])
+        self.assertEqual(embed.grid_to_text(grid)[0], (text, spans))
 
 
 @unittest.skipUnless(shutil.which("tmux"), "需要真实 tmux")
@@ -499,6 +718,19 @@ class ControlChannelIntegrationTests(unittest.TestCase):
                 return
             time.sleep(0.1)
         self.fail("resize-window 经控制通道未生效")
+
+    def test_close_reaps_real_control_client_and_closes_pipes(self):
+        ch = embed.open_channel(self.SESSION)
+        self.assertIsNotNone(ch)
+        process = ch._proc
+        reader = ch._reader
+        ch.close()
+        ch.close()  # 幂等关闭不能再次操作已回收资源或抛异常
+
+        self.assertIsNotNone(process.poll(), "真实 tmux 控制 client 必须已经 wait 回收")
+        self.assertFalse(reader.is_alive())
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
 
     @unittest.skipUnless(embed.supports_theme_report(), "refresh-client -r 需要 tmux 3.5a+")
     def test_report_theme_answers_pane_osc11_query(self):

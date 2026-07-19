@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import queue
 import re
 import shutil
 import subprocess
@@ -143,14 +144,26 @@ def capture(name: str, scroll_offset: int = 0, pane_height: int = 0) -> str | No
     应用层滚动必须用这种方式：copy-mode 的滚动偏移只作用于 client 渲染层，
     capture-pane 抓的 pane buffer 永远停在 live 窗口（实测 scroll_position 变化
     对 capture 内容零影响，这是内嵌滚轮最初不可见的根因）。
+
+    控制通道存活时优先走 `ControlChannel.request`（消灭抓帧循环每帧一次 fork，
+    这是内嵌面板 CPU 占用的主要来源之一）；通道缺失/请求失败时回退外部 fork——
+    只读查询走通道本就安全（见 ControlChannel 类注释的纪律），失败原因可能是
+    会话真的没了，交给下面 fork 路径的 subprocess 异常分类统一处理更可靠。
     """
-    argv = [*keepalive._BASE_ARGV, "capture-pane", "-p", "-e", "-t", name]
+    args = ["capture-pane", "-p", "-e"]
     if scroll_offset > 0 and pane_height > 0:
         # 实测钉死的窗口公式：-S -offset -E (h-1-offset) = live 窗口精确上移 offset 行
         # （seq 1 100 会话里 -S -6 -E 13 得 76..95，相对 live 82..101 正好上移 6）
-        argv[4:4] = ["-S", f"-{scroll_offset}", "-E", str(pane_height - 1 - scroll_offset)]
+        args += ["-S", f"-{scroll_offset}", "-E", str(pane_height - 1 - scroll_offset)]
+    args += ["-t", name]
+    ch = _active_channel(name)
+    if ch is not None:
+        lines = ch.request(*args)
+        if lines is not None:
+            return "\n".join(lines)
     try:
-        out = subprocess.check_output(argv, stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT)
+        out = subprocess.check_output([*keepalive._BASE_ARGV, *args],
+                                      stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     return out.decode("utf-8", errors="replace")
@@ -162,16 +175,25 @@ def pane_state(name: str) -> tuple[int, int, bool, bool, bool, int] | None:
 
     合并进单个 display-message 调用——capture 循环每轮都要光标位置，滚轮转发要鼠标
     模式，应用层滚动的上限判定要回滚量，分开查每轮就是三次 fork。查询失败返回 None。
+    控制通道优先，回退路径同 capture()。
     """
-    try:
-        out = subprocess.check_output(
-            [*keepalive._BASE_ARGV, "display-message", "-p", "-t", name,
-             "#{cursor_x}|#{cursor_y}|#{cursor_flag}|#{mouse_any_flag}|#{mouse_sgr_flag}"
-             "|#{history_size}"],
-            stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT,
-        ).decode().strip()
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
+    args = ["display-message", "-p", "-t", name,
+            "#{cursor_x}|#{cursor_y}|#{cursor_flag}|#{mouse_any_flag}|#{mouse_sgr_flag}"
+            "|#{history_size}"]
+    ch = _active_channel(name)
+    out: str | None = None
+    if ch is not None:
+        lines = ch.request(*args)
+        if lines is not None:
+            out = "\n".join(lines).strip()
+    if out is None:
+        try:
+            out = subprocess.check_output(
+                [*keepalive._BASE_ARGV, *args],
+                stderr=subprocess.DEVNULL, timeout=_CALL_TIMEOUT,
+            ).decode().strip()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
     try:
         xs, ys, fs, ma, ms, hs = out.split("|")
         return int(xs), int(ys), fs == "1", ma == "1", ms == "1", int(hs)
@@ -283,12 +305,30 @@ def _ctl_quote(arg: str) -> str:
                   .replace("$", "\\$").replace("`", "\\`")) + '"'
 
 
+# 匹配 %begin/%end/%error 守卫行，提取 (时间戳, 命令号)——tmux(1) 控制模式协议：
+# 每条命令产生一个 %begin ts num [flags] ... %end/%error ts num [flags] 块，
+# 同一块的 begin/end 共享相同的 (ts, num)。只用前两个数字字段做匹配，不管
+# 后面可能存在的 flags，兼容不同 tmux 版本的尾部格式差异。
+_GUARD_RE = re.compile(r"^%(begin|end|error)\s+(\d+)\s+(\d+)")
+_STARTUP_WAITER = object()
+_ASYNC_NOTIFICATIONS = frozenset({
+    "%client-detached", "%client-session-changed", "%client-window-changed",
+    "%extended-output", "%layout-change", "%message", "%output",
+    "%paste-buffer-changed", "%paste-buffer-deleted", "%pause",
+    "%session-changed", "%session-renamed", "%session-window-changed",
+    "%sessions-changed", "%subscription-changed", "%unlinked-window-add",
+    "%unlinked-window-close", "%unlinked-window-renamed", "%window-add",
+    "%window-close", "%window-pane-changed", "%window-renamed",
+})
+
+
 class ControlChannel:
     """到某个托管会话的控制模式通道。
 
     stdin 写命令（tmux 命令行语法，参数经 _ctl_quote）；stdout 由读线程按行协议
     消费：%output → on_output 回调（capture 循环的抓帧信号）、%pause → 自动回
-    refresh -A 恢复（tmux 3.2+ pause-after 流控）、%exit/EOF → 标记死亡。
+    refresh -A 恢复（tmux 3.2+ pause-after 流控）、%exit/EOF → 标记死亡、
+    %begin…%end/%error → 同步命令的响应块（见 request()）。
     """
 
     def __init__(self, name: str, on_output=None) -> None:
@@ -297,13 +337,36 @@ class ControlChannel:
         self.dead = False
         self.last_error: str | None = None
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._ready = threading.Event()
+        self._startup_ok = False
+        # FIFO：每次成功写入一条命令就 append 一个「响应接收方」占位（None 表示
+        # 调用方不关心响应，即现有 command()/send() 的火后不理用法；否则是
+        # request() 传入的 maxsize=1 Queue）。tmux 控制模式命令响应严格按发送
+        # 顺序返回、块与块之间不交叉（协议保证），因此不管 request()/command()
+        # 分别在哪个线程调用，只要写入 stdin 与登记这个占位在同一把锁内原子
+        # 完成，_read_loop 按到达顺序 popleft 消费就必然对应正确的调用方——
+        # 不依赖任何按时间戳/命令号做跨线程匹配的假设。
+        # 第一项预留给 `tmux -C attach` 自身的启动响应。必须等这块响应完整消费后
+        # 才能允许业务命令进入 FIFO，否则首条业务 waiter 会被 attach 的 %end
+        # 错拿，随后所有响应整体错位。
+        self._pending: "collections.deque[queue.Queue | None | object]" = collections.deque(
+            [_STARTUP_WAITER]
+        )
+        # reader 已从 FIFO 取出、但守卫块尚未结束的当前请求。close/通道死亡时
+        # 也必须唤醒它，不能只清理仍留在 _pending 里的排队请求。
+        self._active_waiter: queue.Queue | None | object = None
         self._proc = subprocess.Popen(
             [*keepalive._BASE_ARGV, "-C", "attach", "-t", name],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        self.pane_id = self._query_pane_id()  # %N，refresh -r 的寻址需要稳定 ID
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        if not self._ready.wait(_CALL_TIMEOUT) or not self._startup_ok or self.dead:
+            self.close()
+            raise OSError(f"tmux 控制通道启动失败：{name}")
+        self.pane_id = self._query_pane_id()  # %N，refresh -r 的寻址需要稳定 ID
 
     def _query_pane_id(self) -> str | None:
         known = _pane_ids.get(self.name)  # 创建时经 new-session -P 登记的最快
@@ -319,24 +382,118 @@ class ControlChannel:
             return None
 
     def _read_loop(self) -> None:
+        # 块解析进度只在 reader 线程内读写；pending/active waiter 与写线程、
+        # close 共享，统一用 _lock 保护。
+        in_block = False
+        block_lines: list[str] = []
+        block_guard: tuple[str, str] | None = None
+        current_waiter: "queue.Queue | None | object" = None
         try:
             for raw in self._proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
-                if line.startswith("%output "):
-                    self._notify()
-                elif line.startswith("%pause "):
-                    # 流控：服务端发现我们落后 pause-after 秒未消费时暂停推送，
-                    # 回 continue 恢复（输出内容本身不解析，不存在真正的积压）
-                    pane = line.split(None, 1)[1].strip()
-                    self.command("refresh", "-A", f"{pane}:continue")
-                elif line.startswith("%error"):
-                    self.last_error = line
-                elif line.startswith("%exit"):
+                if in_block:
+                    m = _GUARD_RE.match(line)
+                    if (
+                        m is not None
+                        and m.group(1) in ("end", "error")
+                        and (m.group(2), m.group(3)) == block_guard
+                    ):
+                        # 真正的块终止行——必须连时间戳+命令号一起匹配，不能只
+                        # 看前缀：capture-pane 的响应块是命令的原始输出，不像
+                        # %output 通知那样对内容做八进制转义，pane 里的真实文本
+                        # （比如某个程序打印的一行 "%error: ..."）理论上可能撞上
+                        # "%end"/"%error" 前缀，靠 (ts, num) 精确配对排除这种
+                        # 误判——协议本身不转义命令响应，这是唯一可靠的判据。
+                        ok = m.group(1) == "end"
+                        if current_waiter is _STARTUP_WAITER:
+                            self._startup_ok = ok
+                            self._ready.set()
+                        elif current_waiter is not None:
+                            try:
+                                current_waiter.put_nowait((ok, block_lines))
+                            except queue.Full:
+                                pass  # 调用方已超时放弃，静默丢弃迟到的响应
+                        with self._lock:
+                            if self._active_waiter is current_waiter:
+                                self._active_waiter = None
+                        in_block = False
+                        block_lines = []
+                        block_guard = None
+                        current_waiter = None
+                        continue
+                    notification = self._handle_notification(line)
+                    if notification == "exit":
+                        break
+                    if notification == "handled":
+                        continue
+                    block_lines.append(line)
+                    continue
+                m = _GUARD_RE.match(line)
+                if m is not None and m.group(1) == "begin":
+                    in_block = True
+                    block_guard = (m.group(2), m.group(3))
+                    block_lines = []
+                    # 和写线程登记 waiter 使用同一把锁。写线程会先 append、再把
+                    # 命令 flush 给 tmux，因此 reader 不可能看到响应却看不到登记。
+                    with self._lock:
+                        try:
+                            current_waiter = self._pending.popleft()
+                        except IndexError:
+                            # 只可能是未知的服务端自发命令块；丢弃其正文但不让
+                            # 后续业务 waiter 错位。
+                            current_waiter = None
+                        self._active_waiter = current_waiter
+                    continue
+                notification = self._handle_notification(line)
+                if notification == "exit":
                     break
+                if notification == "handled":
+                    continue
+                if line.startswith("%error"):
+                    self.last_error = line
         except (OSError, ValueError):
             pass
-        self.dead = True
+        self._mark_dead()
         self._notify()  # 唤醒 capture 循环，让它感知通道死亡并回退轮询/判定会话死亡
+
+    def _handle_notification(self, line: str) -> str | None:
+        """处理可夹在命令响应块之间的控制模式异步通知。
+
+        返回 ``"handled"`` 表示通知已消费，``"exit"`` 表示 reader 应退出，
+        ``None`` 表示这是普通命令输出。通知不能混入 capture-pane 的正文。
+        """
+        kind = line.split(None, 1)[0] if line else ""
+        if kind == "%exit":
+            return "exit"
+        if kind not in _ASYNC_NOTIFICATIONS:
+            return None
+        if kind in ("%output", "%extended-output"):
+            self._notify()
+        elif kind == "%pause":
+            # 流控：服务端发现客户端来不及消费时暂停推送，立即经同一控制通道
+            # 回 continue；其响应会按 FIFO 正常落到一个 fire-and-forget 占位。
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                pane = parts[1].strip()
+                self.command("refresh", "-A", f"{pane}:continue")
+        return "handled"
+
+    def _mark_dead(self) -> None:
+        """标记通道死亡，并让全部同步请求立即失败返回。"""
+        self.dead = True
+        self._ready.set()
+        with self._lock:
+            pending = list(self._pending)
+            self._pending.clear()
+            if self._active_waiter is not None:
+                pending.append(self._active_waiter)
+                self._active_waiter = None
+        for waiter in pending:
+            if waiter is not None and waiter is not _STARTUP_WAITER:
+                try:
+                    waiter.put_nowait((False, []))
+                except queue.Full:
+                    pass
 
     def _notify(self) -> None:
         if self.on_output is not None:
@@ -345,28 +502,101 @@ class ControlChannel:
             except Exception:
                 pass  # 回调（Event.set）不应失败；兜底保读线程不死
 
-    def send(self, cmd: str) -> bool:
-        """写一条命令行；通道已死或写入失败返回 False（调用方回退 fork 路径）。"""
-        if self.dead:
-            return False
+    def _send_command(self, cmd: str, waiter: "queue.Queue | None") -> bool:
+        """写一条命令行并把 waiter 原子地登记进 FIFO 响应队列。
+
+        waiter 为 None（command()/send() 的既有用法）表示调用方不关心响应，
+        对应块到达时直接丢弃；写入与登记必须在同一把锁内完成，否则并发调用者
+        之间可能出现「命令已经进了 tmux 的处理队列，但登记还没跟上」的窗口，
+        使 _read_loop 按到达顺序 popleft 时配对到错误的调用方。
+        """
+        failed = False
         try:
             with self._lock:
+                if self.dead or self._closed:
+                    return False
+                # 必须先登记再写入。reader 取 pending 也拿同一把锁；释放锁时命令
+                # 已经 flush，因而不存在“响应先到、waiter 后登记”的窗口。
+                self._pending.append(waiter)
                 self._proc.stdin.write(cmd.encode("utf-8") + b"\n")
                 self._proc.stdin.flush()
         except (OSError, ValueError):
-            self.dead = True
+            # 写失败时 reader 不可能为本命令收到响应；登记项仍在队尾，安全回滚。
+            with self._lock:
+                if self._pending and self._pending[-1] is waiter:
+                    self._pending.pop()
+            failed = True
+        if failed:
+            self._mark_dead()
             return False
         return True
+
+    def send(self, cmd: str) -> bool:
+        """写一条命令行；通道已死或写入失败返回 False（调用方回退 fork 路径）。"""
+        return self._send_command(cmd, None)
 
     def command(self, *args: str) -> bool:
         return self.send(" ".join(_ctl_quote(a) for a in args))
 
-    def close(self) -> None:
-        self.dead = True
+    def request(self, *args: str, timeout: float = _CALL_TIMEOUT) -> list[str] | None:
+        """同步发命令并等待其 %begin…%end/%error 响应块，返回块内文本行列表。
+
+        用于 capture-pane/display-message 这类只读查询——通道存活时不必再为
+        每次查询 fork 一个 tmux 客户端进程（原来的抓帧循环每帧都要付这个代价，
+        真机实测是内嵌面板 CPU 占用的主要来源之一）。命令失败（%error）或
+        通道死亡/超时都返回 None，调用方据此回退外部 fork 路径。
+        """
+        if self.dead:
+            return None
+        waiter: "queue.Queue[tuple[bool, list[str]]]" = queue.Queue(maxsize=1)
+        cmd = " ".join(_ctl_quote(a) for a in args)
+        if not self._send_command(cmd, waiter):
+            return None
         try:
-            self._proc.kill()
-        except OSError:
-            pass
+            ok, lines = waiter.get(timeout=timeout)
+        except queue.Empty:
+            # 控制响应超时后不能继续复用 FIFO：不知道这条响应是迟到还是已经
+            # 丢失，继续发请求只会让后续响应整体错位、pending 无界增长。
+            self.close()
+            return None
+        return lines if ok else None
+
+    def close(self) -> None:
+        """幂等关闭控制 client，唤醒请求方并完整回收子进程、管道和 reader。"""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._mark_dead()
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except OSError:
+                pass
+            if self._proc.poll() is None:
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        self._proc.kill()
+                        self._proc.wait(timeout=0.5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                except OSError:
+                    pass
+            else:
+                try:
+                    self._proc.wait(timeout=0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if threading.current_thread() is not self._reader:
+                self._reader.join(timeout=0.5)
+            try:
+                if self._proc.stdout is not None:
+                    self._proc.stdout.close()
+            except OSError:
+                pass
 
 
 _channel: ControlChannel | None = None
@@ -566,6 +796,12 @@ def translate_textual_key(key: str) -> tuple[str, str] | None:
         return ("keys", "Enter")
     if key == "tab":
         return ("keys", "Tab")
+    if key == "shift+tab":
+        # tmux 没有 S-Tab：终端里 Shift+Tab 是 backtab，tmux 的具名键是 BTab
+        # （tmux(1) 手册明确列出——大多数带 Shift 的键改用有专名的形式，不走
+        # S- 前缀）。Claude Code 用这个键循环 plan/权限模式，是高频操作，漏掉
+        # 会在内嵌面板里表现为「按了没反应」且没有任何提示（真实缺口，非假设）。
+        return ("keys", "BTab")
     if key == "backspace":
         return ("keys", "BSpace")
     if key == "escape":
@@ -582,23 +818,15 @@ def translate_textual_key(key: str) -> tuple[str, str] | None:
 # 画面解析：capture-pane -e 输出 → 定宽定高的字符单元格网格
 # ---------------------------------------------------------------------------
 
-def _rgb_to_256(r: int, g: int, b: int) -> int:
-    """真彩色量化到 xterm 256 色；curses 端无法表达任意 RGB，近似即可。"""
-    if r == g == b:
-        if r < 8:
-            return 16
-        if r > 248:
-            return 231
-        return 232 + round((r - 8) / 247 * 24)
-    cube = lambda v: round(v / 255 * 5)  # noqa: E731
-    return 16 + 36 * cube(r) + 6 * cube(g) + cube(b)
-
-
 @dataclass(frozen=True)
 class Cell:
     ch: str = " "
-    fg: int = -1   # 0-255；-1 = 终端默认前景
-    bg: int = -1   # 0-255；-1 = 终端默认背景
+    # -1 = 终端默认色；0-255 = 256 色索引；tuple(r, g, b) = 真彩色直通（SGR
+    # 38/48;2;r;g;b 原样保留，不再量化）——curses 时代的 `_rgb_to_256` 量化是
+    # curses 颜色对（256 个上限）的限制，不是现在 Textual/Rich 渲染端的限制；
+    # Rich 用 `Color.from_rgb` 原样表达任意 RGB，量化到这里只是无谓降质。
+    fg: "int | tuple[int, int, int]" = -1
+    bg: "int | tuple[int, int, int]" = -1
     bold: bool = False
     dim: bool = False
     underline: bool = False
@@ -621,8 +849,9 @@ class _SgrState:
     """单行的 SGR 属性状态机：遇到字符就按当前属性落格。"""
 
     def __init__(self) -> None:
-        self.fg = -1
-        self.bg = -1
+        # 与 Cell.fg/bg 同语义：-1 默认色 / 0-255 索引色 / (r, g, b) 真彩色
+        self.fg: "int | tuple[int, int, int]" = -1
+        self.bg: "int | tuple[int, int, int]" = -1
         self.bold = False
         self.dim = False
         self.underline = False
@@ -663,10 +892,10 @@ class _SgrState:
             elif p in (38, 48):
                 # 38/48 ; 5 ; n  或  38/48 ; 2 ; r ; g ; b
                 if i + 2 < len(params) and params[i + 1] == 5:
-                    value = params[i + 2]
+                    value: "int | tuple[int, int, int]" = params[i + 2]
                     i += 2
                 elif i + 4 < len(params) and params[i + 1] == 2:
-                    value = _rgb_to_256(params[i + 2], params[i + 3], params[i + 4])
+                    value = (params[i + 2], params[i + 3], params[i + 4])
                     i += 4
                 else:
                     i += 1  # 参数不全，跳过模式位继续
@@ -758,10 +987,27 @@ def parse_screen(text: str, width: int, height: int) -> list[list[Cell]]:
 def cell_style(cell: Cell) -> Style:
     """把一个单元格的颜色/属性组合编译成 Rich Style；结果按组合缓存（Cell 是
     frozen dataclass，可哈希），避免每帧对同一批组合重复构造 Style 对象。
+
+    fg/bg 两种形态分别处理：0-255 的索引色直接 `Color.from_ansi`，(r, g, b)
+    真彩色用 `Color.from_rgb` 原样传递——curses 时代必须量化到 256 色是因为
+    颜色对上限是 256，这个限制在 Textual/Rich 渲染端不存在了，量化到这里只是
+    无谓降质（托管 agent 的渐变/主题色会全被打到近似色上）。
     """
+    if isinstance(cell.fg, tuple):
+        fg_color = Color.from_rgb(*cell.fg)
+    elif cell.fg >= 0:
+        fg_color = Color.from_ansi(cell.fg)
+    else:
+        fg_color = None
+    if isinstance(cell.bg, tuple):
+        bg_color = Color.from_rgb(*cell.bg)
+    elif cell.bg >= 0:
+        bg_color = Color.from_ansi(cell.bg)
+    else:
+        bg_color = None
     return Style(
-        color=Color.from_ansi(cell.fg) if cell.fg >= 0 else None,
-        bgcolor=Color.from_ansi(cell.bg) if cell.bg >= 0 else None,
+        color=fg_color,
+        bgcolor=bg_color,
         bold=cell.bold or None,
         dim=cell.dim or None,
         underline=cell.underline or None,
@@ -769,30 +1015,46 @@ def cell_style(cell: Cell) -> Style:
     )
 
 
+def row_text_and_spans(row: list[Cell]) -> tuple[str, list[tuple[int, int, Style]]]:
+    """单行 Cell 编译为 (纯文本, 样式段列表)——样式段是 (起始字符下标, 结束字符
+    下标, Style)，下标按 `chars`（跳过 wide_cont 占位格后的纯文本）计数，不是
+    终端列位置；相邻同样式单元格合并成一段。
+
+    这是 `grid_to_text`（整屏一次性构造，供旧的整体 Rich Text 渲染路径）和
+    `ui/embed_pane.py` 的 Line API 按行局部重绘（`render_line`，每行按需构造
+    Textual `Strip`）共用的核心合并逻辑，抽成单行函数避免两处各自实现、
+    渐渐演化出细微差异。保持在 `embed.py`（不 import textual）维持模块与 UI
+    框架无关这条既有边界——`Strip`/`Segment` 这类 Textual 专属类型的构造留在
+    `ui/embed_pane.py`。
+    """
+    chars: list[str] = []
+    spans: list[tuple[int, int, Style]] = []
+    x = 0
+    span_start = 0
+    span_style: Style | None = None
+    for cell in row:
+        if cell.wide_cont:
+            continue
+        chars.append(cell.ch)
+        style = cell_style(cell)
+        if style != span_style:
+            if span_style is not None and x > span_start:
+                spans.append((span_start, x, span_style))
+            span_start = x
+            span_style = style
+        # span 下标供 Rich Text / Python 字符串切片使用，必须按 Python 字符索引
+        # 累加，不能按终端 cell 数累加。组合字符会和基础字符合并在同一个 Cell.ch
+        # 中（如 "e\u0301" 长度为 2）；仍然只加 1 会让后续文本被切掉。宽字符的
+        # continuation cell 已在上面跳过，主 cell.ch 长度仍为 1，不受影响。
+        x += len(cell.ch)
+    if span_style is not None and x > span_start:
+        spans.append((span_start, x, span_style))
+    return "".join(chars), spans
+
+
 def grid_to_text(grid: list[list[Cell]]) -> list[tuple[str, list[tuple[int, int, Style]]]]:
     """把单元格网格编译成每行 (纯文本, 样式段列表) ——样式段是 (起始列, 结束列, Style)，
     相邻同样式单元格合并成一段。调用方（如 Textual 的 EmbedPane）据此构造
     `rich.text.Text` 并按段调用 `stylize`，避免逐格构造 Style/Span 的开销。
     """
-    rows: list[tuple[str, list[tuple[int, int, Style]]]] = []
-    for row in grid:
-        chars: list[str] = []
-        spans: list[tuple[int, int, Style]] = []
-        x = 0
-        span_start = 0
-        span_style: Style | None = None
-        for cell in row:
-            if cell.wide_cont:
-                continue
-            chars.append(cell.ch)
-            style = cell_style(cell)
-            if style != span_style:
-                if span_style is not None and x > span_start:
-                    spans.append((span_start, x, span_style))
-                span_start = x
-                span_style = style
-            x += 1
-        if span_style is not None and x > span_start:
-            spans.append((span_start, x, span_style))
-        rows.append(("".join(chars), spans))
-    return rows
+    return [row_text_and_spans(row) for row in grid]

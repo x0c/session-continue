@@ -26,7 +26,12 @@ class PickupApp(App):
     CSS = """
     #list-header {
         height: 1;
+        color: white;
         background: $primary-darken-2;
+    }
+
+    #session-list > ListItem {
+        margin-bottom: 1;
     }
     """
 

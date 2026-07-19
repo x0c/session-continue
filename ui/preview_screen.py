@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.screen import Screen
@@ -43,6 +43,11 @@ class PreviewScreen(Screen):
         self.session = session
         self.title = title
         self._at_bottom = True
+        # 上一次真正重渲染时用到的消息列表/折行宽度：轮询命中"内容没变、宽度
+        # 也没变"时直接跳过折行+重建 Text+Static.update()（全量 re-layout），
+        # 只有内容变化或窗口 resize 才值得付这个代价。
+        self._last_messages: list | None = None
+        self._last_width: int | None = None
 
     def compose(self) -> ComposeResult:
         import pickup
@@ -60,16 +65,30 @@ class PreviewScreen(Screen):
         )
 
     def on_mount(self) -> None:
-        self._render_messages()
+        self._render_messages(force=True)
         self.set_interval(POLL_INTERVAL, self._poll_updates)
 
-    def _render_messages(self) -> None:
+    def _on_resize(self, event: events.Resize) -> None:
+        # 无条件轮询改成"内容没变就跳过"之后，窗口 resize 不再顺带触发重渲染
+        # 了——但折行宽度是按当前终端宽度算的（见下方 width 计算），宽度变了
+        # 必须强制重新折行，否则文本会保持旧宽度的断行，直到内容碰巧也变化。
+        self._render_messages(force=True)
+
+    def _render_messages(self, *, force: bool = False) -> None:
         import pickup
 
         messages = self.store.get_conversation(self.session)
-        runtime_name = self.store.registry.get(str(self.session.get("source") or "")).display_name
         scroll = self.query_one("#preview-scroll", VerticalScroll)
         width = max(20, scroll.content_size.width - 2)
+        # 每次轮询都以 Textual 当前真实滚动位置更新追底状态，必须放在内容相同的
+        # early return 之前。用户刚向上翻历史时，即使这一轮没有新消息，也要立刻
+        # 记住“已离开底部”，避免下一轮内容更新把他强行拽回最底端。
+        was_at_bottom = scroll.scroll_y >= scroll.max_scroll_y - 1
+        self._at_bottom = was_at_bottom
+        if not force and messages == self._last_messages and width == self._last_width:
+            return
+
+        runtime_name = self.store.registry.get(str(self.session.get("source") or "")).display_name
         lines = pickup._preview_lines(messages, runtime_name, width)
 
         out = Text()
@@ -82,10 +101,11 @@ class PreviewScreen(Screen):
                 out.append("\n")
         body = self.query_one("#preview-body", Static)
         body.update(out)
-        was_at_bottom = self._at_bottom
-        self._at_bottom = scroll.scroll_y >= scroll.max_scroll_y - 1
+        self._last_messages = messages
+        self._last_width = width
         if was_at_bottom:
             scroll.scroll_end(animate=False)
+            self._at_bottom = True
 
     def _poll_updates(self) -> None:
         self._render_messages()

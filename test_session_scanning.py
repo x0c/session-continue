@@ -604,14 +604,102 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
             {"id": "a", "mtime": 1, "size_kb": 1, "fallback_title": "标题A"},
             {"id": "b", "mtime": 1, "size_kb": 1, "fallback_title": "标题B"},
         ]
+        cache = {}
 
         with mock.patch.object(titles, "generate_titles_batch", return_value={}) as mocked:
             with mock.patch.object(titles, "save_cache", return_value=None) as save_mock:
-                result = titles.refresh_titles(sessions, {}, generator=mock.Mock())
+                result = titles.refresh_titles(sessions, cache, generator=mock.Mock())
 
         self.assertEqual(result, {})
         mocked.assert_called_once()
-        save_mock.assert_not_called()
+        save_mock.assert_called_once()
+        for session in sessions:
+            entry = cache[titles.session_key(session)]
+            self.assertEqual(entry["generation_state"], "failed")
+            self.assertEqual(entry["generation_version"], titles.TITLE_CACHE_VERSION)
+            self.assertFalse(titles.resolve_initial_title(session, cache)[1])
+
+        expired_cache = {
+            titles.session_key(sessions[0]): {
+                **cache[titles.session_key(sessions[0])],
+                "generation_version": titles.TITLE_CACHE_VERSION - 1,
+            }
+        }
+        self.assertTrue(titles.resolve_initial_title(sessions[0], expired_cache)[1])
+
+    def test_refresh_titles_without_available_generator_writes_finished_state(self) -> None:
+        sessions = [
+            {"id": "offline", "source": "claude", "mtime": 1, "size_kb": 1,
+             "fallback_title": "整理离线安装流程"},
+        ]
+        cache = {}
+
+        with (
+            mock.patch.object(titles.titlegen, "available_generators", return_value=()),
+            mock.patch.object(titles, "save_cache") as save_mock,
+        ):
+            result = titles.refresh_titles(sessions, cache)
+
+        self.assertEqual(result, {})
+        save_mock.assert_called_once_with(cache)
+        entry = cache["claude:offline"]
+        self.assertEqual(entry["generation_state"], "failed")
+        self.assertEqual(entry["generation_version"], titles.TITLE_CACHE_VERSION)
+        self.assertEqual(titles.resolve_initial_title(sessions[0], cache), ("整理离线安装流程", False))
+
+    def test_refresh_titles_partial_result_marks_missing_and_low_value_items_finished(self) -> None:
+        sessions = [
+            {"id": "ok", "source": "claude", "mtime": 1, "size_kb": 1,
+             "fallback_title": "修复登录报错"},
+            {"id": "missing", "source": "claude", "mtime": 1, "size_kb": 1,
+             "fallback_title": "补充支付测试"},
+            {"id": "low", "source": "claude", "mtime": 1, "size_kb": 1,
+             "fallback_title": "整理部署流程"},
+        ]
+        cache = {}
+        raw = {"claude:ok": "修复登录报错", "claude:low": "继续"}
+
+        with (
+            mock.patch.object(titles, "generate_titles_batch", return_value=raw),
+            mock.patch.object(titles, "save_cache"),
+        ):
+            result = titles.refresh_titles(sessions, cache, generator=mock.Mock())
+
+        self.assertEqual(result, {"claude:ok": "修复登录报错"})
+        self.assertNotIn("generation_state", cache["claude:ok"])
+        for key in ("claude:missing", "claude:low"):
+            self.assertEqual(cache[key]["generation_state"], "failed")
+        self.assertFalse(titles.resolve_initial_title(sessions[1], cache)[1])
+        self.assertFalse(titles.resolve_initial_title(sessions[2], cache)[1])
+
+    def test_refresh_titles_probes_bad_preferred_generator_only_once(self) -> None:
+        sessions = [
+            {"id": f"s{i}", "source": "claude", "mtime": 1, "size_kb": 1,
+             "fallback_title": f"处理标题任务{i}"}
+            for i in range(titles._BATCH_SIZE * 3)
+        ]
+        failed = mock.Mock()
+        failed.id = "claude"
+        fallback = mock.Mock()
+        fallback.id = "codex"
+        calls = {"claude": 0, "codex": 0}
+
+        def fake_batch(chunk, generator, timeout=90):
+            calls[generator.id] += 1
+            if generator is failed:
+                return {}
+            return {titles.session_key(s): f"生成{s['id']}" for s in chunk}
+
+        with (
+            mock.patch.object(titles.titlegen, "available_generators", return_value=(failed, fallback)),
+            mock.patch.object(titles, "generate_titles_batch", side_effect=fake_batch),
+            mock.patch.object(titles, "save_cache"),
+        ):
+            result = titles.refresh_titles(sessions, {})
+
+        self.assertEqual(len(result), len(sessions))
+        self.assertEqual(calls["claude"], 1)
+        self.assertEqual(calls["codex"], 3)
 
     def test_refresh_titles_saves_cache_per_batch(self) -> None:
         # 三批（_BATCH_SIZE 条/批）并行完成后，仍应每批落盘而非最后一次性写。
@@ -638,11 +726,15 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         lock = threading.Lock()
         started = threading.Event()
         release = threading.Event()
-        state = {"active": 0, "max_active": 0}
+        state = {"calls": 0, "active": 0, "max_active": 0}
         outcome = {}
 
         def fake_batch(chunk, generator, timeout=90):
             with lock:
+                state["calls"] += 1
+                # 第一批是串行健康探测，必须先正常完成；后面的五批才并发。
+                if state["calls"] == 1:
+                    return {titles.session_key(s): f"生成{s['id']}" for s in chunk}
                 state["active"] += 1
                 state["max_active"] = max(state["max_active"], state["active"])
                 if state["active"] == titles._MAX_PARALLEL_BATCHES:
@@ -677,6 +769,7 @@ class ClaudeScanTests(TimezoneMixin, unittest.TestCase):
         self.assertFalse(runner.is_alive())
         self.assertNotIn("error", outcome)
         self.assertEqual(len(outcome["result"]), len(sessions))
+        self.assertEqual(state["calls"], titles._MAX_PARALLEL_BATCHES + 1)
 
     def test_scan_sessions_memoizes_cwd_isdir_and_peek_skips_noise_and_dead_cwd(self) -> None:
         # 首屏 ≤1s 的回归防退化用例：不依赖真实数据。构造大量会话共享极少数
@@ -1297,16 +1390,65 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
         with mock.patch.object(scan_opencode, "_db_paths", return_value=[]):
             self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
 
-    def test_scan_sessions_degrades_when_db_is_corrupted(self) -> None:
+    def test_scan_signature_sorts_live_snapshot_and_detects_process_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            db_path.touch()
+
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name",
+                                   return_value={"/tmp/b": 22, "/tmp/a": 11}):
+                first = scan_opencode.scan_signature()
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name",
+                                   return_value={"/tmp/a": 11, "/tmp/b": 22}):
+                reordered = scan_opencode.scan_signature()
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name",
+                                   return_value={"/tmp/a": 11}):
+                changed = scan_opencode.scan_signature()
+
+        self.assertEqual(first, reordered)
+        self.assertNotEqual(first, changed)
+
+    def test_scan_sessions_raises_when_all_existing_db_connections_fail(self) -> None:
+        with mock.patch.object(scan_opencode, "_db_paths", return_value=["a.db", "b.db"]), \
+             mock.patch.object(scan_opencode, "_connect_ro", return_value=None), \
+             mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
+            with self.assertRaisesRegex(RuntimeError, "所有 OpenCode 会话数据库均读取失败"):
+                scan_opencode.scan_sessions(limit=10)
+
+    def test_scan_sessions_keeps_successful_result_when_another_db_query_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            broken_path = Path(td) / "broken.db"
+            broken_path.write_text("不是一个真正的 sqlite 文件", encoding="utf-8")
+            healthy_path = Path(td) / "healthy.db"
+            _make_opencode_db(
+                healthy_path,
+                sessions=[{
+                    "id": "ses_healthy", "directory": "/tmp/demo", "title": "正常会话",
+                    "time_created": 0, "time_updated": 100_000,
+                }],
+            )
+
+            with mock.patch.object(
+                scan_opencode, "_db_paths", return_value=[str(broken_path), str(healthy_path)]
+            ), mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
+                sessions = scan_opencode.scan_sessions(limit=10)
+
+        self.assertEqual([session["id"] for session in sessions], ["ses_healthy"])
+
+    def test_scan_sessions_raises_when_db_is_corrupted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "opencode.db"
             db_path.write_text("不是一个真正的 sqlite 文件", encoding="utf-8")
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
                  mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
-                self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
+                with self.assertRaisesRegex(RuntimeError, "所有 OpenCode 会话数据库均读取失败"):
+                    scan_opencode.scan_sessions(limit=10)
 
-    def test_scan_sessions_degrades_when_tables_are_missing(self) -> None:
+    def test_scan_sessions_raises_when_tables_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "opencode.db"
             conn = sqlite3.connect(str(db_path))
@@ -1314,7 +1456,8 @@ class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
 
             with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
                  mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
-                self.assertEqual(scan_opencode.scan_sessions(limit=10), [])
+                with self.assertRaisesRegex(RuntimeError, "所有 OpenCode 会话数据库均读取失败"):
+                    scan_opencode.scan_sessions(limit=10)
 
     def test_limit_keeps_newest_sessions_in_descending_order(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1831,6 +1974,30 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(store.get_title(session), "这是一条很长的兜底标题")
         self.assertIn(pickup.session_key(session), store.generating)
 
+    def test_low_value_session_never_enters_generating_state(self) -> None:
+        session = {
+            "source": "claude",
+            "id": "greeting",
+            "short_id": "greeting",
+            "mtime": 1,
+            "size_bytes": 1,
+            "size_kb": 1,
+            "native_title": None,
+            "fallback_title": "在吗",
+        }
+        runtime = mock.Mock()
+        runtime.id = "claude"
+        runtime.display_name = "Claude"
+        runtime.scan_sessions.return_value = [session]
+        registry = pickup.RuntimeRegistry((runtime,))
+
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+
+        self.assertEqual(store.get_title(session), "在吗")
+        self.assertNotIn(pickup.session_key(session), store.generating)
+
     def test_poll_cache_updates_clears_spinner_when_title_arrives(self) -> None:
         session = {
             "source": "claude",
@@ -1865,6 +2032,54 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(store.get_title(session), "后台生成的标题")
         self.assertNotIn(key, store.generating)
         self.assertTrue(store.dirty.is_set())
+
+    def test_failed_title_terminal_state_clears_spinner_and_survives_restart(self) -> None:
+        session = {
+            "source": "claude",
+            "id": "failed",
+            "short_id": "failed",
+            "mtime": 1,
+            "size_bytes": 1,
+            "size_kb": 1,
+            "native_title": None,
+            "fallback_title": "排查标题生成卡死",
+        }
+        runtime = mock.Mock()
+        runtime.id = "claude"
+        runtime.display_name = "Claude"
+        runtime.scan_sessions.return_value = [session]
+        registry = pickup.RuntimeRegistry((runtime,))
+        key = pickup.session_key(session)
+
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+        self.assertIn(key, store.generating)
+
+        failed_cache = {
+            key: {
+                "fp": titles._fingerprint(session),
+                "title": "排查标题生成卡死",
+                "generation_state": "failed",
+                "generation_version": titles.TITLE_CACHE_VERSION,
+            }
+        }
+        with (
+            mock.patch.object(pickup.SessionStore, "_cache_file_mtime", return_value=999.0),
+            mock.patch.object(pickup.titles, "load_cache", return_value=failed_cache),
+        ):
+            store.poll_cache_updates()
+
+        self.assertEqual(store.get_title(session), "排查标题生成卡死")
+        self.assertNotIn(key, store.generating)
+        self.assertTrue(store.dirty.is_set())
+
+        # 模拟重新启动 pickup：同一缓存版本的失败终态不能再次进入待生成队列。
+        with mock.patch.object(pickup.titles, "load_cache", return_value=failed_cache):
+            restarted = pickup.SessionStore(limit=20, registry=registry)
+            restarted.load()
+        self.assertNotIn(key, restarted.generating)
+        self.assertFalse(titles.resolve_initial_title(session, failed_cache)[1])
 
     def test_conversation_is_loaded_lazily_and_cached(self) -> None:
         session = {
@@ -2007,6 +2222,7 @@ class TuiLayoutTests(unittest.TestCase):
         claude_runtime = mock.Mock()
         claude_runtime.id = "claude"
         claude_runtime.display_name = "Claude"
+        claude_runtime.scan_signature.return_value = None
         claude_runtime.scan_sessions.side_effect = [first, second]
         registry = pickup.RuntimeRegistry((claude_runtime,))
         with mock.patch.object(pickup.titles, "load_cache", return_value={}):

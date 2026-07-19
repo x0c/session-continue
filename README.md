@@ -104,12 +104,13 @@ JSON output includes runtime, session ID, title, working directory, update time,
 ## Embedded Panes (work on multiple sessions at once)
 
 `pickup` is a unified, time-ordered session timeline: Claude Code, Codex CLI, OpenCode, and Kimi
-Code sessions appear in one list rather than separate runtime tabs. Each two-line card shows
-`project: title` first, then runtime, status, and the right-aligned update time. The right half
-always follows the selection: hosted sessions render their live terminal, while history that is not
-currently hosted shows an instant summary without starting a process. Once the list is shown its
-order is stable — cards never jump around when their content updates; only genuinely new sessions
-appear, always prepended at the top.
+Code sessions appear in one list rather than separate runtime tabs. Each card shows `project: title`
+with the runtime aligned right on the first row, then a green running state (or ended state) with the
+update time aligned right on the second row. A blank row separates cards. Title generation uses a
+spinner without changing the title's weight. The right half always follows the selection: hosted
+sessions render their live terminal, while history that is not currently hosted shows an instant
+summary without starting a process. Once the list is shown its order is stable — cards never jump
+around when their content updates; only genuinely new sessions appear, always prepended at the top.
 
 - The first row is a pinned `＋ 新建会话` (new session) item that never scrolls away: press
   `Enter` on it to pick a project directory and an agent runtime, and the blank session starts
@@ -123,18 +124,15 @@ appear, always prepended at the top.
   is passed through to the agent after a short delay, and `Ctrl-\` remains supported for compatibility.
 - `p` pins the right pane to the current session so you can browse other history while monitoring it;
   press `p` again to restore follow mode. `f` cycles the optional project filter.
-- Scroll wheel always browses the pane's scrollback (rendered from tmux history), even when the
-  embedded agent requests mouse input; this makes up/down scrolling reliable and any keystroke
-  drops you back to the live view. Use `e` when an agent needs direct mouse-wheel input. Wheel
-  over the left sidebar scrolls the session list. Mouse events never trigger a full redraw, so
-  drag storms can't freeze the UI.
-- Drag to select anywhere — pickup implements its own selection: drag with the left button
-  and the highlighted text is copied straight to your clipboard (OSC 52, works over SSH),
-  no keys needed. This is the copy path while mouse reporting is on (native selection is
-  taken over by the program).
+- The wheel follows the natural direction: up moves into older output and down returns toward the
+  live view. At the live edge, agents that request wheel input receive it directly; otherwise pickup
+  browses tmux history. Use `e` for full-screen mouse interaction. Wheel over the left sidebar scrolls
+  the session list.
+- Drag to select text in the embedded pane, then press `Ctrl+C` to copy it through OSC 52 (including
+  over SSH when the terminal supports it).
 - `m` (in the list/sidebar) toggles mouse reporting off and on — turn it off when you want
   your terminal's native drag-to-select for a longer copying session; turn it back on to
-  resume wheel forwarding and built-in drag-to-copy.
+  resume wheel forwarding and embedded-pane text selection.
 - The terminal cursor is parked at the agent's own cursor position, so IME preedit popups
   (e.g. CJK input methods) appear right at the agent's input box, not at the bottom of the screen.
 - Dark/light theme detection inside panes is repaired on tmux ≥ 3.5a: `pickup` probes your real
@@ -266,15 +264,20 @@ The original session history is left untouched (opened read-only). The target ru
 
 ## Title Generation
 
-The TUI first shows a local fallback title so the first screen is immediate. A detached background process can then generate better Chinese titles in small batches through `claude -p --model haiku`.
+The TUI first shows a local fallback title so the first screen is immediate. A detached background
+process can then generate better Chinese titles in small batches through an available Claude or
+Codex CLI.
 
 Cost controls:
 
 - generated titles are cached by runtime and session ID;
 - a file lock prevents duplicate title-generation workers;
-- failures keep the local fallback title instead of retrying every item slowly.
+- failed, timed-out, invalid, or missing results keep the local fallback title and stop the spinner;
+- a failed title is not retried automatically on later launches, so it does not repeatedly consume
+  account quota. A future title-cache upgrade may retry it under updated rules.
 
-Title generation is optional in practice: if `claude` is unavailable or fails, the session picker still works.
+Title generation is optional in practice: if no generator is available or generation fails, the
+session picker still works.
 
 ## Project Layout
 

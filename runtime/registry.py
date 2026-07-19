@@ -26,6 +26,13 @@ class RuntimeRegistry:
             self._runtimes[runtime.id] = runtime
         if not self._runtimes:
             raise ValueError("至少需要注册一个运行时")
+        # 廉价预检缓存：runtime.id -> (limit, scan_signature() 返回值) 与对应的上一次
+        # 扫描结果，只有实现了 scan_signature()（非 None）的运行时才会命中，见
+        # scan_all() 和 BaseRuntime.scan_signature 的文档。只应由同一调用方顺序调用
+        # scan_all()（如 SessionStore 的后台重扫循环），不是线程安全的并发写结构——
+        # 调用方需要自己保证同一 registry 实例不会被多个线程同时 scan_all()。
+        self._scan_cache: dict[str, tuple[int, object]] = {}
+        self._scan_cache_result: dict[str, list[SessionInfo]] = {}
 
     def __iter__(self):
         return iter(self._runtimes.values())
@@ -47,14 +54,42 @@ class RuntimeRegistry:
         单个运行时的扫描异常（如某条真实会话记录格式异常触发未预料的解析
         bug）被隔离在这里：该运行时降级为空列表，不拖垮其余运行时的结果，
         也不让 pickup 首屏因为一条脏数据直接崩溃退出。
+
+        实现了 `scan_signature()`（目前只有 OpenCode）的运行时会先做一次廉价
+        签名比对：签名和上一次调用相同就直接复用上一次的扫描结果，跳过完整的
+        `scan_sessions()`；没实现（返回 `None`）的运行时不受影响，行为与优化前
+        完全一致。见 `BaseRuntime.scan_signature` 文档里为什么 Claude/Codex 故意
+        不接入这个机制。
         """
         runtimes = list(self)
 
+        def _copy_sessions(sessions: list[SessionInfo]) -> list[SessionInfo]:
+            """缓存与调用方之间隔离可变会话字典，避免界面注入字段反向污染缓存。"""
+            return [dict(session) for session in sessions]
+
         def _scan_one(runtime: BaseRuntime) -> list[SessionInfo]:
             try:
-                return runtime.scan_sessions(limit)
+                signature = runtime.scan_signature()
             except Exception:
-                return []
+                signature = None
+            if signature is not None:
+                cache_key = (limit, signature)
+                if self._scan_cache.get(runtime.id) == cache_key:
+                    return _copy_sessions(self._scan_cache_result.get(runtime.id, []))
+            try:
+                result = runtime.scan_sessions(limit)
+            except Exception:
+                # 瞬时读取失败不能把一份空结果写进新签名、覆盖最后一次成功缓存；
+                # 有旧数据时继续展示旧快照，首次扫描就失败才降级为空列表。
+                cached = self._scan_cache_result.get(runtime.id)
+                return _copy_sessions(cached[:limit]) if cached is not None else []
+            if signature is not None:
+                self._scan_cache[runtime.id] = (limit, signature)
+                # 保存一份、返回另一份：SessionStore/keepalive 会就地给调用方拿到的
+                # dict 注入 keepalive_name 等展示状态，不能让这些字段进入扫描缓存。
+                self._scan_cache_result[runtime.id] = _copy_sessions(result)
+                return _copy_sessions(self._scan_cache_result[runtime.id])
+            return result
 
         with ThreadPoolExecutor(max_workers=max(1, len(runtimes))) as pool:
             scanned = pool.map(_scan_one, runtimes)

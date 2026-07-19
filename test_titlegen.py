@@ -211,8 +211,17 @@ class RefreshTitlesGeneratorTests(unittest.TestCase):
         self.assertEqual(cache["claude:s1"]["title"], "修复登录报错")
 
     def test_returns_empty_when_no_generator_resolvable(self) -> None:
-        with mock.patch.object(titlegen, "available_generators", return_value=()):
-            self.assertEqual(titles.refresh_titles([_session("s1")], {}), {})
+        session = _session("s1")
+        cache = {}
+        with (
+            mock.patch.object(titlegen, "available_generators", return_value=()),
+            mock.patch.object(titles, "save_cache") as save_mock,
+        ):
+            self.assertEqual(titles.refresh_titles([session], cache), {})
+
+        save_mock.assert_called_once_with(cache)
+        self.assertEqual(cache["claude:s1"]["generation_state"], "failed")
+        self.assertFalse(titles.resolve_initial_title(session, cache)[1])
 
     def test_falls_back_to_next_generator_after_preferred_generator_fails(self) -> None:
         failed = mock.Mock(spec=titlegen.TitleGenerator)

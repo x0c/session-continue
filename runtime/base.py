@@ -43,6 +43,20 @@ class BaseRuntime(ABC):
     def is_available(self) -> bool:
         return shutil.which(self.executable) is not None
 
+    def scan_signature(self) -> object | None:
+        """返回一个廉价、可哈希的"本地历史是否可能有变化"签名，供 `RuntimeRegistry.scan_all`
+        判断能否跳过一次完整的 `scan_sessions()`（后台重扫最重的开销）。
+
+        只允许做目录/文件级别的元数据探测（`os.stat`/`os.listdir`），不能读文件内容；
+        两次调用签名相等即视为"本地历史没有变化"，跳过扫描、复用上一次结果。返回
+        `None` 表示该运行时没有可靠的廉价预检，调用方每次都必须完整扫描——这是安全
+        默认值。新增运行时或没有用真实数据验证过目录 mtime 语义前，不要覆写为非
+        `None`（Claude/Codex 的历史目录是多层嵌套结构，已验证"已有会话文件被追加
+        写入"这类变化不会冒泡到任何祖先目录的 mtime，父目录 mtime 判断在这类结构上
+        不可靠，因此故意不覆写，保持返回 `None`；OpenCode 是单文件 SQLite，mtime
+        判断可靠，见 `runtime/opencode.py`）。"""
+        return None
+
     @abstractmethod
     def scan_sessions(self, limit: int) -> list[SessionInfo]:
         """扫描并返回该运行时的本地会话。"""

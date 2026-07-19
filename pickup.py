@@ -305,6 +305,13 @@ class SessionStore:
         # 后台重扫只把「新出现」的会话插到最前，不再按 mtime 整体重排——
         # 否则运行中的会话一有消息更新就跳到列表顶上，用户刚要看的位置全乱（用户实报）。
         self._order: list[str] = []
+        # load() 是否已经跑完至少一次：main() 现在把 load() 挪到后台线程异步跑，
+        # UI 侧（MainScreen）据此决定是直接渲染已有数据，还是先展示空骨架列表、
+        # 挂一个 worker 等它完成。_load_event 供 UI 线程阻塞等待，避免和 main()
+        # 里预先起的加载线程重复扫描一次。
+        self.loaded = False
+        self._load_event = threading.Event()
+        self.load_error: str | None = None
 
     @staticmethod
     def _cache_file_mtime() -> float:
@@ -314,8 +321,35 @@ class SessionStore:
             return 0.0
 
     def load(self) -> None:
-        scanned = self.registry.scan_all(self.limit)
-        self._merge_scanned(scanned)
+        try:
+            scanned = self.registry.scan_all(self.limit)
+            self._merge_scanned(scanned)
+            with self.lock:
+                self.load_error = None
+        except Exception as exc:
+            # main() 在裸后台线程里调用 load()；异常不能让线程直接退出、让 UI
+            # 永远等不到完成事件。保留中文错误给页头展示，后台 refresh 仍会继续
+            # 尝试并在成功后自动清除。
+            with self.lock:
+                self.load_error = f"会话加载失败：{exc}"
+        finally:
+            with self.lock:
+                self.loaded = True
+            self._load_event.set()
+
+    def wait_loaded(self, timeout: float | None = None) -> bool:
+        """阻塞等待 load() 完成一次；已完成时立即返回。
+
+        供 UI 侧的加载 worker 使用：main() 可能已经在后台线程里抢先跑了 load()
+        （与探测终端 OSC 颜色并行），worker 不需要再重复扫一遍磁盘，只要等那次
+        跑完即可。返回值语义与 threading.Event.wait 一致（超时未完成返回 False）。
+        """
+        return self._load_event.wait(timeout)
+
+    def get_load_error(self) -> str | None:
+        """线程安全读取最近一次加载/刷新错误，供界面页头展示。"""
+        with self.lock:
+            return self.load_error
 
     def refresh(self) -> bool:
         """后台周期性重扫磁盘，把新增/结束的会话并入当前列表。
@@ -323,15 +357,55 @@ class SessionStore:
         与 load() 共用合并逻辑，唯一区别是返回「会话集合是否真的变了」，
         供调用方只在有变化时才 dirty.set()，避免主循环无谓重定位光标。
         """
-        scanned = self.registry.scan_all(self.limit)
-        before = self._sessions_signature()
-        self._merge_scanned(scanned)
-        return self._sessions_signature() != before
+        try:
+            scanned = self.registry.scan_all(self.limit)
+            before = self._sessions_signature()
+            self._merge_scanned(scanned)
+            changed = self._sessions_signature() != before
+        except Exception as exc:
+            with self.lock:
+                self.load_error = f"会话刷新失败：{exc}"
+            raise
+        with self.lock:
+            self.load_error = None
+        return changed
 
     def _sessions_signature(self) -> tuple:
+        """判定「会话集合是否真的变了」的签名，只应纳入值变化后必须触发列表
+        重建的字段。
+
+        `live`/`keepalive_name` 必须在内——否则「运行中→已结束」状态翻转和
+        托管标注出现/消失时，会话键集合本身没变，`refresh()` 判定"没变化"、
+        `dirty` 不会 set，`SessionCard` 手上还是上一次合并时的旧 dict 引用，
+        状态列和运行中标注会一直冻结在首次展示时的取值，直到某个真正的新增/
+        结束会话顺带带动一次 rebuild（真实 bug：长时间开着 pickup 盯一个正在
+        跑的会话，看到的"运行中"字样可能已经过期很久）。
+
+        列表已经支持按会话键原地更新卡片，因此 mtime、标题来源和详情摘要也要
+        纳入签名；否则扫描拿到了新内容，refresh() 却会误判“没有变化”，卡片的
+        相对时间和右栏最近问答会一直停在旧值。
+        """
         with self.lock:
             return tuple(
-                (runtime_id, tuple(session_key(session) for session in bucket))
+                (
+                    runtime_id,
+                    tuple(
+                        (
+                            session_key(session),
+                            bool(session.get("live")),
+                            session.get("keepalive_name"),
+                            session.get("mtime"),
+                            session.get("cwd"),
+                            session.get("cwd_display"),
+                            session.get("native_title"),
+                            session.get("fallback_title"),
+                            session.get("first_user_msg"),
+                            session.get("last_user_msg"),
+                            session.get("last_agent_msg"),
+                        )
+                        for session in bucket
+                    ),
+                )
                 for runtime_id, bucket in sorted(self.sessions.items())
             )
 
@@ -353,6 +427,9 @@ class SessionStore:
             self._order = [session_key(session) for session in fresh] + [
                 key for key in self._order if key in by_key
             ]
+            # 已从扫描结果消失的会话不能继续占着生成状态，否则 has_generating()
+            # 会永久为真，列表仍会空转刷新不存在的卡片。
+            self.generating.intersection_update(by_key)
             for session in by_key.values():
                 key = session_key(session)
                 # annotate 没匹配上时，用本进程的内嵌托管记录兜底（见 __init__ 注释）；
@@ -364,11 +441,14 @@ class SessionStore:
                             session["keepalive_name"] = hosted_name
                         else:
                             self.hosted.pop(key, None)
-                title, _ = titles.resolve_initial_title(session, self.cache)
+                title, needs = titles.resolve_initial_title(session, self.cache)
                 self.display_titles[key] = title
-                # 没有可用缓存标题（纯临时兜底）才打转圈圈，等待后台进程产出。
-                if not titles.has_usable_cached_title(session, self.cache):
+                # 生成状态必须以标题状态机返回的 needs 为唯一依据。低价值会话、
+                # 已尝试失败的会话都可能没有模型标题，但它们不应继续转圈。
+                if needs:
                     self.generating.add(key)
+                else:
+                    self.generating.discard(key)
             self._projects = None
 
     def projects(self) -> list[dict]:
@@ -395,6 +475,33 @@ class SessionStore:
                 ordered = missing + ordered
             return ordered
 
+    def find_session(self, key: str) -> dict | None:
+        """按跨运行时会话键返回当前扫描快照中的会话对象。"""
+        with self.lock:
+            for bucket in self.sessions.values():
+                for session in bucket:
+                    if session_key(session) == key:
+                        return session
+        return None
+
+    def mark_hosted(self, key: str, name: str | None) -> dict | None:
+        """原子登记/清除托管会话，并同步更新当前扫描快照中的展示字段。"""
+        with self.lock:
+            if name:
+                self.hosted[key] = name
+            else:
+                self.hosted.pop(key, None)
+            for bucket in self.sessions.values():
+                for session in bucket:
+                    if session_key(session) != key:
+                        continue
+                    if name:
+                        session["keepalive_name"] = name
+                    else:
+                        session.pop("keepalive_name", None)
+                    return session
+        return None
+
     def poll_cache_updates(self) -> None:
         """缓存文件被后台生成进程更新时重读，把新标题刷到界面并停掉对应转圈圈。"""
         mtime = self._cache_file_mtime()
@@ -408,12 +515,15 @@ class SessionStore:
             for bucket in self.sessions.values():
                 for session in bucket:
                     key = session_key(session)
-                    if key not in self.generating:
-                        continue
-                    if titles.has_usable_cached_title(session, cache):
-                        title, _ = titles.resolve_initial_title(session, cache)
-                        self.display_titles[key] = title
+                    title, needs = titles.resolve_initial_title(session, cache)
+                    old_title = self.display_titles.get(key)
+                    was_generating = key in self.generating
+                    self.display_titles[key] = title
+                    if needs:
+                        self.generating.add(key)
+                    else:
                         self.generating.discard(key)
+                    if old_title != title or was_generating != needs:
                         changed = True
         if changed:
             self.dirty.set()
@@ -422,6 +532,13 @@ class SessionStore:
         """一次性取「当前展示标题」和「正在生成的 ID 集合」快照，保证两者一致。"""
         with self.lock:
             return dict(self.display_titles), set(self.generating)
+
+    def has_generating(self) -> bool:
+        """轻量判断有没有会话在生成标题，只读一个 bool、不拷贝任何 dict/set；
+        供高频轮询（如列表转圈圈 spinner）在没有生成任务时直接跳过 snapshot()
+        的拷贝开销。"""
+        with self.lock:
+            return bool(self.generating)
 
     def get_title(self, session: dict) -> str:
         with self.lock:
@@ -866,19 +983,24 @@ def main() -> None:
         keepalive.reap_idle()  # 顺带回收空闲太久没人管的后台保活会话，不常驻额外进程
 
     store = SessionStore(limit=args.limit, registry=registry)
-    store.load()
-
-    if not any(store.sessions.values()):
-        names = "、".join(runtime.display_name for runtime in store.registry)
-        print(f"未找到任何 {names} 会话记录。", file=sys.stderr)
-        sys.exit(1)
+    # store.load()（磁盘扫描 + JSON 解析）和下面的 _probe_osc_colours()（终端 OSC
+    # 10/11 探测，最长阻塞 1.2s）互不依赖，串行执行会把两者耗时直接相加、白白
+    # 拖长首屏。这里提前在后台线程里开始扫描，让它跟随后的 OSC 探测重叠执行；
+    # UI 启动后 MainScreen 通过 store.wait_loaded() 等它跑完（大多数情况下，扫描
+    # 会在 OSC 探测的等待期间就已经跑完，UI 挂载时可以直接渲染，不需要额外等待）。
+    # 找不到任何会话不再在这里直接 sys.exit(1)：扫描本身现在是异步的，主进程无法
+    # 同步判断"扫完了但真的一条都没有"，这个空状态提示改由 MainScreen 在
+    # wait_loaded() 完成后展示（见 ui/main_screen.py 的 _update_header）。
+    threading.Thread(target=store.load, daemon=True).start()
 
     # 拉起脱离终端的后台进程生成标题：用户秒退或原生恢复（execvp 替换进程）后仍继续，
     # TUI 通过轮询缓存文件拾取它逐批写入的标题。
     _spawn_title_daemon(args.limit)
 
     # 趁 Textual 接管终端前探测外层终端的前景/背景色（OSC 10/11）：内嵌面板聚焦时经
-    # refresh-client -r 注入托管 pane，让 pane 内 agent 的深/浅主题检测拿到真实值
+    # refresh-client -r 注入托管 pane，让 pane 内 agent 的深/浅主题检测拿到真实值。
+    # 这一步仍然必须在 UI 启动前同步完成（EmbedPane/MainScreen 的深浅色主题判断
+    # 依赖它），但现在跟上面的后台扫描线程是并行的，不再是"扫描 + 探测"首尾相加。
     global _OSC_REPORT
     _OSC_REPORT = _probe_osc_colours()
     if os.environ.get("PICKUP_DEBUG"):

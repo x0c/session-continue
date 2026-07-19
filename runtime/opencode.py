@@ -29,6 +29,9 @@ class OpenCodeRuntime(BaseRuntime):
     auto_approve_args = ()
     _RUN_AUTO_APPROVE_ARG = "--dangerously-skip-permissions"
 
+    def scan_signature(self) -> object | None:
+        return scan_opencode.scan_signature()
+
     def scan_sessions(self, limit: int) -> list[SessionInfo]:
         return scan_opencode.scan_sessions(limit=limit)
 

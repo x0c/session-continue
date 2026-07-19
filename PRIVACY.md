@@ -28,6 +28,10 @@ The core scanner, TUI, preview screen, and JSON output do not make network reque
 
 Optional title generation launches one of your locally installed agent CLIs (`claude` or `codex`; auto-detected, or pinned via `PICKUP_TITLE_GENERATOR`, legacy name `SC_TITLE_GENERATOR`). That command sends short session excerpts to the corresponding model provider under your own account and credentials. If the command is missing or fails, the tool keeps using local fallback titles.
 
+Failed, timed-out, invalid, or incomplete title results are recorded locally for the current cache
+version. Later launches do not automatically submit those sessions again, preventing repeated quota
+usage; a future cache-version upgrade may retry them under updated rules.
+
 When you resume or hand off a session, the selected runtime process takes over the terminal. From that point on, Claude Code or Codex CLI behaves according to its own configuration.
 
 ## Keep-Alive (Background tmux)

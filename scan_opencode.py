@@ -155,6 +155,35 @@ def _build_session_info(row: sqlite3.Row, db_path: str) -> dict | None:
     }
 
 
+def scan_signature() -> tuple | None:
+    """候选数据库元数据与存活进程快照，供后台重扫廉价判断是否需要重新查询。
+
+    OpenCode 历史存在单个 SQLite 文件里，任何写入都会更新该文件自身（或其 -wal
+    边车文件，WAL 模式下 checkpoint 前主文件 mtime 可能滞后）的 mtime，属于可靠的
+    单文件场景，不像 Claude/Codex 那样有"祖先目录 mtime 不冒泡"的问题。
+
+    `live`/`pid` 来自独立的进程探测，进程退出后数据库通常也不再变化；若签名只看
+    文件 mtime，最后一次运行状态会永久冻结。因此签名同时带上排序后的
+    「工作目录 -> pid」快照，让进程启停和探活恢复都能触发一次完整扫描。
+    """
+    paths = _db_paths()
+    if not paths:
+        return None
+    file_signature: list[tuple[str, float]] = []
+    for path in paths:
+        try:
+            file_signature.append((path, os.stat(path).st_mtime))
+        except OSError:
+            return None
+        wal_path = path + "-wal"
+        try:
+            file_signature.append((wal_path, os.stat(wal_path).st_mtime))
+        except OSError:
+            pass  # 没有 WAL 边车文件（未开 WAL 或已 checkpoint）是正常情况
+    live_signature = tuple(sorted(live_pids_by_process_name("opencode").items()))
+    return (tuple(file_signature), live_signature)
+
+
 def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     """扫描所有 OpenCode 数据目录下的会话，返回统一结构列表，按 mtime 降序。
 
@@ -163,8 +192,10 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     子查询）耗时个位数毫秒，远在首屏 ≤1s 预算内，无需额外的早停优化。
     """
     live_by_cwd = live_pids_by_process_name("opencode")
+    db_paths = _db_paths()
+    successful_queries = 0
     results: list[dict] = []
-    for db_path in _db_paths():
+    for db_path in db_paths:
         conn = _connect_ro(db_path)
         if conn is None:
             continue
@@ -174,6 +205,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue
         finally:
             conn.close()
+        successful_queries += 1
         for row in rows:
             info = _build_session_info(row, db_path)
             if info is None:
@@ -181,6 +213,11 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             if cwd_filter and not info["cwd"].startswith(cwd_filter):
                 continue
             results.append(info)
+
+    if db_paths and successful_queries == 0:
+        # “库里确实没有会话”和“所有库都暂时打不开”必须区分；后者抛给 registry，
+        # 由它保留最后一次成功缓存，不能把瞬时故障误当成全量删除。
+        raise RuntimeError("所有 OpenCode 会话数据库均读取失败")
 
     results.sort(key=lambda s: s["mtime"], reverse=True)
     results = results[:limit]

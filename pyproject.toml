@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pickup"
-version = "0.17.6"
+version = "0.17.7"
 description = "Terminal session picker and handoff tool for Claude Code, Codex CLI, OpenCode, and Kimi Code CLI."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -39,23 +39,60 @@ class SessionCard(Widget):
     }
     """
 
-    def __init__(self, session: dict, store: "pickup.SessionStore", spin_char: str) -> None:
+    def __init__(
+        self,
+        session: dict,
+        store: "pickup.SessionStore",
+        spin_char: str,
+        *,
+        display_title: str | None = None,
+        is_generating: bool = False,
+    ) -> None:
         super().__init__()
         self.session = session
         self._store = store
         self._spin_char = spin_char
+        # 展示标题/生成中标记由外部（rebuild()/_tick_spinner）注入并按需更新，
+        # 不在 render() 里自己调用 store.snapshot()——那个方法要拿锁、拷贝整个
+        # display_titles dict 和 generating set，卡片一多就是重复的拷贝开销。
+        self.display_title = display_title if display_title is not None else session["fallback_title"]
+        self.is_generating = is_generating
+        self._render_signature = self._compute_signature()
+
+    def _compute_signature(self) -> tuple:
+        """渲染相关字段的轻量快照，用来判定"内容是否真的变了"、要不要 refresh()。"""
+        session = self.session
+        return (
+            self.display_title,
+            self.is_generating,
+            bool(session.get("live")),
+            session.get("keepalive_name"),
+            session.get("mtime"),
+        )
+
+    def apply_update(self, session: dict, display_title: str, is_generating: bool) -> bool:
+        """原地更新路径专用：替换会话引用与展示态，仅当渲染相关字段确实变化
+        时才 refresh()。返回是否触发了 refresh，供调用方按需断言/统计。"""
+        self.session = session
+        self.display_title = display_title
+        self.is_generating = is_generating
+        signature = self._compute_signature()
+        changed = signature != self._render_signature
+        self._render_signature = signature
+        if changed:
+            self.refresh()
+        return changed
 
     def render(self) -> Text:
         import pickup  # 延迟导入：ui 包只在 pickup.main() 运行期才加载，届时模块已就绪
 
         session = self.session
         store = self._store
-        key = pickup.session_key(session)
-        display_titles, generating = store.snapshot()
-        title = display_titles.get(key, session["fallback_title"])
-        is_gen = key in generating
+        title = self.display_title
+        is_gen = self.is_generating
         is_keepalive = bool(session.get("keepalive_name"))
-        status_text = "运行中(托管)" if is_keepalive else ("运行中" if session.get("live") else "已结束")
+        is_running = is_keepalive or bool(session.get("live"))
+        status_text = "运行中(托管)" if is_keepalive else ("运行中" if is_running else "已结束")
 
         project_path = pickup._normalize_cwd(session.get("cwd"))
         project = os.path.basename(project_path) if project_path else str(session.get("cwd_display") or "未知项目")
@@ -63,17 +100,24 @@ class SessionCard(Widget):
         if is_gen:
             title_prefix = f"{self._spin_char} {title_prefix}"
         width = max(10, self.size.width or 40)
-        title_line = pickup._fit_cell(title_prefix + title, width)
 
         runtime_name = store.registry.get(str(session.get("source") or "")).display_name
-        meta_left = f"{status_text} · {runtime_name}"
-        relative_time = pickup._format_relative_time(session.get("mtime") or 0)
-        meta_width = max(1, width - pickup._text_width(relative_time))
-        meta_line = pickup._fit_cell(meta_left, meta_width) + pickup._fit_cell_right(relative_time, width - meta_width)
+        runtime_width = min(width - 1, max(1, pickup._text_width(runtime_name)))
+        title_width = width - runtime_width
+        title_cell = pickup._fit_cell(title_prefix + title, title_width)
+        runtime_cell = pickup._fit_cell_right(runtime_name, runtime_width)
 
-        out = Text(title_line, style="bold" if is_gen else "")
+        relative_time = pickup._format_relative_time(session.get("mtime") or 0)
+        time_width = min(width - 1, max(1, pickup._text_width(relative_time)))
+        status_width = width - time_width
+        status_cell = pickup._fit_cell(status_text, status_width)
+        time_cell = pickup._fit_cell_right(relative_time, time_width)
+
+        out = Text(title_cell)
+        out.append(runtime_cell, style="dim")
         out.append("\n")
-        out.append(meta_line, style="dim")
+        out.append(status_cell, style="green" if is_running else "dim")
+        out.append(time_cell, style="dim")
         return out
 
 
@@ -116,18 +160,51 @@ class SessionListView(ListView):
         self.set_interval(0.15, self._tick_spinner)
 
     def _tick_spinner(self) -> None:
+        # 便宜检查在前：没有任何会话在生成标题时，连 store.snapshot() 都不调——
+        # 后者要拿锁、拷贝 display_titles dict 和 generating set，150ms 一次的
+        # 轮询白拷贝纯属浪费。有会话在生成时也只刷新命中 generating 的那几张
+        # 卡片，不遍历全部子项逐个 refresh。
+        if not self.store.has_generating():
+            return
         import pickup
 
-        _, generating = self.store.snapshot()
-        if not generating:
-            return
+        display_titles, generating = self.store.snapshot()
         self._spin_frame += 1
         spin_char = pickup.SPINNER_FRAMES[self._spin_frame % len(pickup.SPINNER_FRAMES)]
+        for card in self._session_cards():
+            key = pickup.session_key(card.session)
+            if key not in generating:
+                continue
+            card._spin_char = spin_char
+            card.display_title = display_titles.get(key, card.session["fallback_title"])
+            card.is_generating = True
+            card.refresh()
+
+    def _session_cards(self) -> list[SessionCard]:
+        """按当前显示顺序返回全部 SessionCard（跳过顶部固定的新建会话项）。"""
+        cards = []
         for item in self.children:
+            if item.id == NEW_SESSION_ID:
+                continue
             card = item.children[0] if item.children else None
             if isinstance(card, SessionCard):
-                card._spin_char = spin_char
-                card.refresh()
+                cards.append(card)
+        return cards
+
+    def _current_session_keys(self) -> list[str]:
+        import pickup
+
+        return [pickup.session_key(card.session) for card in self._session_cards()]
+
+    def _update_cards_in_place(self, sessions: list[dict]) -> None:
+        """会话集合（顺序+成员）没变，只需换 SessionCard 手上的 session 引用、
+        按需 refresh，不碰 ListView 子项结构（不 mount/unmount 任何 Widget）。"""
+        import pickup
+
+        display_titles, generating = self.store.snapshot()
+        for card, session in zip(self._session_cards(), sessions):
+            key = pickup.session_key(session)
+            card.apply_update(session, display_titles.get(key, session["fallback_title"]), key in generating)
 
     def visible_sessions(self) -> list[dict]:
         import pickup
@@ -146,7 +223,13 @@ class SessionListView(ListView):
         return self.index == 0
 
     async def rebuild(self, *, keep_selection: bool = True) -> None:
-        """按当前筛选重建全部条目；尽量保持原有选中的会话不变（后台重扫后调用）。"""
+        """按当前筛选重建条目；尽量保持原有选中的会话不变（后台重扫后调用）。
+
+        会话集合（顺序+成员）没变时走原地更新——只换 SessionCard 手上的
+        session 引用、按需 refresh()，不碰 ListView 子项结构；集合真的变了
+        （新增/删除/顺序变化）才走批量清空重建，见 docs/MAINTAINER_GUIDE.md
+        「界面」节的性能优化记录。
+        """
         import pickup
 
         previous_key = None
@@ -156,19 +239,51 @@ class SessionListView(ListView):
                 previous_key = pickup.session_key(selected)
 
         sessions = self.visible_sessions()
-        await self.clear()
-        await self.append(ListItem(NewSessionCard(), id=NEW_SESSION_ID))
+        new_keys = [pickup.session_key(session) for session in sessions]
+
+        if new_keys == self._current_session_keys():
+            self._update_cards_in_place(sessions)
+            if previous_key is None and self.index is None:
+                self.index = 1 if sessions else 0
+            return
+
+        display_titles, generating = self.store.snapshot()
+        items = [ListItem(NewSessionCard(), id=NEW_SESSION_ID)]
+        for session in sessions:
+            key = pickup.session_key(session)
+            items.append(
+                ListItem(
+                    SessionCard(
+                        session,
+                        self.store,
+                        pickup.SPINNER_FRAMES[0],
+                        display_title=display_titles.get(key, session["fallback_title"]),
+                        is_generating=key in generating,
+                    )
+                )
+            )
+
+        # batch_update() 抑制 clear()+extend() 中间那次多余重绘；两步都要 await
+        # 完成（DOM 真正更新），批量 API 本身已经把"多次 mount"合成一轮。
+        with self.app.batch_update():
+            await self.clear()
+            await self.extend(items)
 
         new_index = 0
         for i, session in enumerate(sessions):
-            item = ListItem(SessionCard(session, self.store, pickup.SPINNER_FRAMES[0]))
-            await self.append(item)
             if previous_key is not None and pickup.session_key(session) == previous_key:
                 new_index = i + 1
         if previous_key is not None:
             self.index = new_index
         elif self.index is None:
             self.index = 1 if sessions else 0
+        # Textual 已知问题（issue #6300）：clear()+extend() 后紧接着设置 index，
+        # 高亮理论上可能只在内部状态里正确、要等用户交互才真正刷新到屏幕。在当前
+        # 锁定版本（8.2.8）下用 Pilot 直接探查过 compositor 的增量重绘路径，没有
+        # 复现出"选中但不刷新"的现象——但探查手段本身有局限（无法完全模拟真实
+        # 终端的部分重绘时序），显式 refresh() 成本几乎为零，保留作为兜底不会有
+        # 副作用，直接加上。
+        self.refresh()
 
     async def cycle_project_filter(self) -> None:
         keys = [None, *(project["cwd_key"] for project in self.store.projects())]

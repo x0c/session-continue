@@ -79,6 +79,32 @@ class BrokenRuntime(BaseRuntime):
         return LaunchPlan((self.executable,), cwd)
 
 
+class CachedRuntime(FakeRuntime):
+    """带可变签名和结果的假运行时，供验证扫描缓存契约。"""
+
+    id = "cached"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.signature = 1
+        self.fail = fail
+        self.calls = 0
+        self.session = {
+            "source": self.id,
+            "id": "cached-session",
+            "cwd": "/tmp",
+            "fallback_title": "缓存会话",
+        }
+
+    def scan_signature(self) -> object:
+        return self.signature
+
+    def scan_sessions(self, limit: int) -> list[dict]:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("模拟瞬时扫描失败")
+        return [self.session]
+
+
 class RuntimeTests(unittest.TestCase):
     def _session(self, source: str, history_path: str, cwd: str) -> dict:
         return {
@@ -316,6 +342,47 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(scanned["gemini"], [])
         self.assertEqual(scanned["broken"], [])
+
+    def test_scan_cache_copies_sessions_on_save_and_each_return(self) -> None:
+        runtime = CachedRuntime()
+        registry = RuntimeRegistry((runtime,))
+
+        first = registry.scan_all(limit=10)[runtime.id]
+        runtime.session["keepalive_name"] = "污染源结果"
+        first[0]["runtime_status"] = "污染首次返回"
+
+        second = registry.scan_all(limit=10)[runtime.id]
+        self.assertEqual(runtime.calls, 1)
+        self.assertNotIn("keepalive_name", second[0])
+        self.assertNotIn("runtime_status", second[0])
+
+        second[0]["runtime_status"] = "污染缓存命中返回"
+        third = registry.scan_all(limit=10)[runtime.id]
+        self.assertNotIn("runtime_status", third[0])
+
+    def test_scan_failure_returns_old_cache_without_overwriting_it(self) -> None:
+        runtime = CachedRuntime()
+        registry = RuntimeRegistry((runtime,))
+        original = registry.scan_all(limit=10)[runtime.id]
+
+        runtime.signature = 2
+        runtime.fail = True
+        stale = registry.scan_all(limit=10)[runtime.id]
+        self.assertEqual(stale, original)
+
+        # 失败不能把新签名写进缓存；同一签名恢复后必须重新扫描。
+        runtime.fail = False
+        runtime.session = {**runtime.session, "id": "recovered-session"}
+        recovered = registry.scan_all(limit=10)[runtime.id]
+        self.assertEqual(runtime.calls, 3)
+        self.assertEqual(recovered[0]["id"], "recovered-session")
+
+    def test_first_scan_failure_degrades_to_empty_result(self) -> None:
+        runtime = CachedRuntime(fail=True)
+
+        scanned = RuntimeRegistry((runtime,)).scan_all(limit=10)
+
+        self.assertEqual(scanned[runtime.id], [])
 
     def test_passthrough_plan_prepends_auto_approve_args(self) -> None:
         plan = default_registry().build_passthrough_plan("claude", ["把测试修到全绿"])
