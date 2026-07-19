@@ -154,6 +154,9 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
 
         store, _ = _make_store()
         app = PickupApp(store, embed_ok=False)
+        # CI 上 pilot.pause 的墙钟开销可能让 0.12s 防抖在「拖动断言」前就到期；
+        # 本测把窗口拉长，只验证「拖动中重置、停稳后恰好一次」的契约。
+        debounce = 0.5
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             calls: list[Size] = []
@@ -163,7 +166,10 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
                 calls.append(app.size)
                 original()
 
-            with mock.patch.object(app, "_force_full_repaint", side_effect=_tracking_force):
+            with (
+                mock.patch.object(app_mod, "_RESIZE_FULL_REPAINT_DEBOUNCE", debounce),
+                mock.patch.object(app, "_force_full_repaint", side_effect=_tracking_force),
+            ):
                 # 快速连续缩放：防抖计时器应被反复重置，到期前不应触发全量重绘
                 await pilot.resize_terminal(90, 28)
                 await pilot.pause(delay=0.02)
@@ -172,12 +178,11 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.resize_terminal(70, 22)
                 await pilot.pause(delay=0.02)
                 self.assertEqual(calls, [], "拖动过程中不应触发整屏全量重绘")
+                self.assertIsNotNone(app._resize_full_repaint_timer)
                 # 停稳超过防抖窗口后应恰好一次，且尺寸为最后一次目标
-                await pilot.pause(delay=app_mod._RESIZE_FULL_REPAINT_DEBOUNCE + 0.05)
+                await pilot.pause(delay=debounce + 0.05)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0], Size(70, 22))
-                # 全量路径：整屏区域应在 compositor 脏区（或刚被 refresh 消费后为空，
-                # 二者都可接受；关键是 _force_full_repaint 被调用且带最终尺寸）
                 self.assertIsNone(app._resize_full_repaint_timer)
 
     async def test_f12_saves_screenshot_under_cache(self) -> None:
