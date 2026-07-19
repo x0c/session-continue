@@ -89,7 +89,7 @@ sequenceDiagram
 2. **实现扫描与预览**：新增 `scan_<助手>.py`，把私有历史转换成完整 `SessionInfo`；列表扫描保持轻量，完整对话在 `load_conversation` 按需读取。过滤内部子任务、空会话、系统注入和标题生成留下的噪音会话。
 3. **实现助手运行时**：新增 `runtime/<助手>.py` 的 `BaseRuntime` 子类，声明稳定的 id、显示名、可执行命令、历史阅读提示和唯一一处的 `auto_approve_args`；实现扫描、预览、原生恢复、跨助手目标新建、空白新建。仅在确实支持且已验证时实现带指令的原生续接。
 4. **注册一次**：在 `runtime/registry.py` 导入并加入 `default_registry()`。注册表顺序就是默认显示/选择顺序之一；id 必须唯一，且扫描结果的 `source` 必须与其一致。
-5. **补展示配色**：仅在 `pickup.py` 的 `RUNTIME_LABEL_STYLES` 加一行 `id → 色值`，使列表、详情和预览角色名通过同一个 `runtime_label_style` 自动取得样式。
+5. **补展示配色**：仅在 `src/pickup/theme.py` 的 `RUNTIME_LABEL_STYLES` 加一行 `id → 色值`，使列表、详情和预览角色名通过同一个 `runtime_label_style` 自动取得样式。
 6. **补测试**：在 `test_runtime.py` 覆盖新助手自身恢复、空白新建、作为跨助手目标、作为跨助手源（有真实可读历史样例时）；补相应扫描器测试，锁定私有格式的过滤和解析。
 7. **运行自动验收**：执行编译检查与完整 unittest；运行注册表扫描计时，确保新助手异常不会拖垮其他助手，也不明显拉长首屏。
 8. **真机抽查**：随机检查至少 5 条真实新助手历史的扫描与预览；进入终端界面，确认列表显示、配色、同助手恢复、跨助手接力和空白新建。对接力后产生的新目标会话确认原始历史未被改写。
@@ -111,7 +111,7 @@ sequenceDiagram
 | `scan_kimi.py` | Kimi `state.json` / `wire.jsonl` 扫描 | Kimi 扫描器 |
 | `scan_cursor.py` | Cursor CLI 目录、JSON 与 SQLite 扫描 | Cursor 扫描器 |
 | `models.py` | 统一会话、接力和启动计划数据模型 | `SessionInfo`、`Handoff`、`LaunchPlan` |
-| `pickup.py` | 启动入口、运行时配色、直启分发 | `RUNTIME_LABEL_STYLES`、`runtime_label_style` |
+| `src/pickup/cli.py` 等 | 启动入口、运行时配色、直启分发 | `RUNTIME_LABEL_STYLES`、`runtime_label_style` |
 | `test_runtime.py` | 运行时、注册、接力、缓存和透传参数测试 | `RuntimeTests` |
 
 ## §3 本域代码入口索引
@@ -128,7 +128,7 @@ sequenceDiagram
 | 注册与扫描缓存 | `runtime/registry.py` | `default_registry()`、`scan_all(limit)` | 注册一次；扫描并发且单助手异常隔离 |
 | 直启参数透传 | `runtime/registry.py` | `build_passthrough_plan` | 只补 `auto_approve_args`，用户已传入时不重复 |
 | 统一会话键与接力正文 | `models.py` | `session_key`、`Handoff.render_prompt` | 标题键按「助手运行时 + 会话 ID」隔离；接力提示词禁止改写源历史 |
-| 列表配色 | `pickup.py` | `RUNTIME_LABEL_STYLES`、`runtime_label_style` | 颜色唯一来源，界面层不可另建色表 |
+| 列表配色 | `src/pickup/cli.py` 等 | `RUNTIME_LABEL_STYLES`、`runtime_label_style` | 颜色唯一来源，界面层不可另建色表 |
 | 回归测试 | `test_runtime.py` | `RuntimeTests`、`FakeRuntime` | FakeRuntime 演示无两两转换分支地扩展第六种助手 |
 
 ## §4 本域表与外部数据入口索引
@@ -177,7 +177,7 @@ sequenceDiagram
 1. **静态与全量单测**：在 cli 根执行：
 
    ```bash
-   python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_cursor.py scan_common.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py observe.py runtime/*.py ui/*.py test_*.py
+   python3 -m compileall -q src/pickup tests
    python3 -m unittest -v
    ```
 
@@ -201,7 +201,7 @@ sequenceDiagram
 
 5. **真实历史抽查**：随机抽查至少 5 条本机新助手会话，分别调用扫描与预览，检查无空文本、字面量 `"None"`、错误角色、时间倒序、内部子任务或标题生成噪音；同时确认扫描出的历史路径实际存在。
 
-6. **真机流程验收**：用当前源码启动 `python3 pickup.py --limit 5`，确认新助手出现在列表和高级操作目标中、标签颜色可区分。分别完成同助手恢复、从一个现有助手交给新助手、从新助手交给一个现有助手、指定工作目录的空白新建；跨助手后检查源历史文件的修改时间和内容未被本流程改写。
+6. **真机流程验收**：用当前源码启动 `python3 -m pickup --limit 5`，确认新助手出现在列表和高级操作目标中、标签颜色可区分。分别完成同助手恢复、从一个现有助手交给新助手、从新助手交给一个现有助手、指定工作目录的空白新建；跨助手后检查源历史文件的修改时间和内容未被本流程改写。
 
 7. **对照验收**：将新助手逐项与现有适配器对照，而非只验证「能启动」：
    - Claude/Codex：多层 JSONL 历史，默认不使用扫描签名；

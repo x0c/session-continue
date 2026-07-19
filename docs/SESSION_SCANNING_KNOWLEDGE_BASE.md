@@ -155,7 +155,7 @@ flowchart TD
 | `./` | Cursor CLI 元数据扫描、SQLite blob 预览 | `scan_cursor.py` |
 | `./` | 跨扫描器纯函数、按 cwd 判活 | `scan_common.py` |
 | `runtime/` | 统一适配抽象、注册表与各助手委托 | `runtime/base.py`、`runtime/registry.py`、`runtime/*.py` |
-| `./` | 会话列表合并、异步加载、预览缓存 | `pickup.py` |
+| `./` | 会话列表合并、异步加载、预览缓存 | `src/pickup/cli.py` 等 |
 | `./` | 统一会话与完整对话的数据结构 | `models.py` |
 | `./` | 扫描、格式、缓存与性能回归测试 | `test_session_scanning.py` |
 
@@ -239,7 +239,8 @@ flowchart TD
 在 `cli/` 目录执行：
 
 ```bash
-python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_cursor.py scan_common.py models.py runtime/*.py test_session_scanning.py
+python3 -m compileall -q src/pickup tests
+python3 -m unittest discover -s tests -p 'test_session_scanning.py' -v
 python3 -m unittest -v test_session_scanning.py
 ```
 

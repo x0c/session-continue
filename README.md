@@ -69,23 +69,22 @@ Then run:
 pickup
 ```
 
-### Without Installing
+### From Source (editable)
 
 ```bash
 git clone https://github.com/x0c/pickup.git
 cd pickup
-python3 pickup.py
+python3 -m pip install --user -e .
 ```
 
-You can also add a symlink manually:
+Then run:
 
 ```bash
-mkdir -p ~/.local/bin
-ln -sf "$PWD/pickup.py" ~/.local/bin/pickup
-chmod +x pickup.py
+pickup
+# or: python3 -m pickup
 ```
 
-Make sure `~/.local/bin` is in your `PATH`.
+Do not run a deleted root-level `pickup.py`; the package lives under `src/pickup/`.
 
 ## Usage
 
@@ -276,32 +275,31 @@ session picker still works.
 
 | Path | Purpose |
 | --- | --- |
-| `pickup.py` | session store/data layer, formatting helpers, direct-launch subcommand dispatch, and process handoff; entry point delegates the UI to `ui.app.run_app()` |
-| `ui/` | Textual UI package: main screen (session list + right-pane conversation/embed), modals, session-list widget |
-| `embed.py` | embedded-pane host: renders hosted tmux sessions (`capture-pane` out, `send-keys` in), SGR parsing; framework-neutral rendering via `cell_style`/`grid_to_text` (Rich styles) |
-| `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
-| `keepalive.py` | tmux-backed launch wrapper: keep-alive on/off detection, wrap/attach launch plans, idle reaping (config for the dedicated tmux server is inlined here, not a separate file — see maintainer notes) |
-| `models.py` | shared session, handoff, and launch-plan data models |
-| `runtime/` | runtime adapters for scanning, native resume, and new-session launch |
-| `scan_claude.py` | Claude Code history scanner |
-| `scan_codex.py` | Codex CLI history scanner |
-| `scan_opencode.py` | OpenCode history scanner (read-only SQLite queries) |
-| `scan_kimi.py` | Kimi Code CLI history scanner (`~/.kimi-code/sessions/` wire.jsonl) |
-| `scan_cursor.py` | Cursor Agent CLI history scanner (`~/.cursor/chats/`) |
-| `titles.py` | local title fallback, cache, status labels, and batch generation |
-| `docs/SKILL.md` | agent-facing command reference (SKILL.md convention) |
-| `test_*.py` | unit tests |
+| `src/pickup/` | installable package (src-layout) |
+| `src/pickup/cli.py` | process entry, argparse, direct-launch dispatch |
+| `src/pickup/store.py` | session store / snapshot refresh |
+| `src/pickup/display.py` | width, cards, preview, filtering helpers |
+| `src/pickup/theme.py` | OSC probe and runtime label colors |
+| `src/pickup/ui/` | Textual UI: main screen, modals, session list, embed pane |
+| `src/pickup/embed.py` | embedded-pane host (`capture-pane` / `send-keys`) |
+| `src/pickup/agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` |
+| `src/pickup/keepalive.py` | tmux-backed keep-alive wrapper |
+| `src/pickup/models.py` | shared session / handoff / launch-plan models |
+| `src/pickup/runtime/` | runtime adapters |
+| `src/pickup/scan/` | per-assistant history scanners |
+| `src/pickup/titles.py` / `titlegen.py` | title cache and generators |
+| `tests/` | unit tests |
+| `docs/SKILL.md` | agent-facing command reference |
 
 ## Development
 
-Run the same checks used by CI:
-
 ```bash
-python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_cursor.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py ui/*.py test_*.py
-python3 -m unittest -v
+python3 -m pip install --user -e .
+python3 -m compileall -q src/pickup tests
+python3 -m unittest discover -s tests -v
 ```
 
-For UI changes, run a real terminal smoke test as well.
+For UI changes, run a real terminal smoke test as well (`bash selftest.sh` for embed/keepalive paths).
 
 Maintainer notes live in [AGENTS.md](AGENTS.md) and [docs/MAINTAINER_GUIDE.md](docs/MAINTAINER_GUIDE.md).
 

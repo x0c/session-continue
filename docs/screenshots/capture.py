@@ -30,9 +30,9 @@ sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import pickup
-from models import ConversationMessage
+from pickup.models import ConversationMessage
 from pickup import session_key
-from ui.app import PickupApp
+from pickup.ui.app import PickupApp
 
 
 OUT_DIR = Path(__file__).resolve().parent
@@ -124,7 +124,7 @@ def _demo_store():
     }
 
     from unittest import mock
-    from runtime import RuntimeRegistry
+    from pickup.runtime import RuntimeRegistry
 
     runtimes = []
     for rid, name in (("claude", "Claude"), ("cursor", "Cursor"), ("codex", "Codex")):

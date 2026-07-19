@@ -42,7 +42,7 @@ pickup 的价值是让用户从一个终端界面中继续或接力不同 Coding
 
 ```mermaid
 graph TD
-    A["pickup.py main()"] --> B["SessionStore<br/>异步加载会话与标题缓存"]
+    A["pickup.cli.main()"] --> B["SessionStore<br/>异步加载会话与标题缓存"]
     A --> C["ui.app.run_app()"]
     C --> D["PickupApp"]
     D --> E["MainScreen（终端界面）"]
@@ -59,7 +59,7 @@ graph TD
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant P as pickup.py
+    participant P as pickup.cli
     participant S as SessionStore
     participant M as 终端界面
     participant R as 运行时注册表
@@ -87,7 +87,7 @@ sequenceDiagram
 
 ### 主界面流程
 
-1. `pickup.py main()` 确认当前是交互式终端且 tmux 可用，创建 `SessionStore`；会话扫描在后台线程开始，外层终端颜色探测可并行进行。
+1. `pickup.cli.main()` 确认当前是交互式终端且 tmux 可用，创建 `SessionStore`；会话扫描在后台线程开始，外层终端颜色探测可并行进行。
 2. `ui.app.run_app()` 初始化界面语言，创建终端界面。即使扫描尚未完成，界面也先出现骨架：搜索框、＋新建会话和右栏。
 3. `MainScreen._on_initial_load_done()` 接到首次扫描完成事件后选择有会话的默认运行时，重建侧边栏，并开启会话刷新与标题缓存轮询。
 4. 用户移动或点击侧边栏选择时，`MainScreen._follow_current_selection()` 决定右栏：
@@ -140,7 +140,7 @@ stateDiagram-v2
 
 | 场景 | 入口 | 类 / 方法 / 配置 | 说明 |
 |---|---|---|---|
-| 启动终端界面、非 TTY 降级、直启进入界面 | `pickup.py` | `main()`、`_dispatch_direct_launch()` | 交互式入口；扫描、主题探测、标题后台进程和应用启动在此接线 |
+| 启动终端界面、非 TTY 降级、直启进入界面 | `src/pickup/cli.py` 等 | `main()`、`_dispatch_direct_launch()` | 交互式入口；扫描、主题探测、标题后台进程和应用启动在此接线 |
 | 应用外壳与语言初始化 | `ui/app.py` | `run_app()`、`PickupApp.on_mount()` | 初始化多语言，按外层背景选择浅/深主题，再推入主屏 |
 | 主屏布局与 Footer | `ui/main_screen.py` | `MainScreen.compose()`、`_main_bindings()` | 左栏搜索和列表、右栏、Footer 的唯一组合处 |
 | 首屏异步加载与后台刷新 | `ui/main_screen.py` | `_await_initial_load()`、`_background_refresh_worker()`、`_poll_cache()` | 等首次扫描、按退避间隔重扫、轮询标题缓存 |
@@ -151,7 +151,7 @@ stateDiagram-v2
 | 高级操作与结束确认 | `ui/main_screen.py`、`ui/modals.py` | `action_handoff()`、`choose_target_runtime()`、`ConfirmModal` | 高级操作动态读取注册运行时；结束操作先确认 |
 | 右栏静态预览和实时画面挂接 | `ui/embed_pane.py` | `show_detail()`、`focus_session()`、`scroll_detail()` | 本域仅管理呈现切换、焦点与详情滚动；不描述 tmux 实现 |
 | 多语言文案 | `i18n.py` | `_MESSAGES`、`detect_lang()`、`t()` | 新增用户可见文案必须同时给 en / zh；环境优先级在此定义 |
-| 宽字符与预览正文格式 | `pickup.py` | `_text_width()`、`_fit_cell()`、`_preview_lines()` | 中文、emoji 和组合字符按终端显示宽度处理；预览带角色与可选时间 |
+| 宽字符与预览正文格式 | `src/pickup/cli.py` 等 | `_text_width()`、`_fit_cell()`、`_preview_lines()` | 中文、emoji 和组合字符按终端显示宽度处理；预览带角色与可选时间 |
 | 本地截图与界面观测 | `observe.py`、`ui/main_screen.py` | `save_tui_screenshot()`、`action_save_screenshot()` | F12 导出当前真实 TUI；对话内容仅由用户主动截图，不能提交 |
 | 截图夹具验收 | `docs/screenshots/capture.py` | `_demo_store()`、`_capture()` | 用虚构会话生成左右栏截图，不读真实会话历史 |
 | 界面回归验证 | `test_ui.py` | `MainScreenNavigationTests`、`RightPanePreviewTests`、`SidebarVisualLayoutTests` 等 | Textual Pilot 覆盖导航、预览、弹窗、卡片、刷新和内嵌接线 |
@@ -205,7 +205,7 @@ stateDiagram-v2
 - **AI 易错点**【点击选择】会动态增删的会话卡、新建项和弹窗菜单项必须关闭 Textual 文本拖选；它们的点击语义是选择/确认。右栏内嵌实时终端保留文本选择和 Ctrl+C 复制，不能全局关闭。
 - **AI 易错点**【窗口缩放必须防抖】拖动终端窗口时备用屏幕会被终端自行 reflow，差分重绘会花屏，需要整屏全量重绘清残影；但全量重绘、`tmux resize-window` 和唤醒抓帧都必须在尺寸停稳（约 120ms）后再做一次，禁止每次 Resize 都狂刷。拖动期右栏只按当前宽度裁补旧缓存行即可。
 - 【隐性依赖】`Footer` 展示的是 `MainScreen.BINDINGS` 的本地化 description。验证时中文环境必须看到 `a 高级操作`，英文环境必须看到 `a Advanced`；不要再手绘底部帮助行。
-- 【隐性依赖】真实终端冒烟必须运行当前源码 `python3 pickup.py` 或先覆盖安装。用户 shell 中的 `pickup` 可能指向旧 site-packages 副本；布局、配色或按键改动后也必须重启已打开的终端界面。
+- 【隐性依赖】真实终端冒烟必须运行当前源码 `python3 -m pickup` 或先覆盖安装。用户 shell 中的 `pickup` 可能指向旧 site-packages 副本；布局、配色或按键改动后也必须重启已打开的终端界面。
 - 【隐性依赖】截图验收分两类：`docs/screenshots/capture.py` 使用虚构数据，适合提交和回归；F12 截图反映真实 TUI，可能含私密对话，只能本地诊断。Textual SVG 转 PNG 可能把真彩色压成灰阶，运行时配色要以真机或卡片样式断言确认。
 - 【消歧】“运行中 / 运行中(托管) / 已结束”是终端界面的进程活性展示；它与标题模块的状态标签及机器接口英文 `status` 不是同一套语义，不能互相替换。
 - 【消歧】“对话预览”固定在右栏，旧 Space 全屏预览入口不得复活；`e` 全屏接管已删除。
@@ -219,9 +219,9 @@ stateDiagram-v2
 1. 编译与完整单测：
 
 ```bash
-python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_cursor.py scan_common.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py observe.py runtime/*.py ui/*.py test_*.py
-python3 -m unittest -v
-python3 -m unittest -v test_ui
+python3 -m compileall -q src/pickup tests
+python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -p 'test_ui.py' -v
 ```
 
 2. 截图验收（界面变更必做）：
@@ -235,7 +235,7 @@ python3 docs/screenshots/capture.py
 3. 真实终端冒烟：为避免标题生成消耗账号额度，在临时目录放置指向本机 `true` 的 `claude`、`codex`，并置于 `PATH` 最前，再运行：
 
 ```bash
-python3 pickup.py --limit 5
+python3 -m pickup --limit 5
 ```
 
 人工进入终端界面确认：Footer 显示高级操作；高级操作动态列出运行时且默认选中第一个已安装的其他运行时；Esc 先关闭弹窗再退出；选择已结束会话时右栏展示完整对话及角色行；`/`、Down、Enter 与搜索框 Esc 的焦点行为正确。用户本人还应在真实终端点一次关键路径，这是本域最终的体验验收。
@@ -267,7 +267,7 @@ bash selftest.sh
 
 ```bash
 python3 -m unittest -v test_i18n test_ui
-PICKUP_LANG=zh python3 pickup.py --limit 5
+PICKUP_LANG=zh python3 -m pickup --limit 5
 ```
 
 确认中文文案完整、CJK 宽度不挤压运行时名；测试断言固定英文时应显式切换语言，不能依赖本机 locale。

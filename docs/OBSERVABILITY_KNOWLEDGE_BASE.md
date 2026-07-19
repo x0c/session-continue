@@ -112,8 +112,8 @@ flowchart TD
 | 细日志开关 | 在测试或本机分别关闭/开启 `PICKUP_DEBUG=1`、`PICKUP_LOG=debug` | 默认不写 debug，开启后才出现 debug 事件 |
 | 脱敏与容量边界 | `python3 -m unittest -v test_observe.py` | 敏感字段变为 `<redacted>`，超过 256KB 后可继续写入 |
 | 异常双写 | `python3 -m unittest -v test_observe.py` | `error` 事件无 traceback，异常日志有完整 traceback |
-| 只读诊断 | `python3 pickup.py diagnose` 或已安装命令 `pickup diagnose` | 返回日志/截图目录、存在性、tmux 与配色事实；不启动 TUI |
-| 事件现场读取 | `python3 pickup.py diagnose` 后读取 `~/.cache/pickup/events.log` | 能按 JSON 行查看 `scan_all`、`list_rebuild`、`host_session`、`capture_slow`、`error` 等 |
+| 只读诊断 | `python3 -m pickup diagnose` 或已安装命令 `pickup diagnose` | 返回日志/截图目录、存在性、tmux 与配色事实；不启动 TUI |
+| 事件现场读取 | `python3 -m pickup diagnose` 后读取 `~/.cache/pickup/events.log` | 能按 JSON 行查看 `scan_all`、`list_rebuild`、`host_session`、`capture_slow`、`error` 等 |
 | 截图观测 | 在真实 TUI 中按 F12 | 生成 `~/.cache/pickup/screenshots/tui-*.svg`，并只作本地排查使用 |
 | 验收截图消歧 | `python3 docs/screenshots/capture.py` | 生成虚构数据的验收图；不读取真实历史，不替代 F12 现场截图 |
 

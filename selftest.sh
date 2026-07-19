@@ -92,7 +92,7 @@ PYWORKAROUND_PATH="$(python3 -c 'import sys; print(":".join(p for p in sys.path 
 ENVV="HOME=$TMP/home PYTHONPATH=$PYWORKAROUND_PATH PATH=$TMP/fakebin:$TMUX_DIR:/usr/local/bin:/usr/bin:/bin TERM=xterm-256color PICKUP_TITLE_GENERATOR=none PICKUP_LANG=zh"
 tmux -L "$OUTER" new-session -d -s tui -x 180 -y 42
 tmux -L "$OUTER" set-option -t tui mouse on
-tmux -L "$OUTER" send-keys -t tui "cd $REPO && env $ENVV python3 pickup.py --limit 5" Enter
+tmux -L "$OUTER" send-keys -t tui "cd $REPO && env $ENVV python3 -m pickup --limit 5" Enter
 
 wait_for "workA: 修复切换体验" 60
 wait_for "workB: 第二个会话" 60
@@ -185,7 +185,7 @@ ok "退出 pickup 后，后台托管会话不受影响"
 # 不能假设成 pickup-claude-<--resume 的参数>。
 before_direct="$(sessions | grep '^pickup-claude-' || true)"
 tmux -L "$OUTER" new-window -t tui -n direct
-tmux -L "$OUTER" send-keys -t direct "cd $REPO && env $ENVV python3 pickup.py claude --resume directcccc" Enter
+tmux -L "$OUTER" send-keys -t direct "cd $REPO && env $ENVV python3 -m pickup claude --resume directcccc" Enter
 wait_for_direct() {
   local text="$1" tries="${2:-40}"
   local i
@@ -216,7 +216,7 @@ ok "直启场景键盘输入真实转发进托管会话"
 # 不是产品的 bug）。
 before_cursor="$(sessions | grep '^pickup-claude-' || true)"
 tmux -L "$OUTER" new-window -t tui -n cursor
-tmux -L "$OUTER" send-keys -t cursor "cd $REPO && env $ENVV python3 pickup.py claude --resume cursortest" Enter
+tmux -L "$OUTER" send-keys -t cursor "cd $REPO && env $ENVV python3 -m pickup claude --resume cursortest" Enter
 wait_for_cursor() {
   local text="$1" tries="${2:-40}"
   local i
