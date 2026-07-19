@@ -562,6 +562,14 @@ class ParseScreenTests(unittest.TestCase):
         self.assertEqual(grid[0][0].ch, "é")
         self.assertEqual(grid[0][1].ch, "x")
 
+    def test_spacing_mark_width_matches_rich_renderer(self):
+        # Devanagari 的 Mc 附标在 Rich/Textual 宽度表中是零宽；若用
+        # unicodedata.east_asian_width 自行判定会误算成 1 列，导致后续
+        # 文本在内嵌终端的解析位置与 Textual 真实绘制位置错开。
+        grid = embed.parse_screen("काx", 2, 1)
+        self.assertEqual(grid[0][0].ch, "का")
+        self.assertEqual(grid[0][1].ch, "x")
+
     def test_non_sgr_sequences_are_skipped(self):
         grid = embed.parse_screen("a\x1b[2Kb\x1b(Bc", 3, 1)
         self.assertEqual("".join(c.ch for c in grid[0]), "abc")

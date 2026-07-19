@@ -48,6 +48,8 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
+from rich.cells import cell_len as _rich_cell_len
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 关掉 Textual 默认开启的 Kitty 键盘协议（DISAMBIGUATE | REPORT_ALL_KEYS |

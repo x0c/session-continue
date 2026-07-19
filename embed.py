@@ -21,9 +21,9 @@ import shutil
 import subprocess
 import threading
 import time
-import unicodedata
 from dataclasses import dataclass
 
+from rich.cells import cell_len as _rich_cell_len
 from rich.color import Color
 from rich.style import Style
 
@@ -838,11 +838,11 @@ _BLANK = Cell()
 
 
 def _char_width(ch: str) -> int:
-    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me"):
-        return 0
-    if unicodedata.east_asian_width(ch) in ("F", "W"):
-        return 2
-    return 1
+    # 与 Rich/Textual 的渲染宽度表保持一致（`rich.cells.cell_len`）：自实现的
+    # `unicodedata.east_asian_width` 在 emoji、组合字符、ambiguous-width 字符
+    # 上会跟 Rich 的排版结果不一致（本项目同时用这两套计算，会导致内嵌画面
+    # 里 CJK/emoji 对齐错位）。`cell_len("")` 已经是 0，不用特判。
+    return _rich_cell_len(ch)
 
 
 class _SgrState:
