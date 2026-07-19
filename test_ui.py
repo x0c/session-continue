@@ -624,6 +624,28 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await _wait_until(lambda: not app.screen._host_busy)
                 self.assertFalse(app.screen._host_busy)
 
+    async def test_new_session_shortcut_hosts_without_reading_session(self) -> None:
+        """回归：按 n 走 NewSessionRequest 时，托管成功回调不得访问 request.session。"""
+        store, registry = _make_store()
+        registry.build_new_session_plan = lambda request: LaunchPlan(("claude",), "/tmp")
+        app = PickupApp(store, embed_ok=True)
+
+        with (
+            mock.patch("embed.host_session", return_value="pickup-claude-new"),
+            mock.patch.object(pickup, "usable_cwd", return_value="/tmp"),
+            mock.patch.object(pickup, "_new_session_cwd", return_value="/tmp"),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(delay=0.2)
+                pane = app.screen.query_one(EmbedPane)
+                pane.focus_session = mock.Mock()
+                await pilot.press("n")
+                await _wait_until(lambda: not app.screen._host_busy)
+                self.assertTrue(pane.focus_session.called)
+                self.assertEqual(pane.focus_session.call_args_list[0].args[0], "pickup-claude-new")
+                # 新建路径没有关联会话，fallback 必须是 None
+                self.assertIsNone(pane.focus_session.call_args_list[0].args[1])
+
 
 @unittest.skipUnless(HAS_TMUX, "内嵌面板依赖真实 tmux")
 class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):

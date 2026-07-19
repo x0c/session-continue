@@ -355,20 +355,24 @@ class MainScreen(Screen):
         self.app.bell()
 
     def _on_embed_hosted(self, request, name: str, same_runtime: bool) -> None:
-        """`_host_and_focus` worker 成功后的收尾：只在主线程操作 Textual/store 状态。"""
+        """`_host_and_focus` worker 成功后的收尾：只在主线程操作 Textual/store 状态。
+
+        `request` 可能是 `LaunchRequest`（恢复/接力）或 `NewSessionRequest`（空白新建）。
+        后者没有关联会话，不能读 `.session`——按 `n` 新建时曾经因此闪退。
+        """
         import pickup
 
         self._host_busy = False
         pane = self.query_one(EmbedPane)
-        current = request.session
-        if same_runtime:
-            key = pickup.session_key(request.session)
-            marked = self.store.mark_hosted(key, name)
-            if marked is None:
-                request.session["keepalive_name"] = name
-            current = marked or request.session
         fallback = None
         if isinstance(request, pickup.LaunchRequest):
+            current = request.session
+            if same_runtime:
+                key = pickup.session_key(request.session)
+                marked = self.store.mark_hosted(key, name)
+                if marked is None:
+                    request.session["keepalive_name"] = name
+                current = marked or request.session
             fallback = lambda s=current: self._render_detail(s)
         pane.focus_session(name, fallback)
         self.set_focus(pane)
