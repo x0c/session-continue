@@ -2258,6 +2258,49 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual([s["id"] for s in store.all_sessions()], ["d", "a", "b", "c"])
         self.assertEqual(store.all_sessions()[2]["mtime"], 100)
 
+    def test_mark_hosted_clear_forces_ended_until_scan_confirms_dead(self) -> None:
+        """按 q 结束托管后不能闪「运行中」：立刻清 live，重扫仍报 live 时继续压住。"""
+        session = {
+            "source": "claude", "id": "s0", "short_id": "s0", "mtime": 1.0,
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "t",
+            "cwd": "/tmp", "live": True, "pid": 99, "keepalive_name": "pickup-claude-s0",
+        }
+        claude_runtime = mock.Mock()
+        claude_runtime.id = "claude"
+        claude_runtime.display_name = "Claude"
+        claude_runtime.scan_signature.return_value = None
+        claude_runtime.scan_sessions.return_value = [dict(session)]
+        registry = pickup.RuntimeRegistry((claude_runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+
+        store.mark_hosted("claude:s0", None)
+        current = store.find_session("claude:s0")
+        self.assertFalse(current.get("live"))
+        self.assertIsNone(current.get("pid"))
+        self.assertNotIn("keepalive_name", current)
+        self.assertIn("claude:s0", store._force_ended)
+
+        still_live = {
+            "source": "claude", "id": "s0", "short_id": "s0", "mtime": 1.0,
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "t",
+            "cwd": "/tmp", "live": True, "pid": 99,
+        }
+        claude_runtime.scan_sessions.return_value = [still_live]
+        with mock.patch.object(pickup.keepalive, "annotate"):
+            store.refresh()
+        current = store.find_session("claude:s0")
+        self.assertFalse(current.get("live"))
+        self.assertIn("claude:s0", store._force_ended)
+
+        dead = dict(still_live, live=False, pid=None)
+        claude_runtime.scan_sessions.return_value = [dead]
+        with mock.patch.object(pickup.keepalive, "annotate"):
+            store.refresh()
+        self.assertNotIn("claude:s0", store._force_ended)
+        self.assertFalse(store.find_session("claude:s0").get("live"))
+
 class NavStub:
     """`_new_session_cwd` 只需要 `project_query` 属性；界面层真实用的是
     `ui.nav.NavState`，测试这里用一个最小 stub 避免依赖 ui 包。"""

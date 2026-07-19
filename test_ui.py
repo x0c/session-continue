@@ -1346,7 +1346,7 @@ class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
         sessions = [{
             "source": "claude", "id": "s0", "short_id": "s0", "mtime": time.time(),
             "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "会话0",
-            "cwd": "/tmp", "live": False, "keepalive_name": "pickup-claude-fake",
+            "cwd": "/tmp", "live": True, "pid": 4242, "keepalive_name": "pickup-claude-fake",
         }]
         store, _ = _make_store(sessions=sessions)
         app = PickupApp(store, embed_ok=False)
@@ -1354,15 +1354,25 @@ class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await pilot.pause(delay=0.2)
                 await pilot.press("down")
+                list_view = app.screen.query_one(SessionListView)
+                card = list_view._session_cards()[0]
+                self.assertIn("Running (hosted)", card.render().plain)
                 await pilot.press("q")
                 await pilot.pause(delay=0.3)  # worker 推弹窗 + ConfirmModal 武装
                 self.assertIsInstance(app.screen, ConfirmModal)
                 await pilot.press("q")
                 await pilot.pause(delay=0.2)
+                # 确认后立刻应是已结束，不能先闪一帧「运行中」（live 仍为 True）
+                card = list_view._session_cards()[0]
+                plain = card.render().plain
+                self.assertIn("Ended", plain)
+                self.assertNotIn("Running", plain)
         kill_mock.assert_called_once_with("pickup-claude-fake")
         current = store.find_session("claude:s0")
         self.assertIsNotNone(current)
         self.assertNotIn("keepalive_name", current)
+        self.assertFalse(current.get("live"))
+        self.assertIsNone(current.get("pid"))
 
 
 if __name__ == "__main__":

@@ -399,6 +399,9 @@ class SessionStore:
         # （或像某些 fake CLI 一样根本不注册）时，后台重扫替换会话字典后仍能立刻恢复
         # keepalive_name，避免 x 拒绝关闭、回车误开竞争进程。
         self.hosted: dict[str, str] = {}
+        # 用户刚用 q 结束的会话键：杀掉到进程真正退出之间，扫描仍可能报 live=True。
+        # 在确认已死之前强制按已结束展示，避免「托管 → 运行中 → 已结束」闪烁。
+        self._force_ended: set[str] = set()
         # 值是 (读取时的历史文件 mtime, 消息列表)；文件 mtime 变化就重读，
         # 修掉"同一次 pickup 内 / 关闭预览重开还是旧内容"的问题。
         self.conversations: dict[str, tuple[float | None, list[ConversationMessage]]] = {}
@@ -551,6 +554,15 @@ class SessionStore:
             self.generating.intersection_update(by_key)
             for session in by_key.values():
                 key = session_key(session)
+                # 用户刚结束的会话：进程可能还没退出，扫描仍报 live；强制已结束展示，
+                # 直到某次扫描确认 live=False 再解除（见 mark_hosted 清除分支）。
+                if key in self._force_ended:
+                    if session.get("live"):
+                        session["live"] = False
+                        session["pid"] = None
+                        session.pop("keepalive_name", None)
+                    else:
+                        self._force_ended.discard(key)
                 # annotate 没匹配上时，用本进程的内嵌托管记录兜底（见 __init__ 注释）；
                 # 托管会话已死则清掉记录，让状态回到真实的「已结束」
                 if "keepalive_name" not in session:
@@ -604,12 +616,20 @@ class SessionStore:
         return None
 
     def mark_hosted(self, key: str, name: str | None) -> dict | None:
-        """原子登记/清除托管会话，并同步更新当前扫描快照中的展示字段。"""
+        """原子登记/清除托管会话，并同步更新当前扫描快照中的展示字段。
+
+        清除时（name=None）一并把 `live`/`pid` 置为已结束，并记入 `_force_ended`：
+        用户按 q 杀掉托管后，若只清 `keepalive_name` 而留下上次扫描的 `live=True`，
+        列表会先从「运行中(托管)」闪成「运行中」，再等后台重扫才变成「已结束」；
+        进程尚未退出时下一轮扫描仍可能报 live，靠 `_force_ended` 压住直到确认已死。
+        """
         with self.lock:
             if name:
                 self.hosted[key] = name
+                self._force_ended.discard(key)
             else:
                 self.hosted.pop(key, None)
+                self._force_ended.add(key)
             for bucket in self.sessions.values():
                 for session in bucket:
                     if session_key(session) != key:
@@ -618,6 +638,8 @@ class SessionStore:
                         session["keepalive_name"] = name
                     else:
                         session.pop("keepalive_name", None)
+                        session["live"] = False
+                        session["pid"] = None
                     return session
         return None
 
