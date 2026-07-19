@@ -775,7 +775,10 @@ class EmbedPane(Widget):
         embed.pane_state 阻塞调用。
         """
         if self._is_detail_view():
-            self.scroll_detail(local_delta)
+            # 文档式预览：detail_offset 0=顶部、增大=更靠后的对话。
+            # 传入的 local_delta 沿用 history_offset 约定（Up=+、Down=-，0=直播底），
+            # 与文档滚动符号相反，这里取反才能「下滚看更晚内容」。
+            self.scroll_detail(-local_delta)
             return
         name = self.session_name
         if not name or self.dead:

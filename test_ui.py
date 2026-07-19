@@ -1115,6 +1115,19 @@ class EmbedPaneWheelTests(unittest.TestCase):
         pane._on_mouse_scroll_down(scroll_down)
         self.assertEqual(pane.history_offset, 0)
 
+    def test_detail_wheel_follows_document_scroll_direction(self):
+        """已结束会话预览：下滚应增大 detail_offset（看更晚内容），与 history_offset 相反。"""
+        pane = EmbedPane()
+        pane.show_detail(lambda: "预览正文")
+        pane.scroll_detail = mock.Mock(return_value=True)
+        scroll_down = events.MouseScrollDown(None, 10, 5, 0, 0, 0, False, False, False)
+        scroll_up = events.MouseScrollUp(None, 10, 5, 0, 0, 0, False, False, False)
+
+        pane._on_mouse_scroll_down(scroll_down)
+        pane.scroll_detail.assert_called_with(3)
+        pane._on_mouse_scroll_up(scroll_up)
+        pane.scroll_detail.assert_called_with(-3)
+
     def test_scroll_handlers_preserve_sgr_direction_without_local_scroll(self):
         pane = EmbedPane()
         pane.session_name = "pickup-claude-x"
