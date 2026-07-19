@@ -2169,6 +2169,19 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(pickup._fit_cell("标题很长", 5), "标题 ")
         self.assertEqual(pickup._text_width(pickup._fit_cell("✅完成", 8)), 8)
 
+        mixed = "काe\u0301好🙂"
+        self.assertEqual(pickup._text_width(mixed), 6)
+        self.assertEqual(pickup._fit_cell(mixed, 4), "काe\u0301好")
+
+        contextual_emoji = "👨\u200d💻"
+        self.assertEqual(pickup._text_width(contextual_emoji), 2)
+        self.assertEqual(pickup._fit_cell(contextual_emoji + "x", 2), contextual_emoji)
+        self.assertEqual(pickup._fit_cell_right("a" + contextual_emoji, 2), " a")
+        self.assertEqual(
+            pickup._wrap_preview_text(contextual_emoji + "x", 2),
+            [contextual_emoji, "x"],
+        )
+
     def test_preview_renders_messages_as_chronological_chat(self) -> None:
         messages = [
             pickup.ConversationMessage("user", "请分析启动速度"),

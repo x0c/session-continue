@@ -48,7 +48,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
-from rich.cells import cell_len as _rich_cell_len
+from rich.cells import cell_len as _rich_cell_len, chop_cells as _rich_chop_cells
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -100,45 +100,31 @@ def _format_relative_time(mtime: float, now: float | None = None) -> str:
 
 
 def _char_width(ch: str) -> int:
-    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me"):
-        return 0
-    if unicodedata.east_asian_width(ch) in ("F", "W"):
-        return 2
-    return 1
+    # 与 `embed._char_width`、Rich/Textual 的渲染宽度表保持一致。
+    return _rich_cell_len(ch)
 
 
 def _text_width(text: str) -> int:
-    return sum(_char_width(ch) for ch in text)
+    # 必须整段计算；ZWJ emoji 等 grapheme 逐字符求和会失真。
+    return _rich_cell_len(text)
 
 
 def _fit_cell(text: object, width: int) -> str:
     """按终端显示宽度截断并补齐，避免中文和图标把表格列挤歪。"""
     if width <= 0:
         return ""
-    out = []
-    used = 0
-    for ch in str(text):
-        ch_width = _char_width(ch)
-        if used + ch_width > width:
-            break
-        out.append(ch)
-        used += ch_width
-    return "".join(out) + " " * (width - used)
+    chunks = _rich_chop_cells(str(text), width)
+    fitted = chunks[0] if chunks else ""
+    return fitted + " " * (width - _text_width(fitted))
 
 
 def _fit_cell_right(text: object, width: int) -> str:
     """按终端显示宽度截断并右对齐补齐（数值列用）。"""
     if width <= 0:
         return ""
-    out = []
-    used = 0
-    for ch in str(text):
-        ch_width = _char_width(ch)
-        if used + ch_width > width:
-            break
-        out.append(ch)
-        used += ch_width
-    return " " * (width - used) + "".join(out)
+    chunks = _rich_chop_cells(str(text), width)
+    fitted = chunks[0] if chunks else ""
+    return " " * (width - _text_width(fitted)) + fitted
 
 
 def _wrap_preview_text(text: str, width: int) -> list[str]:
@@ -146,8 +132,10 @@ def _wrap_preview_text(text: str, width: int) -> list[str]:
     if width <= 0:
         return []
 
+    # ZWNJ/ZWJ 虽属 Cf，但是文字连写和 emoji grapheme 的有效组成
+    # 字符，不能像其他控制字符一样替换为空格。
     cleaned = "".join(
-        ch if ch in "\n\t" or unicodedata.category(ch)[0] != "C" else " "
+        ch if ch in "\n\t\u200c\u200d" or unicodedata.category(ch)[0] != "C" else " "
         for ch in text
     ).replace("\t", "    ")
     lines: list[str] = []
@@ -155,17 +143,7 @@ def _wrap_preview_text(text: str, width: int) -> list[str]:
         if not paragraph:
             lines.append("")
             continue
-        current: list[str] = []
-        used = 0
-        for ch in paragraph:
-            ch_width = _char_width(ch)
-            if current and used + ch_width > width:
-                lines.append("".join(current))
-                current = []
-                used = 0
-            current.append(ch)
-            used += ch_width
-        lines.append("".join(current))
+        lines.extend(_rich_chop_cells(paragraph, width))
     return lines
 
 
