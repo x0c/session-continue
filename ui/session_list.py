@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -34,7 +35,7 @@ class SessionCard(Widget):
 
     DEFAULT_CSS = """
     SessionCard {
-        height: 2;
+        height: 3;
         width: 1fr;
     }
     """
@@ -101,10 +102,12 @@ class SessionCard(Widget):
             title_prefix = f"{self._spin_char} {title_prefix}"
         width = max(10, self.size.width or 40)
 
-        runtime_name = store.registry.get(str(session.get("source") or "")).display_name
+        runtime = store.registry.get(str(session.get("source") or ""))
+        runtime_name = runtime.display_name
+        runtime_id = getattr(runtime, "id", None) or str(session.get("source") or "")
         runtime_width = min(width - 1, max(1, pickup._text_width(runtime_name)))
         title_width = width - runtime_width
-        title_cell = pickup._fit_cell(title_prefix + title, title_width)
+        title_cell = pickup._fit_cell(title_prefix + title, title_width, ellipsis=True)
         runtime_cell = pickup._fit_cell_right(runtime_name, runtime_width)
 
         relative_time = pickup._format_relative_time(session.get("mtime") or 0)
@@ -114,10 +117,12 @@ class SessionCard(Widget):
         time_cell = pickup._fit_cell_right(relative_time, time_width)
 
         out = Text(title_cell)
-        out.append(runtime_cell, style="dim")
+        out.append(runtime_cell, style=pickup.runtime_label_style(runtime_id))
         out.append("\n")
         out.append(status_cell, style="green" if is_running else "dim")
         out.append(time_cell, style="dim")
+        # 第三行空行：视觉分隔，同时算进本卡命中区（不要用 ListItem margin/padding）
+        out.append("\n")
         return out
 
 
@@ -128,17 +133,26 @@ class NewSessionCard(Widget):
 
     DEFAULT_CSS = """
     NewSessionCard {
-        height: 1;
+        height: 2;
         width: 1fr;
     }
     """
 
     def render(self) -> Text:
-        return Text("＋ 新建会话", style="bold")
+        # 第二行空行：与会话卡同样把分隔算进本项命中区
+        return Text("＋ 新建会话", style="bold") + Text("\n")
 
 
 class SessionListView(ListView):
     """会话列表：虚拟索引 0 固定为新建会话项，之后是稳定顺序的会话卡片。"""
+
+    # 隐藏滚动条占位，保留键盘/滚轮滚动（scrollbar-size: 0 不关掉 overflow）。
+    DEFAULT_CSS = """
+    SessionListView {
+        scrollbar-size-vertical: 0;
+        scrollbar-size-horizontal: 0;
+    }
+    """
 
     BINDINGS = [
         Binding("j", "cursor_down", "选择", show=False),
@@ -148,10 +162,8 @@ class SessionListView(ListView):
     def __init__(self, store: "pickup.SessionStore", nav, **kwargs) -> None:
         super().__init__(**kwargs)
         self.store = store
-        # 项目筛选状态只认 nav.project_key 这一份：曾经在这里另开一个
-        # self.project_key 属性，cycle_project_filter 只改了这份、
-        # MainScreen._update_header 却读 nav.project_key，两边不同步导致
-        # 页头筛选文案和实际筛选结果对不上（真机排查发现的真实 bug）。
+        # 项目搜索查询只认 nav.project_query 这一份，供 visible_sessions /
+        # 页头占位文案 / 新建会话目录解析共用，禁止在本类另开一份状态。
         self.nav = nav
         self._spin_frame = 0
 
@@ -209,7 +221,12 @@ class SessionListView(ListView):
     def visible_sessions(self) -> list[dict]:
         import pickup
 
-        return pickup._filter_sessions(self.store.all_sessions(), self.nav.project_key)
+        display_titles, _ = self.store.snapshot()
+        return pickup._filter_sessions_by_query(
+            self.store.all_sessions(),
+            self.nav.project_query,
+            titles=display_titles,
+        )
 
     def selected_session(self) -> dict | None:
         sessions = self.visible_sessions()
@@ -240,11 +257,19 @@ class SessionListView(ListView):
 
         sessions = self.visible_sessions()
         new_keys = [pickup.session_key(session) for session in sessions]
+        t0 = time.perf_counter()
 
         if new_keys == self._current_session_keys():
             self._update_cards_in_place(sessions)
             if previous_key is None and self.index is None:
                 self.index = 1 if sessions else 0
+            import observe
+            observe.event(
+                "list_rebuild",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                mode="in_place",
+                card_count=len(sessions),
+            )
             return
 
         display_titles, generating = self.store.snapshot()
@@ -284,13 +309,10 @@ class SessionListView(ListView):
         # 终端的部分重绘时序），显式 refresh() 成本几乎为零，保留作为兜底不会有
         # 副作用，直接加上。
         self.refresh()
-
-    async def cycle_project_filter(self) -> None:
-        keys = [None, *(project["cwd_key"] for project in self.store.projects())]
-        try:
-            position = keys.index(self.nav.project_key)
-        except ValueError:
-            position = 0
-        self.nav.project_key = keys[(position + 1) % len(keys)]
-        await self.rebuild(keep_selection=False)
-        self.index = 1 if len(self.visible_sessions()) else 0
+        import observe
+        observe.event(
+            "list_rebuild",
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+            mode="full",
+            card_count=len(sessions),
+        )

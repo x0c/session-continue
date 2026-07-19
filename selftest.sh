@@ -90,10 +90,11 @@ wait_for "workA: 修复切换体验" 60
 wait_for "workB: 第二个会话" 60
 ok "首屏是跨运行时统一时间线"
 
-# 下移到第一张会话卡，右栏应展示未托管会话的静态摘要。
+# 下移到第一张会话卡，右栏应展示完整对话预览（选中即预览，不再依赖 Space）。
 tmux -L "$OUTER" send-keys -t tui Down
-wait_for "最近提问" 60
-ok "选中未托管会话时右栏展示静态摘要"
+wait_for "● 你" 60
+wait_for "修复切换体验" 60
+ok "选中未托管会话时右栏展示完整对话预览"
 
 tmux -L "$OUTER" send-keys -t tui Enter
 wait_for "FAKE-CLAUDE --resume aaaa1111" 60
@@ -110,19 +111,36 @@ sleep 0.5
 ok "键盘输入真实转发进托管会话（不是被列表吞掉）"
 
 # Ctrl+\ 回列表：Textual 原生区分 Ctrl+\ 与连续两次按 \，不再需要旧版的双反
-# 斜杠时间窗口消歧义。回列表后按 f 应该能正常切换项目筛选（如果焦点还停在
-# pane 上，这个按键会被当成字面文本发进托管会话，标题栏筛选状态不会变化）。
+# 斜杠时间窗口消歧义。回列表后按 / 聚焦搜索框并输入项目名应能过滤列表（如果焦点
+# 还停在 pane 上，这些按键会被当成字面文本发进托管会话，搜索框不会出现独立的
+# workA 查询串、workB 卡片也不会消失）。
 tmux -L "$OUTER" send-keys -t tui C-\\
 sleep 0.8
-tmux -L "$OUTER" send-keys -t tui f
-wait_for "会话 · workA (" 20
-ok "Ctrl+\\ 把键盘焦点交回列表（f 项目筛选生效证明焦点确实回来了）"
-# 固定数据里有 workA/workB 两个项目，循环是 全部项目 -> workA -> workB -> 全部项目
-# 三档；再按两次 f 才能转回"全部项目"，不是一次。
-tmux -L "$OUTER" send-keys -t tui f
-wait_for "会话 · workB (" 20
-tmux -L "$OUTER" send-keys -t tui f
-wait_for "会话 · 全部项目 (" 20
+tmux -L "$OUTER" send-keys -t tui /
+sleep 0.3
+tmux -L "$OUTER" send-keys -t tui -l "workA"
+# 注意：不能 wait_for "workA"——列表里本来就有「workA: …」标题，会立刻假阳性。
+# 以 workB 卡片消失为准，证明搜索过滤已生效（也就证明焦点已回到列表）。
+filtered=0
+for _ in {1..40}; do
+  if ! cap | grep -q "workB:"; then
+    filtered=1
+    break
+  fi
+  sleep 0.15
+done
+if [[ "$filtered" != "1" ]]; then
+  echo "搜索 workA 后列表仍出现 workB 会话卡，焦点可能没回到列表或过滤未生效" >&2
+  cap >&2
+  exit 1
+fi
+ok "Ctrl+\\ 把键盘焦点交回列表（/ 搜索过滤生效证明焦点确实回来了）"
+# Esc 清空搜索，恢复全部项目可见；再 Down 把焦点交回列表，避免后续快捷键被搜索框吞掉
+tmux -L "$OUTER" send-keys -t tui Escape
+sleep 0.4
+wait_for "workB:" 20
+tmux -L "$OUTER" send-keys -t tui Down
+sleep 0.2
 
 # 关闭分栏：托管会话必须在后台 tmux 继续存活，不能被一并杀掉。
 tmux -L "$OUTER" send-keys -t tui c
@@ -213,10 +231,10 @@ inner_cursor="$(tmux -L "$KEEPALIVE" display-message -p -t "$cursor_session" '#{
 outer_cursor="$(tmux -L "$OUTER" display-message -p -t cursor '#{cursor_x},#{cursor_y}')"
 outer_x="${outer_cursor%,*}"; outer_y="${outer_cursor#*,}"
 inner_x="${inner_cursor%,*}"; inner_y="${inner_cursor#*,}"
-# 左栏固定宽度 44（ui/main_screen.py 的 LIST_PANE_WIDTH），面板起点在第 44 列；
-# 真实外层光标列 = 44 + pane 内真实光标列，行 = pane 内真实光标行（面板顶部无
+# 左栏固定宽度 39（ui/main_screen.py 的 LIST_PANE_WIDTH），面板起点在第 39 列；
+# 真实外层光标列 = 39 + pane 内真实光标列，行 = pane 内真实光标行（面板顶部无
 # 额外偏移）。算错了说明 EmbedPane._update_app_cursor 的坐标换算或时机有问题。
-expected_x=$((44 + inner_x))
+expected_x=$((39 + inner_x))
 if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$inner_y" ]]; then
   ok "外层终端真实光标精确落在托管 pane 内的真实光标位置（内 ${inner_cursor} -> 外 ${outer_cursor}，IME 候选框定位依据的机制验证通过）"
 else

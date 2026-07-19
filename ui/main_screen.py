@@ -1,26 +1,24 @@
 """主屏：会话列表 + 右栏内嵌面板，取代旧版 pickup.py 里的 _run 主循环。
 
-按键语义（f 项目筛选 / p 固定 / space 预览 / a 高级操作 / n 新建 / e 全屏 /
-x 关闭后台 / c 关闭面板 / Esc 退出）与旧版一一对应，具体业务规则不变；
-只是从"手写 curses 循环 + 状态机"换成 Textual 的 action/binding 派发。
+按键语义（/ 聚焦项目搜索 / p 固定 / a 高级操作 / n 新建 / e 全屏 /
+x 关闭后台 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
+展示完整对话预览（不再使用 Space 全屏预览页）。侧边栏顶部为项目搜索框，
+大小写无关模糊匹配项目名与会话标题。
 """
 
 from __future__ import annotations
-
-import os
 
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Static
+from textual.widgets import Footer, Input
 from textual.worker import get_current_worker
 
 from ui.embed_pane import EmbedPane
 from ui.modals import ConfirmModal, choose_target_runtime, new_session_flow
 from ui.nav import NavState
-from ui.preview_screen import PreviewScreen
 from ui.session_list import SessionListView
 
 try:
@@ -32,20 +30,19 @@ REFRESH_INTERVAL = 3.0  # 秒，后台重扫会话列表的最短间隔，与旧
 REFRESH_INTERVAL_MAX = 10.0  # 秒，连续空闲多轮后退避到的最长间隔
 _IDLE_ROUNDS_BEFORE_BACKOFF = 3  # 连续几轮扫描都没变化才开始拉长间隔，避免偶发抖动误判空闲
 CACHE_POLL_INTERVAL = 0.5  # 秒，标题缓存文件轮询间隔（比会话重扫轻得多，保持高频）
-LIST_PANE_WIDTH = 44  # 分栏时左栏固定宽度，对应旧版 EMBED_LEFT_BAND
+LIST_PANE_WIDTH = 39  # 分栏时左栏固定宽度，对应旧版 EMBED_LEFT_BAND
 
 
 class MainScreen(Screen):
     BINDINGS = [
-        Binding("f", "cycle_project", "项目"),
         Binding("p", "pin_pane", "固定"),
-        Binding("space", "preview", "预览"),
         Binding("a", "handoff", "高级操作"),
         Binding("n", "new_session", "新建"),
         Binding("e", "fullscreen", "全屏"),
         Binding("x", "kill_keepalive", "关闭后台", show=False),
         Binding("c", "close_pane", "关闭面板", show=False),
         Binding("m", "toggle_mouse", "鼠标", show=False),
+        Binding("f12", "save_screenshot", "截图", show=False),
         Binding("escape", "quit_app", "退出"),
         # 不再单独绑 ctrl+c 退出：Textual 的 Screen 基类自带 ctrl+c -> copy_text
         # （划词后复制选中文本），子类 BINDINGS 里重复同一个键会按键位覆盖掉
@@ -66,11 +63,12 @@ class MainScreen(Screen):
         self.nav = NavState(source=source)
         self.mouse_forward_enabled = True
         self._host_busy = False
+        self._preview_gen = 0
 
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="list-pane"):
-                yield Static(id="list-header")
+                yield Input(placeholder="筛选项目…", id="project-search")
                 yield SessionListView(self.store, self.nav, id="session-list")
             if self.embed_ok:
                 yield EmbedPane(id="embed-pane", on_focus_list=self._focus_list, osc_report=self.osc_report)
@@ -189,28 +187,29 @@ class MainScreen(Screen):
         if self.embed_ok:
             pane = self.query_one(EmbedPane)
             # SessionCard 已换成最新扫描对象；静态详情缓存也必须失效并重新跟随，
-            # 否则右栏仍会展示旧闭包里的标题/状态/最近问答。
+            # 否则右栏仍会展示旧闭包里的标题/状态/对话预览。
             pane.invalidate_detail()
             self._follow_current_selection()
 
     def _update_header(self) -> None:
+        """刷新搜索框占位文案：空查询时展示命中数；出错/无会话时给出原因。"""
         session_list = self.query_one(SessionListView)
-        filter_label = "全部项目" if self.nav.project_key is None else (
-            os.path.basename(self.nav.project_key) or "未知项目"
-        )
+        search = self.query_one("#project-search", Input)
         count = len(session_list.visible_sessions())
-        header_text = f" 会话 · {filter_label} ({count})"
         load_error = self.store.get_load_error()
         # 首屏扫描已经跑完（store.loaded）且全部运行时都没扫到任何会话时，给出
         # 友好提示，而不是让用户面对一个永远空白、原因不明的列表——旧版是在 main()
         # 里同步扫完就直接打印错误退出，扫描挪到后台 worker 后这个判断只能挪到这里，
         # 扫描没跑完之前（store.loaded 为 False）不能误判为"确实没有会话"。
         if load_error:
-            header_text += f" — {load_error}；正在自动重试"
+            search.placeholder = f"筛选项目… — {load_error}；正在自动重试"
         elif self.store.loaded and count == 0 and not any(self.store.sessions.values()):
             names = "、".join(runtime.display_name for runtime in self.store.registry)
-            header_text += f" — 未找到任何 {names} 会话记录"
-        self.query_one("#list-header", Static).update(header_text)
+            search.placeholder = f"筛选项目… — 未找到任何 {names} 会话记录"
+        elif self.nav.project_query.strip():
+            search.placeholder = f"筛选项目… ({count})"
+        else:
+            search.placeholder = f"筛选项目 ({count})"
 
     # ---- 选择跟随：右栏默认展示左栏当前选中项 ----
 
@@ -229,7 +228,7 @@ class MainScreen(Screen):
         if self.nav.pinned_key is not None:
             return
         if session_list.is_new_session_selected():
-            pane.show_detail(lambda: Text("新建会话：选择项目与运行时", justify="center"))
+            pane.show_detail(lambda: Text("新建会话：选择项目与运行时"))
             return
         session = session_list.selected_session()
         if session is None:
@@ -238,7 +237,23 @@ class MainScreen(Screen):
         if name:
             pane.focus_session(str(name), lambda s=session: self._render_detail(s))
         else:
+            self._preview_gen += 1
+            self._warm_conversation(session, self._preview_gen)
             pane.show_detail(lambda s=session: self._render_detail(s))
+
+    def _detail_header(self, session: dict) -> Text:
+        import pickup
+
+        title = self.store.get_title(session)
+        runtime = self.store.registry.get(str(session.get("source") or ""))
+        status = "运行中" if session.get("live") else "已结束"
+        project = str(session.get("cwd") or session.get("cwd_display") or "未知项目")
+        out = Text(title, style="bold")
+        out.append("\n")
+        out.append(runtime.display_name, style=pickup.runtime_label_style(runtime.id))
+        out.append(f" · {status}", style="dim")
+        out.append("\n" + project, style="dim")
+        return out
 
     def _render_detail(self, session: dict) -> Text:
         import pickup
@@ -246,18 +261,48 @@ class MainScreen(Screen):
         # 详情 renderer 会被 EmbedPane 缓存并延后调用；后台重扫后闭包捕获的 dict
         # 已不是 Store 当前对象，必须每次按稳定会话键重新解析最新快照。
         session = self.store.find_session(pickup.session_key(session)) or session
-        title = self.store.get_title(session)
+        out = self._detail_header(session)
+        messages = self.store.peek_conversation(session)
+        if messages is None:
+            return out
         runtime = self.store.registry.get(str(session.get("source") or ""))
-        status = "运行中" if session.get("live") else "已结束"
-        project = str(session.get("cwd") or session.get("cwd_display") or "未知项目")
-        out = Text(title, style="bold")
-        out.append("\n" + f"{runtime.display_name} · {status}", style="dim")
-        out.append("\n" + project, style="dim")
-        out.append("\n\n最近提问\n", style="bold")
-        out.append(str(session.get("last_user_msg") or "暂无可展示内容"))
-        out.append("\n\n最近回复\n", style="bold")
-        out.append(str(session.get("last_agent_msg") or "暂无可展示内容"))
+        runtime_name = runtime.display_name
+        runtime_style = pickup.runtime_label_style(runtime.id)
+        try:
+            width = max(20, (self.query_one(EmbedPane).size.width or 40) - 2)
+        except Exception:
+            width = 40
+        lines = pickup._preview_lines(messages, runtime_name, width)
+        out.append("\n")
+        for i, (kind, line, suffix) in enumerate(lines):
+            out.append("\n")
+            if kind == "assistant" and line.startswith("◆ "):
+                style = runtime_style
+            else:
+                style = {"user": "bold cyan", "assistant": "bold green", "dim": "dim"}.get(kind, "")
+            out.append(line, style=style)
+            if suffix:
+                out.append(suffix, style="dim")
         return out
+
+    @work(thread=True)
+    def _warm_conversation(self, session: dict, gen: int) -> None:
+        """后台填对话缓存；仅当仍是当前选中世代时刷新右栏。"""
+        try:
+            self.store.get_conversation(session)
+        except Exception:
+            return
+        if gen != self._preview_gen:
+            return
+        self.app.call_from_thread(self._refresh_preview_detail)
+
+    def _refresh_preview_detail(self) -> None:
+        if not self.embed_ok:
+            return
+        pane = self.query_one(EmbedPane)
+        if pane.session_name or pane.has_focus:
+            return
+        pane.invalidate_detail()
 
     # ---- 会话选择/新建 ----
 
@@ -337,16 +382,32 @@ class MainScreen(Screen):
     @work(thread=True, group="host")
     def _host_and_focus(self, request, plan, ident, same_runtime, width, height) -> None:
         import embed
+        import observe
         import pickup
+        import time
 
+        t0 = time.perf_counter()
+        runtime = request.target_runtime_id
         try:
             name = embed.host_session(
                 plan, request.target_runtime_id, ident, width, height, osc_report=self.osc_report,
             )
         except Exception as exc:
+            observe.event(
+                "host_session",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                runtime=runtime,
+                ok=False,
+            )
             pickup._log_embed_error("内嵌会话启动线程", exc)
             self.app.call_from_thread(self._on_host_failed)
             return
+        observe.event(
+            "host_session",
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+            runtime=runtime,
+            ok=True,
+        )
         self.app.call_from_thread(self._on_embed_hosted, request, name, same_runtime)
 
     def _on_host_failed(self) -> None:
@@ -391,16 +452,32 @@ class MainScreen(Screen):
     @work(thread=True, group="host")
     def _host_direct_worker(self, direct, width: int, height: int) -> None:
         import embed
+        import observe
         import pickup
+        import time
 
+        t0 = time.perf_counter()
+        runtime = direct.runtime_id
         try:
             name = embed.host_session(
                 direct.plan, direct.runtime_id, direct.ident, width, height, osc_report=self.osc_report,
             )
         except Exception as exc:
+            observe.event(
+                "host_session",
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                runtime=runtime,
+                ok=False,
+            )
             pickup._log_embed_error("直启会话启动线程", exc)
             self.app.call_from_thread(self._on_host_failed)
             return
+        observe.event(
+            "host_session",
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+            runtime=runtime,
+            ok=True,
+        )
         self.app.call_from_thread(self._on_direct_hosted, name)
 
     def _on_direct_hosted(self, name: str) -> None:
@@ -414,10 +491,41 @@ class MainScreen(Screen):
 
     # ---- 动作 ----
 
-    async def action_cycle_project(self) -> None:
-        await self.query_one(SessionListView).cycle_project_filter()
+    def action_focus_search(self) -> None:
+        self.query_one("#project-search", Input).focus()
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "project-search":
+            return
+        self.nav.project_query = event.value
+        await self.query_one(SessionListView).rebuild(keep_selection=True)
         self._update_header()
         self._follow_current_selection()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "project-search":
+            return
+        # Enter：把焦点交回列表，方便继续用 j/k / 回车操作会话
+        list_view = self.query_one(SessionListView)
+        list_view.focus()
+        if list_view.index is None:
+            list_view.index = 1 if list_view.visible_sessions() else 0
+
+    def on_key(self, event) -> None:
+        search = self.query_one("#project-search", Input)
+        list_view = self.query_one(SessionListView)
+        if search.has_focus:
+            # 搜索框内 Down：跳到列表；不在这里绑 /，避免吞掉用户想输入的斜杠
+            if event.key == "down":
+                event.stop()
+                list_view.focus()
+                if list_view.index is None:
+                    list_view.index = 1 if list_view.visible_sessions() else 0
+            return
+        # 列表聚焦时 / 打开搜索（不用 Screen Binding，否则搜索框里按 / 会被截走）
+        if event.key == "slash" and list_view.has_focus:
+            event.stop()
+            search.focus()
 
     def action_pin_pane(self) -> None:
         import pickup
@@ -433,23 +541,6 @@ class MainScreen(Screen):
             self._follow_current_selection()
         else:
             self.nav.pinned_key = key
-
-    @work
-    async def action_preview(self) -> None:
-        session_list = self.query_one(SessionListView)
-        session = session_list.selected_session()
-        if session is None:
-            self.app.bell()
-            return
-        title = self.store.get_title(session)
-        result = await self.app.push_screen_wait(PreviewScreen(self.store, self.nav, session, title))
-        if result is None:
-            return
-        request, force_fullscreen = result
-        if not force_fullscreen and self.embed_ok:
-            self._embed_open(request)
-        else:
-            self.app.exit(result=request)
 
     @work
     async def action_handoff(self) -> None:
@@ -509,6 +600,19 @@ class MainScreen(Screen):
     def action_toggle_mouse(self) -> None:
         self.mouse_forward_enabled = not self.mouse_forward_enabled
 
+    def action_save_screenshot(self) -> None:
+        """F12：导出当前 TUI 到 ~/.cache/pickup/screenshots/（用户主动触发）。"""
+        import observe
+
+        try:
+            path = observe.save_tui_screenshot(self.app)
+        except Exception as exc:  # noqa: BLE001
+            import pickup
+            pickup._log_embed_error("TUI 截图", exc)
+            self.app.bell()
+            return
+        self.notify(f"已截图 {path}", title="pickup", timeout=4)
+
     def action_fullscreen(self) -> None:
         session_list = self.query_one(SessionListView)
         session = session_list.selected_session()
@@ -520,4 +624,12 @@ class MainScreen(Screen):
         self.app.exit(result=request)
 
     def action_quit_app(self) -> None:
+        # 搜索框聚焦时 Esc 先清空查询，再交回列表；列表上 Esc 才真正退出
+        search = self.query_one("#project-search", Input)
+        if search.has_focus:
+            if search.value:
+                search.value = ""
+                return
+            self.query_one(SessionListView).focus()
+            return
         self.app.exit(result=None)

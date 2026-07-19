@@ -97,7 +97,7 @@ class EmbedPane(Widget):
     EmbedPane {
         width: 1fr;
         height: 1fr;
-        content-align: center middle;
+        content-align: left top;
     }
     EmbedPane:focus {
         border: none;
@@ -278,6 +278,7 @@ class EmbedPane(Widget):
                 if 0 < gap < MIN_CAPTURE_INTERVAL:
                     time.sleep(MIN_CAPTURE_INTERVAL - gap)
                 pane_w, pane_h = self._pane_size()
+                capture_t0 = time.perf_counter()
                 text = embed.capture(name, history_offset, pane_h)
                 last_capture = time.monotonic()
 
@@ -299,6 +300,14 @@ class EmbedPane(Widget):
                     frame_key = (generation, history_offset, pane_w, pane_h, text)
                     if frame_key != last_frame_key:
                         grid = embed.parse_screen(text, pane_w, pane_h)
+                        capture_ms = int((time.perf_counter() - capture_t0) * 1000)
+                        if capture_ms >= 100:
+                            import observe
+                            observe.event(
+                                "capture_slow",
+                                duration_ms=capture_ms,
+                                session_prefix=(name or "")[:16],
+                            )
                         cursor = state[:3] if state is not None else None
                         self.app.call_from_thread(
                             self._apply_capture, generation, name, grid, cursor, state,
@@ -462,12 +471,12 @@ class EmbedPane(Widget):
         `render()` 完全一致（只是从"每次渲染都现算"搬到"状态变化时算一次"）。
         """
         if self.dead:
-            return Text("会话已结束（回车打开其他会话）", justify="center")
+            return Text("会话已结束（回车打开其他会话）")
         if self._detail_renderer is not None:
             rendered = self._detail_renderer()
             return rendered if isinstance(rendered, Text) else Text(str(rendered))
         if self.session_name is None:
-            return Text("选择一个会话查看详情", justify="center")
+            return Text("选择一个会话查看详情")
         # 会话已聚焦但还没有第一帧：连接/抓帧是后台实现细节，不能暴露成用户
         # 可见的中间态，展示空白终端画布，首帧到达后无缝替换。
         return Text()
@@ -477,14 +486,14 @@ class EmbedPane(Widget):
 
         这类画面（详情/占位/已结束提示）刷新频率远低于托管会话实时画面，不需要
         像 `_sync_strips` 那样按行 diff；但 `render_line` 每次重绘要为每一可见行
-        各调用一次，若不缓存就要对同一份内容反复重新换行/居中——缓存键覆盖全部
+        各调用一次，若不缓存就要对同一份内容反复重新换行——缓存键覆盖全部
         决定内容的稳定状态（会话名、是否已结束、详情渲染器身份、当前尺寸），
         命中即复用。renderer 捕获的标题缓存、状态或摘要发生变化时，调用方必须
         调用公开的 `invalidate_detail()`；`show_detail()`/`focus_session()`/
         `clear()`/resize 已在本类内部自动失效。
         转换本身复用 Textual 内置的 `Visual.to_strips`（与 Widget 基类默认的
-        Rich-renderable 渲染路径同一套换行/居中/宽字符处理），不用自己重新
-        实现文本折行和 `content-align: center middle` 这条 CSS 的效果。
+        Rich-renderable 渲染路径同一套换行/对齐/宽字符处理），不用自己重新
+        实现文本折行和 `content-align: left top` 这条 CSS 的效果。
         """
         key = (self.session_name, self.dead, id(self._detail_renderer), self.size)
         if self._static_key == key and self._static_strips_cache is not None:
@@ -504,16 +513,16 @@ class EmbedPane(Widget):
         调用 `self.render()`，且既有测试直接调用 `pane.render().plain` 断言
         画面内容），保留它但不再自己维护一份等价逻辑，保证两条路径不会分叉。
 
-        注意这里刻意**不做** `Visual.to_strips` 的换行/居中/全屏 padding——这些
+        注意这里刻意**不做** `Visual.to_strips` 的换行/对齐/全屏 padding——这些
         效果是 `render_line` 路径本身（经 `_ensure_static_strips`）已经处理的，
-        若 `render()` 也做一遍，返回的就是整屏带空白的居中布局，而不是调用方
+        若 `render()` 也做一遍，返回的就是整屏带空白的对齐布局，而不是调用方
         期待的"原始文本内容"。一组既有测试（`test_first_frame_never_exposes_...`、
         `test_stale_capture_callback_cannot_overwrite_new_view` 等）直接断言
-        `pane.render().plain == "即时会话详情"`（**纯原始文本，不含任何居中
+        `pane.render().plain == "即时会话详情"`（**纯原始文本，不含任何对齐
         空白**），这些测试是项目文档明确固化的行为（「内部状态驱动渲染结果」
         的断言标准），不能为了迎合新的实现去改测试。所以：
         - 非实时状态（详情/占位/已结束/尚无首帧）：直接返回 `_static_renderable()`
-          的原始 `Text` 内容（不居中、不换行）——这跟旧版 `render()` 在这些
+          的原始 `Text` 内容（不对齐填充、不换行）——这跟旧版 `render()` 在这些
           分支里 `return rendered if isinstance(rendered, Text) else Text(...)`
           的行为字节级一致。
         - 实时画面：拼接 `render_line` 的 `.text`（`Strip.text` 只含字符内容、

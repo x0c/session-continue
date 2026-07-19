@@ -2176,11 +2176,15 @@ class TuiLayoutTests(unittest.TestCase):
         contextual_emoji = "👨\u200d💻"
         self.assertEqual(pickup._text_width(contextual_emoji), 2)
         self.assertEqual(pickup._fit_cell(contextual_emoji + "x", 2), contextual_emoji)
-        self.assertEqual(pickup._fit_cell_right("a" + contextual_emoji, 2), " a")
-        self.assertEqual(
-            pickup._wrap_preview_text(contextual_emoji + "x", 2),
-            [contextual_emoji, "x"],
-        )
+        self.assertEqual(pickup._wrap_preview_text(contextual_emoji + "x", 2), [contextual_emoji, "x"])
+
+    def test_fit_cell_ellipsis_keeps_display_width(self) -> None:
+        fitted = pickup._fit_cell("标题很长需要省略", 8, ellipsis=True)
+        self.assertTrue(fitted.rstrip().endswith("..."))
+        self.assertEqual(pickup._text_width(fitted), 8)
+        short = pickup._fit_cell("短", 8, ellipsis=True)
+        self.assertEqual(short.rstrip(), "短")
+        self.assertEqual(pickup._text_width(short), 8)
 
     def test_preview_renders_messages_as_chronological_chat(self) -> None:
         messages = [
@@ -2251,11 +2255,11 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(store.all_sessions()[2]["mtime"], 100)
 
 class NavStub:
-    """`_new_session_cwd` 只需要 `project_key` 属性；界面层真实用的是
+    """`_new_session_cwd` 只需要 `project_query` 属性；界面层真实用的是
     `ui.nav.NavState`，测试这里用一个最小 stub 避免依赖 ui 包。"""
 
-    def __init__(self, project_key: str | None = None) -> None:
-        self.project_key = project_key
+    def __init__(self, project_query: str = "") -> None:
+        self.project_query = project_query
 
 
 class ProjectSidebarTests(unittest.TestCase):
@@ -2328,14 +2332,52 @@ class ProjectSidebarTests(unittest.TestCase):
         sessions = [{"cwd": "/a/x", "mtime": 1}]
         self.assertEqual(pickup._filter_sessions(sessions, None), sessions)
 
-    def test_new_session_cwd_prefers_selected_project_over_session(self) -> None:
+    def test_fuzzy_match_case_insensitive_substring_and_subsequence(self) -> None:
+        self.assertTrue(pickup._fuzzy_match("proxy", "ProxyAgent"))
+        self.assertTrue(pickup._fuzzy_match("PROXY", "ProxyAgent"))
+        self.assertTrue(pickup._fuzzy_match("pxy", "ProxyAgent"))
+        self.assertTrue(pickup._fuzzy_match("界面", "侧边栏界面打磨"))
+        self.assertFalse(pickup._fuzzy_match("zzz", "ProxyAgent"))
+        self.assertTrue(pickup._fuzzy_match("", "anything"))
+
+    def test_filter_sessions_by_query_matches_project_and_title(self) -> None:
+        sessions = [
+            {"source": "claude", "id": "1", "cwd": "/x/ProxyAgent", "fallback_title": "节点"},
+            {"source": "claude", "id": "2", "cwd": "/x/pickup", "fallback_title": "界面打磨"},
+            {"source": "claude", "id": "3", "cwd": "/x/other", "fallback_title": "无关"},
+        ]
+        by_project = pickup._filter_sessions_by_query(sessions, "pRoXy")
+        self.assertEqual([s["id"] for s in by_project], ["1"])
+        by_title = pickup._filter_sessions_by_query(sessions, "界面")
+        self.assertEqual([s["id"] for s in by_title], ["2"])
+        self.assertEqual(pickup._filter_sessions_by_query(sessions, ""), sessions)
+
+    def test_new_session_cwd_uses_unique_project_from_query(self) -> None:
         store = mock.Mock()
-        nav = NavStub(project_key="/proj/a")
+        store.all_sessions.return_value = [
+            {"source": "claude", "id": "1", "cwd": "/proj/a", "fallback_title": "a1"},
+            {"source": "claude", "id": "2", "cwd": "/proj/a", "fallback_title": "a2"},
+            {"source": "claude", "id": "3", "cwd": "/proj/b", "fallback_title": "b1"},
+        ]
+        store.display_titles = {}
+        nav = NavStub(project_query="proj/a")
         session = {"cwd": "/proj/other"}
 
         self.assertEqual(pickup._new_session_cwd(store, nav, session), "/proj/a")
 
-    def test_new_session_cwd_falls_back_to_session_cwd_when_all_projects(self) -> None:
+    def test_new_session_cwd_falls_back_to_session_cwd_when_query_ambiguous(self) -> None:
+        store = mock.Mock()
+        store.all_sessions.return_value = [
+            {"source": "claude", "id": "1", "cwd": "/proj/a", "fallback_title": "x"},
+            {"source": "claude", "id": "2", "cwd": "/proj/b", "fallback_title": "x"},
+        ]
+        store.display_titles = {}
+        nav = NavStub(project_query="proj")
+        session = {"cwd": "/proj/session"}
+
+        self.assertEqual(pickup._new_session_cwd(store, nav, session), "/proj/session")
+
+    def test_new_session_cwd_falls_back_to_session_cwd_when_empty_query(self) -> None:
         store = mock.Mock()
         nav = NavStub()
         session = {"cwd": "/proj/session"}
@@ -2347,12 +2389,6 @@ class ProjectSidebarTests(unittest.TestCase):
         nav = NavStub()
 
         self.assertIsNone(pickup._new_session_cwd(store, nav, None))
-
-    def test_new_session_cwd_unknown_project_returns_none(self) -> None:
-        store = mock.Mock()
-        nav = NavStub(project_key="")
-
-        self.assertIsNone(pickup._new_session_cwd(store, nav, {"cwd": "/should/not/use"}))
 
 
 class TmuxRequirementTests(unittest.TestCase):
@@ -2832,6 +2868,124 @@ class AgentApiTests(unittest.TestCase):
         result = agent_api.cmd_describe(args, registry=None)
         search_flags = [flag for arg in result["data"]["args"] for flag in arg["flags"]]
         self.assertIn("--live", search_flags)
+
+
+class CursorScanTests(unittest.TestCase):
+    """Cursor CLI：~/.cursor/chats/<ws>/<chatId>/meta.json + prompt_history + store.db。"""
+
+    def _chat(
+        self,
+        root: Path,
+        ws: str,
+        chat_id: str,
+        *,
+        title: str,
+        cwd: str,
+        updated_ms: int,
+        prompts: list[str],
+        has_conversation: bool = True,
+    ) -> Path:
+        d = root / ws / chat_id
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "createdAtMs": updated_ms - 1000,
+                    "updatedAtMs": updated_ms,
+                    "hasConversation": has_conversation,
+                    "title": title,
+                    "cwd": cwd,
+                }
+            ),
+            encoding="utf-8",
+        )
+        if prompts:
+            (d / "prompt_history.json").write_text(
+                json.dumps(prompts, ensure_ascii=False), encoding="utf-8"
+            )
+        return d
+
+    def test_scan_sessions_reads_meta_and_prompt_history(self) -> None:
+        import scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = str(root / "proj")
+            Path(cwd).mkdir()
+            self._chat(
+                root,
+                "ws1",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                title="Cursor CLI Support",
+                cwd=cwd,
+                updated_ms=1_700_000_000_000,
+                prompts=["最新一句", "最早一句"],
+            )
+            self._chat(
+                root,
+                "ws1",
+                "empty-chat",
+                title="",
+                cwd=cwd,
+                updated_ms=1_700_000_000_100,
+                prompts=[],
+                has_conversation=False,
+            )
+            with mock.patch.object(scan_cursor, "CHATS_DIR", str(root)), mock.patch.object(
+                scan_cursor, "live_pids_by_process_name", return_value={}
+            ):
+                sessions = scan_cursor.scan_sessions(limit=10)
+            self.assertEqual(len(sessions), 1)
+            s = sessions[0]
+            self.assertEqual(s["source"], "cursor")
+            self.assertEqual(s["id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            self.assertEqual(s["native_title"], "Cursor CLI Support")
+            self.assertEqual(s["cwd"], cwd)
+            self.assertEqual(s["last_user_msg"], "最新一句")
+            self.assertEqual(s["first_user_msg"], "最早一句")
+            self.assertTrue(s["path"].endswith(s["id"]) or s["path"].endswith("store.db"))
+
+    def test_load_conversation_extracts_user_query_and_assistant(self) -> None:
+        import scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            chat = Path(td) / "chat"
+            chat.mkdir()
+            db = chat / "store.db"
+            conn = sqlite3.connect(str(db))
+            conn.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            user_blob = json.dumps(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<user_query>\n帮我加上cursor-cli支持\n</user_query>",
+                        }
+                    ],
+                }
+            ).encode()
+            asst_blob = json.dumps(
+                {
+                    "role": "assistant",
+                    "content": "先摸清现有运行时适配器的模式",
+                }
+            ).encode()
+            conn.execute("INSERT INTO blobs VALUES ('u1', ?)", (user_blob,))
+            conn.execute("INSERT INTO blobs VALUES ('a1', ?)", (asst_blob,))
+            conn.execute("INSERT INTO blobs VALUES ('bin1', ?)", (b"\n\x20not-json",))
+            conn.commit()
+            conn.close()
+            messages = scan_cursor.load_conversation(str(chat))
+            self.assertEqual(
+                [(m.role, m.text) for m in messages],
+                [
+                    ("user", "帮我加上cursor-cli支持"),
+                    ("assistant", "先摸清现有运行时适配器的模式"),
+                ],
+            )
 
 
 class StartupLatencyTests(unittest.TestCase):

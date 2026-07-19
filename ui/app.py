@@ -24,14 +24,17 @@ class PickupApp(App):
     # 类和弹窗菜单项上关闭 ALLOW_SELECT；EmbedPane 画面不会被动态增删，不受
     # 这条限制，保留选择能力。
     CSS = """
-    #list-header {
+    #project-search {
         height: 1;
+        margin: 0;
+        border: none;
+        padding: 0 1;
         color: white;
         background: $primary-darken-2;
     }
 
-    #session-list > ListItem {
-        margin-bottom: 1;
+    #project-search:focus {
+        background: $primary-darken-1;
     }
     """
 

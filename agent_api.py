@@ -527,6 +527,37 @@ def cmd_describe(args, registry) -> dict:
     return _ok({"commands": [_describe_command(spec, full=False) for spec in COMMANDS]})
 
 
+def cmd_diagnose(args, registry) -> dict:
+    """只读诊断：缓存路径、日志是否存在、runtime 配色自检、tmux 版本。不启动 TUI。"""
+    import embed
+    import observe
+    import pickup
+
+    shots_dir = os.path.join(observe.CACHE_DIR, observe.SCREENSHOTS_DIR_NAME)
+    tmux_version = None
+    try:
+        ver = embed._tmux_version()
+        tmux_version = list(ver) if ver is not None else None
+    except Exception:
+        tmux_version = None
+    return _ok({
+        "cache_dir": observe.CACHE_DIR,
+        "events_log": observe.EVENTS_LOG,
+        "events_log_exists": os.path.isfile(observe.EVENTS_LOG),
+        "embed_error_log": observe.EMBED_ERROR_LOG,
+        "embed_error_log_exists": os.path.isfile(observe.EMBED_ERROR_LOG),
+        "screenshots_dir": shots_dir,
+        "debug": bool(os.environ.get("PICKUP_DEBUG")),
+        "runtime_label_style_claude": pickup.runtime_label_style("claude"),
+        "tmux_version": tmux_version,
+        "hints": [
+            "界面异常时先看 events.log / embed-error.log",
+            "TUI 内按 F12 导出当前截图到 screenshots_dir",
+            "改源码后需 pip install --user --force-reinstall --no-deps . 并重启 TUI",
+        ],
+    })
+
+
 def _describe_command(spec: dict, full: bool) -> dict:
     entry = {
         "name": spec["name"],
@@ -546,7 +577,7 @@ COMMANDS = [
         "name": "list",
         "help": "结构化列出已注册运行时的会话",
         "args": [
-            {"flags": ["--runtime"], "kwargs": {"help": "只看指定运行时（claude / codex / opencode / kimi）"}},
+            {"flags": ["--runtime"], "kwargs": {"help": "只看指定运行时（claude / codex / opencode / kimi / cursor）"}},
             {"flags": ["--limit"], "kwargs": {"type": int, "default": 50, "help": "每个运行时最多扫描多少条历史（扫描深度）"}},
             {"flags": ["--top"], "kwargs": {"type": int, "help": "最多返回多少条结果；不影响扫描深度"}},
             {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON，并默认只返回常用字段"}},
@@ -556,7 +587,7 @@ COMMANDS = [
             {"flags": ["--fields"], "kwargs": {"help": "逗号分隔的字段名，只返回这些字段"}},
         ],
         "fields": {
-            "runtime": "运行时标识（claude / codex / opencode / kimi）",
+            "runtime": "运行时标识（claude / codex / opencode / kimi / cursor）",
             "id": "会话完整 ID",
             "short_id": "会话短 ID（前 8 位）",
             "title": "会话标题（缓存的生成标题或本地兜底标题，不触发新生成）",
@@ -667,6 +698,23 @@ COMMANDS = [
         ],
         "fields": {},
     },
+    {
+        "name": "diagnose",
+        "help": "只读诊断 TUI/缓存可观测性路径（events.log、embed-error.log、截图目录、tmux）；不启动界面",
+        "args": [],
+        "fields": {
+            "cache_dir": "本地缓存目录（默认 ~/.cache/pickup）",
+            "events_log": "结构化事件日志路径",
+            "events_log_exists": "events.log 是否已存在",
+            "embed_error_log": "后台异常 traceback 日志路径",
+            "embed_error_log_exists": "embed-error.log 是否已存在",
+            "screenshots_dir": "F12 截图输出目录",
+            "debug": "当前是否开启 PICKUP_DEBUG",
+            "runtime_label_style_claude": "配色自检样例（应为 bold #D97757）",
+            "tmux_version": "探测到的 tmux 版本三元组或 null",
+            "hints": "给 Agent/维护者的下一步排查提示",
+        },
+    },
 ]
 
 HANDLERS = {
@@ -676,6 +724,7 @@ HANDLERS = {
     "context": cmd_context,
     "plan continue": cmd_plan_continue,
     "describe": cmd_describe,
+    "diagnose": cmd_diagnose,
 }
 
 COMMAND_NAMES = tuple(spec["name"] for spec in COMMANDS)

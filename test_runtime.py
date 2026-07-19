@@ -297,9 +297,31 @@ class RuntimeTests(unittest.TestCase):
                 LaunchRequest(session, "gemini", "验证扩展能力")
             )
 
-        self.assertEqual(registry.ids, ("claude", "codex", "opencode", "kimi", "gemini"))
+        self.assertEqual(registry.ids, ("claude", "codex", "opencode", "kimi", "cursor", "gemini"))
         self.assertEqual(plan.argv[0], "gemini")
         self.assertIn("验证扩展能力", plan.argv[-1])
+
+    def test_cursor_resume_plan(self) -> None:
+        registry = default_registry()
+        session = self._session("cursor", "/tmp/chat-dir", "/tmp/not-exists")
+        session["id"] = "chat-1"
+
+        plan = registry.build_launch_plan(LaunchRequest(session, "cursor", "继续"))
+
+        self.assertEqual(plan.argv, ("agent", "--force", "--resume", "chat-1"))
+        self.assertIsNone(plan.cwd)
+
+    def test_default_registry_includes_cursor(self) -> None:
+        reg = default_registry()
+        self.assertIn("cursor", reg.ids)
+        self.assertEqual(reg.get("cursor").executable, "agent")
+
+    def test_passthrough_pads_force_once_for_cursor(self) -> None:
+        reg = default_registry()
+        plan = reg.build_passthrough_plan("cursor", ["--model", "auto"])
+        self.assertEqual(plan.argv[:3], ("agent", "--force", "--model"))
+        plan2 = reg.build_passthrough_plan("cursor", ["--force", "hi"])
+        self.assertEqual(plan2.argv.count("--force"), 1)
 
     def test_claude_new_session_plan_has_no_handoff_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as td:

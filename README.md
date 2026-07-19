@@ -3,22 +3,19 @@
 [![test](https://github.com/x0c/pickup/actions/workflows/test.yml/badge.svg)](https://github.com/x0c/pickup/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Fast terminal session picker for Claude Code, Codex CLI, OpenCode, and Kimi Code CLI.
+Fast terminal session picker for Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and Cursor Agent CLI.
 
-`pickup` scans your local Claude Code, Codex CLI, OpenCode, and Kimi Code CLI history, shows recent coding sessions in a terminal UI (built with [Textual](https://github.com/Textualize/textual)), and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
+`pickup` scans your local Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and Cursor Agent CLI history, shows recent coding sessions in a terminal UI (built with [Textual](https://github.com/Textualize/textual)), and lets you resume the selected session in its native runtime. It can also hand off a session from one runtime to another (e.g. Claude to Codex, or OpenCode to Claude) by starting a new target session with a structured pointer to the original history.
 
 Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manager, Kimi Code CLI session manager, terminal TUI, AI coding agent workflow, JSONL chat history, cross-runtime handoff.
 
-![Session list across Claude Code and Codex CLI](docs/screenshots/list.png)
-
-![Full-screen conversation preview](docs/screenshots/preview.png)
+![Session list with right-pane conversation preview](docs/screenshots/list.png)
 
 ## Why Use It
 
-- Browse recent Claude Code, Codex CLI, OpenCode, and Kimi Code CLI sessions from one terminal screen.
-- Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, `opencode -s <id>`, and `kimi -S <id>`.
-- Preview the user messages and final assistant replies before resuming, each with a timestamp when
-  the history format has one; the preview page refreshes automatically while a session keeps writing.
+- Browse recent Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and Cursor Agent CLI sessions from one terminal screen.
+- Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, `opencode -s <id>`, and `kimi -S <id>`, and `agent --resume`.
+- Select a finished session to preview the full conversation in the right pane (live/hosted sessions show the embedded terminal instead); message timestamps appear when the history format has them.
 - Hand off unfinished work between runtimes without rewriting or faking session files.
 - Keep generated titles in a local cache so repeat launches stay fast.
 - Use JSON output for scripts and launchers.
@@ -27,7 +24,7 @@ Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manage
 
 The tool is local-first.
 
-- It reads local history under `~/.claude/projects/`, `~/.codex/sessions/`, `~/.kimi-code/sessions/`, and (read-only) OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`.
+- It reads local history under `~/.claude/projects/`, `~/.codex/sessions/`, `~/.kimi-code/sessions/`, `~/.cursor/chats/`, and (read-only) OpenCode's SQLite database at `~/.local/share/opencode/opencode.db`.
 - It does not upload session history by itself.
 - Cross-runtime handoff passes the original history file path to the target runtime instead of copying the whole conversation into command-line arguments.
 - Optional title generation calls the preferred installed agent CLI (Claude Code first, then Codex) and may consume its account quota.
@@ -151,7 +148,7 @@ around when their content updates; only genuinely new sessions appear, always pr
 ## Direct Launch
 
 `pickup claude [args...]`, `pickup codex [args...]`, `pickup opencode [args...]`, and
-`pickup kimi [args...]` start a brand-new session
+`pickup kimi [args...]`, and `pickup cursor [args...]` start a brand-new session
 directly. In a real terminal they open the same sidebar TUI with the new session already hosted in
 the right-hand pane, so the fresh agent is one `Esc` away from your full history; outside a real
 terminal (piped/scripted) or with `--no-keepalive` they take over the terminal the classic way
@@ -233,15 +230,14 @@ agent workflows.
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` / `j` / `k` | Move selection |
-| `f` | Cycle the project filter (all projects first) |
+| `/` | Focus the project search box (case-insensitive fuzzy match on project name and session title) |
 | `p` | Pin or unpin the right-hand detail pane |
-| `Space` | Open full-screen conversation preview |
-| `Home` / `End` | Jump in preview |
+| `Home` / `End` | Jump in the right-pane conversation preview |
 | `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background); on the pinned first row `＋ 新建会话`, start the new-session flow instead |
 | `a` | Open advanced handoff actions |
 | `n` | New blank session in the current project with the current runtime (no prompts) |
 | `x` | Close a backgrounded (keep-alive) session, with confirmation |
-| `Esc` | Close preview/dialog or quit |
+| `Esc` | Clear search / close dialog, or quit |
 
 `pickup` waits briefly for an escape sequence to complete, so `Esc` can close the current
 view without breaking arrow keys.
@@ -284,7 +280,7 @@ session picker still works.
 | Path | Purpose |
 | --- | --- |
 | `pickup.py` | session store/data layer, formatting helpers, direct-launch subcommand dispatch, and process handoff; entry point delegates the UI to `ui.app.run_app()` |
-| `ui/` | Textual UI package: main screen (session list + embedded pane), full-screen preview, modals, session-list widget |
+| `ui/` | Textual UI package: main screen (session list + right-pane conversation/embed), modals, session-list widget |
 | `embed.py` | embedded-pane host: renders hosted tmux sessions (`capture-pane` out, `send-keys` in), SGR parsing; framework-neutral rendering via `cell_style`/`grid_to_text` (Rich styles) |
 | `agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` subcommands for agents |
 | `keepalive.py` | tmux-backed launch wrapper: keep-alive on/off detection, wrap/attach launch plans, idle reaping (config for the dedicated tmux server is inlined here, not a separate file — see maintainer notes) |
@@ -294,6 +290,7 @@ session picker still works.
 | `scan_codex.py` | Codex CLI history scanner |
 | `scan_opencode.py` | OpenCode history scanner (read-only SQLite queries) |
 | `scan_kimi.py` | Kimi Code CLI history scanner (`~/.kimi-code/sessions/` wire.jsonl) |
+| `scan_cursor.py` | Cursor Agent CLI history scanner (`~/.cursor/chats/`) |
 | `titles.py` | local title fallback, cache, status labels, and batch generation |
 | `docs/SKILL.md` | agent-facing command reference (SKILL.md convention) |
 | `test_*.py` | unit tests |
@@ -303,7 +300,7 @@ session picker still works.
 Run the same checks used by CI:
 
 ```bash
-python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py ui/*.py test_*.py
+python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_cursor.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py ui/*.py test_*.py
 python3 -m unittest -v
 ```
 

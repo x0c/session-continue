@@ -1,7 +1,7 @@
 """跨扫描器共享的纯函数 helper。
 
-各运行时扫描器（scan_claude.py/scan_codex.py/scan_opencode.py/scan_kimi.py）
-互不依赖，但各自都需要几个完全相同的小工具函数；集中到这里避免四份重复实现
+各运行时扫描器（scan_claude.py/scan_codex.py/scan_opencode.py/scan_kimi.py/scan_cursor.py）
+互不依赖，但各自都需要几个完全相同的小工具函数；集中到这里避免多份重复实现
 各自演进出细微差异。这里只放无状态、无副作用的纯函数，运行时私有的解析格式
 仍留在各自的 scan_*.py 里。
 """

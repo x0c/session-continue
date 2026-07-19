@@ -339,6 +339,17 @@ class AgentApiTests(unittest.TestCase):
     def test_commands_spec_and_handlers_are_in_sync(self) -> None:
         self.assertEqual(set(agent_api.COMMAND_NAMES), set(agent_api.HANDLERS))
 
+    def test_diagnose_is_readonly_and_reports_paths(self) -> None:
+        args = argparse_namespace()
+        result = agent_api.cmd_diagnose(args, self.registry)
+        self.assertTrue(result["ok"])
+        data = result["data"]
+        self.assertIn("cache_dir", data)
+        self.assertIn("events_log", data)
+        self.assertIn("embed_error_log", data)
+        self.assertEqual(data["runtime_label_style_claude"], "bold #D97757")
+        self.assertIsInstance(data["hints"], list)
+
     # ---- dispatch: envelope + exit codes end-to-end ----
 
     def test_dispatch_ok_envelope_and_exit_code(self) -> None:

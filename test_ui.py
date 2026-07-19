@@ -14,6 +14,7 @@ embed.* 调用）：项目已有的 embed.py 单测负责纯函数层，selftest
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 import threading
@@ -26,11 +27,11 @@ from models import LaunchPlan
 from textual import events
 from textual.color import Color
 from textual.geometry import Offset, Size
+from textual.widgets import Input, ListItem
 from ui.app import PickupApp
 from ui.embed_pane import EmbedPane
 from ui.modals import ConfirmModal, PickMenuModal, RuntimePickerModal
-from ui.preview_screen import PreviewScreen
-from ui.session_list import SessionCard, SessionListView
+from ui.session_list import NEW_SESSION_ID, SessionCard, SessionListView
 
 HAS_TMUX = shutil.which("tmux") is not None
 
@@ -142,6 +143,36 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(delay=0.2)
             self.assertEqual(app.theme, "textual-dark")
 
+    async def test_f12_saves_screenshot_under_cache(self) -> None:
+        import observe
+        import tempfile
+
+        store, _ = _make_store()
+        with tempfile.TemporaryDirectory() as tmp:
+            events_path = os.path.join(tmp, "events.log")
+            with (
+                mock.patch.object(observe, "CACHE_DIR", tmp),
+                mock.patch.object(observe, "EVENTS_LOG", events_path),
+                mock.patch.object(observe, "EMBED_ERROR_LOG", os.path.join(tmp, "embed-error.log")),
+            ):
+                observe.reset_for_tests()
+                observe.init(debug=False)
+                app = PickupApp(store, embed_ok=False)
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.pause(delay=0.2)
+                    # 直接调 action，避免 Pilot 对 F12 键名在部分环境下不派发到 Screen。
+                    app.screen.action_save_screenshot()
+                    await pilot.pause(delay=0.2)
+                    keys = {b.key for b in app.screen.BINDINGS}
+                    self.assertIn("f12", keys)
+                shots = os.path.join(tmp, "screenshots")
+                files = os.listdir(shots) if os.path.isdir(shots) else []
+                self.assertTrue(any(name.endswith(".svg") for name in files), files)
+                self.assertTrue(os.path.isfile(events_path))
+                with open(events_path, encoding="utf-8") as fh:
+                    body = fh.read()
+                self.assertIn('"name": "screenshot"', body)
+
     async def test_embed_pane_background_matches_real_terminal_bg(self) -> None:
         """回归测试：内嵌 Agent 画面里的"默认背景"格子（tmux 报 bg=-1）必须垫在
         外层终端真实底色上，不能透出 Textual 主题的中性灰——否则整个托管画面看
@@ -218,30 +249,39 @@ class SessionStoreFailureTests(unittest.IsolatedAsyncioTestCase):
         app = PickupApp(store, embed_ok=False)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.1)
-            header = app.screen.query_one("#list-header")
-            self.assertIn("会话加载失败", str(header.content))
-            self.assertIn("正在自动重试", str(header.content))
+            search = app.screen.query_one("#project-search", Input)
+            self.assertIn("会话加载失败", search.placeholder)
+            self.assertIn("正在自动重试", search.placeholder)
 
             self.assertFalse(store.refresh())
             self.assertIsNone(store.get_load_error())
             app.screen._update_header()
-            self.assertNotIn("失败", str(header.content))
-            self.assertNotIn("正在自动重试", str(header.content))
+            self.assertNotIn("失败", search.placeholder)
+            self.assertNotIn("正在自动重试", search.placeholder)
 
 
 class SessionCardVisualTests(unittest.TestCase):
     """侧边栏两行卡片的列布局和状态样式不能随刷新优化再次回退。"""
 
     @staticmethod
-    def _card(*, live=False, keepalive_name=None, generating=False) -> SessionCard:
-        runtime = mock.Mock(display_name="OpenCode")
+    def _card(
+        *,
+        live=False,
+        keepalive_name=None,
+        generating=False,
+        source="opencode",
+        display_name="OpenCode",
+        display_title="修复侧边栏展示",
+        cwd="/tmp/pickup",
+    ) -> SessionCard:
+        runtime = mock.Mock(id=source, display_name=display_name)
         store = mock.Mock()
         store.registry.get.return_value = runtime
         session = {
-            "source": "opencode",
+            "source": source,
             "id": "visual-check",
-            "fallback_title": "修复侧边栏展示",
-            "cwd": "/tmp/pickup",
+            "fallback_title": display_title,
+            "cwd": cwd,
             "mtime": time.time(),
             "live": live,
         }
@@ -251,35 +291,83 @@ class SessionCardVisualTests(unittest.TestCase):
             session,
             store,
             "◐",
-            display_title="修复侧边栏展示",
+            display_title=display_title,
             is_generating=generating,
         )
 
     def test_runtime_is_right_aligned_on_first_line_at_fixed_width(self) -> None:
         card = self._card()
         with mock.patch.object(
-            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(44, 2),
+            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 2),
         ):
             rendered = card.render()
 
         first_line, second_line = rendered.plain.splitlines()
         self.assertTrue(first_line.endswith("OpenCode"))
         self.assertNotIn("OpenCode", second_line)
-        self.assertEqual(pickup._text_width(first_line), 44)
-        self.assertEqual(pickup._text_width(second_line), 44)
+        self.assertEqual(pickup._text_width(first_line), 39)
+        self.assertEqual(pickup._text_width(second_line), 39)
         relative_time = pickup._format_relative_time(card.session["mtime"])
         self.assertTrue(second_line.endswith(relative_time))
+
+    def test_long_title_uses_ellipsis_before_runtime_name(self) -> None:
+        card = self._card(
+            display_title="这是一个非常非常非常长的侧边栏标题用来验证省略",
+        )
+        with mock.patch.object(
+            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 2),
+        ):
+            rendered = card.render()
+
+        first_line = rendered.plain.splitlines()[0]
+        self.assertTrue(first_line.endswith("OpenCode"))
+        title_part = first_line[: -len("OpenCode")]
+        self.assertIn("...", title_part)
+        self.assertEqual(pickup._text_width(first_line), 39)
+
+    def test_runtime_label_uses_distinct_brand_colors(self) -> None:
+        cases = (
+            ("claude", "Claude", "#D97757"),
+            ("codex", "Codex", "#60A5FA"),
+            ("cursor", "Cursor", "#A78BFA"),
+            ("kimi", "Kimi", "#F472B6"),
+            ("opencode", "OpenCode", "#34D399"),
+        )
+        for source, display_name, color in cases:
+            card = self._card(source=source, display_name=display_name)
+            with self.subTest(source=source), mock.patch.object(
+                SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 2),
+            ):
+                rendered = card.render()
+            runtime_start = rendered.plain.index(display_name)
+            runtime_spans = [
+                span for span in rendered.spans
+                if span.start <= runtime_start < span.end
+            ]
+            self.assertTrue(
+                any(color.lower() in str(span.style).lower() for span in runtime_spans),
+                f"{source} runtime should use {color}, spans={runtime_spans}",
+            )
+            self.assertTrue(
+                any("bold" in str(span.style).lower() for span in runtime_spans),
+                f"{source} runtime label should be bold, spans={runtime_spans}",
+            )
 
     def test_generating_title_keeps_spinner_without_bold(self) -> None:
         card = self._card(generating=True)
         with mock.patch.object(
-            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(44, 2),
+            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 2),
         ):
             rendered = card.render()
 
-        first_line_end = rendered.plain.index("\n")
+        first_line = rendered.plain.splitlines()[0]
+        runtime_start = first_line.rfind("OpenCode")
         self.assertTrue(rendered.plain.startswith("◐ "))
-        title_spans = [span for span in rendered.spans if span.start < first_line_end]
+        # 只断言标题段不加粗；右上角 runtime 名允许 bold + 配色。
+        title_spans = [
+            span for span in rendered.spans
+            if span.start < runtime_start and span.end <= runtime_start
+        ]
         self.assertFalse(any("bold" in str(span.style) for span in title_spans))
 
     def test_running_status_is_green_but_ended_status_is_not(self) -> None:
@@ -290,7 +378,7 @@ class SessionCardVisualTests(unittest.TestCase):
         )
         for card, status_text, expected_green in cases:
             with self.subTest(status=status_text), mock.patch.object(
-                SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(44, 2),
+                SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 2),
             ):
                 rendered = card.render()
 
@@ -306,56 +394,91 @@ class SessionCardVisualTests(unittest.TestCase):
 
 
 class SidebarVisualLayoutTests(unittest.IsolatedAsyncioTestCase):
-    async def test_header_and_card_spacing_are_explicit(self) -> None:
+    async def test_search_and_card_spacing_are_explicit(self) -> None:
         store, _ = _make_store()
         app = PickupApp(store, embed_ok=False)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.2)
-            header = app.screen.query_one("#list-header")
+            search = app.screen.query_one("#project-search", Input)
             list_view = app.screen.query_one(SessionListView)
             items = list(list_view.children)
             cards = list(app.screen.query(SessionCard))
 
-            self.assertEqual(header.styles.color, Color.parse("white"))
+            self.assertEqual(search.styles.color, Color.parse("white"))
             self.assertGreaterEqual(len(items), 3)
-            self.assertEqual(items[1].region.y - items[0].region.bottom, 1)
-            self.assertEqual(items[2].region.y - items[1].region.bottom, 1)
+            # 分隔空行画在卡片自身内，两项 region 紧挨、无外边距空隙
+            self.assertEqual(items[1].region.y - items[0].region.bottom, 0)
+            self.assertEqual(items[2].region.y - items[1].region.bottom, 0)
             self.assertTrue(cards)
-            self.assertTrue(all(card.region.height == 2 for card in cards))
+            self.assertTrue(all(card.region.height == 3 for card in cards))
+            from ui.session_list import NewSessionCard
+            new_card = app.screen.query_one(NewSessionCard)
+            self.assertEqual(new_card.region.height, 2)
 
 
 class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_initial_selection_and_project_filter_cycle(self) -> None:
-        """回归测试：project_key 曾经在 SessionListView 和 MainScreen.nav 上各存
-        一份、互不同步——按 f 筛选后，实际过滤生效（session_list 内部那份变了）
-        但页头文案（读 nav.project_key）继续显示"全部项目"，两者对不上（真机
-        跑 selftest.sh 才暴露，headless 测试当时只断言了内部状态，没断言页头
-        渲染文本，因此没拦住）。这里必须同时断言页头渲染文本，不能只看内部值。
-        """
-        store, _ = _make_store()
+    async def test_initial_selection_and_project_search_filter(self) -> None:
+        """侧边栏顶部搜索框：大小写无关模糊匹配项目名，并同步过滤会话列表。"""
+        sessions = [
+            {
+                "source": "claude", "id": "a", "short_id": "a",
+                "mtime": time.time(), "size_bytes": 1, "size_kb": 1,
+                "native_title": None, "fallback_title": "节点选择",
+                "cwd": "/Users/x/ProxyAgent", "live": False,
+            },
+            {
+                "source": "claude", "id": "b", "short_id": "b",
+                "mtime": time.time() - 10, "size_bytes": 1, "size_kb": 1,
+                "native_title": None, "fallback_title": "界面打磨",
+                "cwd": "/Users/x/pickup", "live": False,
+            },
+            {
+                "source": "claude", "id": "c", "short_id": "c",
+                "mtime": time.time() - 20, "size_bytes": 1, "size_kb": 1,
+                "native_title": None, "fallback_title": "字幕优化",
+                "cwd": "/Users/x/LiveCaptionMac", "live": False,
+            },
+        ]
+        store, _ = _make_store(sessions=sessions)
         app = PickupApp(store, embed_ok=False)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.2)
             list_view = app.screen.query_one(SessionListView)
-            header = app.screen.query_one("#list-header")
+            search = app.screen.query_one("#project-search", Input)
             self.assertEqual(list_view.index, 0)  # 固定「+新建会话」项
             self.assertEqual(len(list_view.visible_sessions()), 3)
-            self.assertIn("全部项目", str(header.content))
+            self.assertIn("筛选项目", search.placeholder)
 
             await pilot.press("down")
             await pilot.pause()
             self.assertEqual(list_view.index, 1)
 
-            await pilot.press("f")
+            await pilot.press("slash")
             await pilot.pause()
-            self.assertEqual(list_view.nav.project_key, "/tmp")
-            self.assertIn("tmp", str(header.content))
-            self.assertNotIn("全部项目", str(header.content))
+            self.assertTrue(search.has_focus)
+            await pilot.press("p", "r", "o", "x", "y")
+            await pilot.pause()
+            self.assertEqual(list_view.nav.project_query, "proxy")
+            visible = list_view.visible_sessions()
+            self.assertEqual(len(visible), 1)
+            self.assertEqual(visible[0]["id"], "a")
+            self.assertIn("ProxyAgent", visible[0]["cwd"])
 
-            await pilot.press("f")
+            # 清空后恢复全部；Esc 在搜索框有内容时只清查询，不退出
+            await pilot.press("escape")
             await pilot.pause()
-            self.assertIsNone(list_view.nav.project_key)
-            self.assertIn("全部项目", str(header.content))
+            self.assertEqual(list_view.nav.project_query, "")
+            self.assertEqual(len(list_view.visible_sessions()), 3)
+            self.assertIsNone(app.return_value)
+
+            # 会话标题也可被模糊命中
+            search.focus()
+            await pilot.pause()
+            search.value = "界面"
+            await pilot.pause()
+            visible = list_view.visible_sessions()
+            self.assertEqual(len(visible), 1)
+            self.assertEqual(visible[0]["id"], "b")
 
     async def test_enter_without_embed_exits_with_launch_request(self) -> None:
         store, _ = _make_store()
@@ -390,6 +513,23 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(delay=0.2)
             card = app.screen.query(SessionCard).first()
             clicked = await pilot.click(card, offset=(5, 0))
+            await pilot.pause()
+            self.assertTrue(clicked)
+        self.assertIsInstance(app.return_value, pickup.LaunchRequest)
+
+    async def test_list_item_gap_padding_is_part_of_hit_area(self) -> None:
+        """卡片底部分隔空行画在 SessionCard/NewSessionCard 自身高度内，
+        点在空行上仍选中该会话（不要用 ListItem margin/padding 做分隔）。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        self.assertNotIn("margin-bottom:", PickupApp.CSS)
+        self.assertNotIn("padding-bottom:", PickupApp.CSS)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            card = app.screen.query(SessionCard).first()
+            self.assertEqual(card.region.height, 3)
+            # 点第三行空行，应等价于点该会话卡
+            clicked = await pilot.click(card, offset=(5, 2))
             await pilot.pause()
             self.assertTrue(clicked)
         self.assertIsInstance(app.return_value, pickup.LaunchRequest)
@@ -433,7 +573,7 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             "source": "claude", "id": "detail", "short_id": "detail",
             "mtime": 100.0, "size_bytes": 1, "size_kb": 1,
             "native_title": "旧标题", "fallback_title": "旧标题",
-            "cwd": "/tmp/pickup", "live": False,
+            "cwd": "/tmp/pickup", "live": False, "path": "/tmp/pickup-detail.jsonl",
             "first_user_msg": "旧首问", "last_user_msg": "旧问题",
             "last_agent_msg": "旧回复",
         }
@@ -448,6 +588,16 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
         runtime = mock.Mock(id="claude", display_name="Claude")
         runtime.scan_signature.return_value = None
         runtime.scan_sessions.side_effect = [[old_session], [new_session]]
+        runtime.load_conversation.side_effect = [
+            [
+                pickup.ConversationMessage("user", "旧问题"),
+                pickup.ConversationMessage("assistant", "旧回复"),
+            ],
+            [
+                pickup.ConversationMessage("user", "新问题"),
+                pickup.ConversationMessage("assistant", "新回复"),
+            ],
+        ]
         registry = pickup.RuntimeRegistry((runtime,))
         with (
             mock.patch.object(pickup.titles, "load_cache", return_value={}),
@@ -468,27 +618,32 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause(delay=0.2)
             await pilot.press("down")
-            await pilot.pause()
+            await pilot.pause(delay=0.3)
             screen = app.screen
             list_view = screen.query_one(SessionListView)
             pane = screen.query_one(EmbedPane)
             card_before = list_view._session_cards()[0]
-            self.assertIn("旧标题", pane.render().plain)
+            await _wait_until(lambda: "旧标题" in pane.render().plain)
             old_snapshot = store.sessions["claude"][0]
 
             with mock.patch.object(pickup.keepalive, "annotate"):
                 self.assertTrue(store.refresh())
+            # 历史 path 未变时对话缓存仍有效；清掉让右栏重新 warm 到新对话。
+            store.conversations.clear()
             await screen._rebuild_list()
+            await pilot.pause(delay=0.3)
 
             card_after = list_view._session_cards()[0]
             self.assertIs(card_after, card_before)
             self.assertIsNot(card_after.session, old_snapshot)
             self.assertEqual(card_after.session["mtime"], 200.0)
+            await _wait_until(lambda: "新标题" in pane.render().plain and "新问题" in pane.render().plain)
             detail = pane.render().plain
             self.assertIn("新标题", detail)
             self.assertIn("新问题", detail)
             self.assertIn("新回复", detail)
             self.assertNotIn("旧问题", detail)
+            self.assertNotIn("最近提问", detail)
 
     async def test_rebuild_falls_back_to_full_rebuild_when_session_set_changes(self) -> None:
         """回归测试：新增/删除会话导致集合真的变了时，`rebuild()` 必须仍然正确
@@ -575,7 +730,11 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         def delayed_host(*args, **kwargs):
             started.set()
-            release.wait(timeout=1.0)
+            # 全量套件下 Textual 调度可能挤占超过 1s；超时后若仍返回成功名，
+            # 会在测试替换 store 会话对象之前就 mark_hosted 旧 dict，随后
+            # dict(old, …) 把 keepalive_name 拷进新对象，断言两边都有名字。
+            if not release.wait(timeout=5.0):
+                raise TimeoutError("测试未能及时释放 delayed_host")
             return "pickup-claude-s0"
 
         app = PickupApp(store, embed_ok=True)
@@ -1011,120 +1170,38 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("x", pane.render().plain.split("DIRECT-HELLO")[-1])
 
 
-class PreviewScreenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_renders_messages_and_escape_closes(self) -> None:
+class RightPanePreviewTests(unittest.IsolatedAsyncioTestCase):
+    """选中即完整预览：右栏展示对话全文；Space 全屏预览已退役。"""
+
+    async def test_right_pane_shows_full_conversation_not_last_qa_blurb(self) -> None:
         store, _ = _make_store()
-        app = PickupApp(store, embed_ok=False)
-        async with app.run_test(size=(100, 30)) as pilot:
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            await pilot.press("down")
+            await pilot.pause(delay=0.3)
+            pane = app.screen.query_one(EmbedPane)
+
+            await _wait_until(lambda: "测试问题" in pane.render().plain and "测试回复" in pane.render().plain)
+            detail = pane.render().plain
+            self.assertIn("● 你", detail)
+            self.assertIn("测试问题", detail)
+            self.assertIn("测试回复", detail)
+            self.assertNotIn("最近提问", detail)
+            self.assertNotIn("最近回复", detail)
+
+    async def test_space_no_longer_opens_fullscreen_preview(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause(delay=0.2)
             await pilot.press("down")
             await pilot.press("space")
             await pilot.pause()
-            self.assertIsInstance(app.screen, PreviewScreen)
-            body = str(app.screen.query_one("#preview-body").content)
-            self.assertIn("测试问题", body)
-            self.assertIn("测试回复", body)
+            self.assertIs(app.screen, app.screen)
+            self.assertEqual(type(app.screen).__name__, "MainScreen")
 
-            await pilot.press("escape")
-            await pilot.pause()
-            self.assertNotIsInstance(app.screen, PreviewScreen)
-
-    async def test_poll_skips_static_update_when_content_and_width_unchanged(self) -> None:
-        """轮询改条件刷新后：会话内容和折行宽度都没变时，第二次
-        `_poll_updates()` 不应该再触发 `Static.update()`（后者带一次全量
-        re-layout，白跑一次是纯浪费）。"""
-        from textual.widgets import Static
-
-        store, _ = _make_store()
-        app = PickupApp(store, embed_ok=False)
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(delay=0.2)
-            await pilot.press("down")
-            await pilot.press("space")
-            await pilot.pause()
-            self.assertIsInstance(app.screen, PreviewScreen)
-
-            with mock.patch.object(Static, "update", autospec=True) as mock_update:
-                app.screen._poll_updates()
-                await pilot.pause()
-                mock_update.assert_not_called()
-
-    async def test_resize_forces_rerender_with_new_wrap_width_even_if_content_unchanged(self) -> None:
-        """隐性依赖：条件刷新只看「内容变没变」，但折行宽度是按当前终端宽度
-        算的——窗口 resize 时必须有显式钩子强制重新折行，否则文本会一直
-        保持旧宽度的断行（内容本身没变，轮询会一直跳过）。"""
-        from textual.widgets import Static
-
-        store, _ = _make_store()
-        app = PickupApp(store, embed_ok=False)
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(delay=0.2)
-            await pilot.press("down")
-            await pilot.press("space")
-            await pilot.pause()
-            screen = app.screen
-            self.assertIsInstance(screen, PreviewScreen)
-            first_width = screen._last_width
-            self.assertIsNotNone(first_width)
-
-            with mock.patch.object(Static, "update", autospec=True) as mock_update:
-                await pilot.resize_terminal(60, 30)
-                await pilot.pause(delay=0.2)
-                mock_update.assert_called()
-            self.assertNotEqual(screen._last_width, first_width)
-
-    async def test_history_scroll_position_survives_poll_new_message_and_resize(self) -> None:
-        store, _ = _make_store()
-        messages = [
-            pickup.ConversationMessage(
-                "user" if index % 2 == 0 else "assistant",
-                f"第 {index} 条很长的历史消息，用于确保预览区确实产生足够多的滚动内容。" * 2,
-            )
-            for index in range(40)
-        ]
-        store.get_conversation = mock.Mock(side_effect=lambda session: list(messages))
-        app = PickupApp(store, embed_ok=False)
-
-        async with app.run_test(size=(80, 20)) as pilot:
-            await pilot.pause(delay=0.2)
-            await pilot.press("down")
-            await pilot.press("space")
-            await pilot.pause(delay=0.2)
-            screen = app.screen
-            self.assertIsInstance(screen, PreviewScreen)
-            scroll = screen.query_one("#preview-scroll")
-            self.assertGreater(scroll.max_scroll_y, 0)
-
-            scroll.scroll_to(y=0, animate=False)
-            await pilot.pause()
-            screen._poll_updates()
-            self.assertFalse(screen._at_bottom)
-
-            with mock.patch.object(scroll, "scroll_end", wraps=scroll.scroll_end) as scroll_end:
-                messages.append(pickup.ConversationMessage("assistant", "刚刚新增的回复"))
-                screen._poll_updates()
-                await pilot.pause()
-                self.assertFalse(screen._at_bottom)
-                scroll_end.assert_not_called()
-
-                await pilot.resize_terminal(70, 18)
-                await pilot.pause(delay=0.2)
-                self.assertFalse(screen._at_bottom)
-                scroll_end.assert_not_called()
-
-    async def test_enter_dismisses_with_launch_request(self) -> None:
-        store, _ = _make_store()
-        app = PickupApp(store, embed_ok=False)
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(delay=0.2)
-            await pilot.press("down")
-            await pilot.press("space")
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-        self.assertIsInstance(app.return_value, pickup.LaunchRequest)
-
-    async def test_a_key_opens_handoff_modal_and_picks_target_runtime(self) -> None:
+    async def test_a_key_opens_handoff_modal_from_main_list(self) -> None:
         codex = mock.Mock()
         codex.id = "codex"
         codex.display_name = "Codex"
@@ -1135,8 +1212,6 @@ class PreviewScreenTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.2)
             await pilot.press("down")
-            await pilot.press("space")
-            await pilot.pause()
             await pilot.press("a")
             await pilot.pause()
             self.assertIsInstance(app.screen, RuntimePickerModal)

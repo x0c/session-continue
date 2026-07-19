@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pickup：终端会话接力工具。
 
-单列表格列出已注册运行时（Claude Code / Codex / OpenCode / Kimi Code）的最近会话，左右切换来源、
+单列表格列出已注册运行时（Claude Code / Codex / OpenCode / Kimi Code / Cursor）的最近会话，左右切换来源、
 上下选行。回车把会话内嵌到右半屏（托管在后台 tmux，左侧列表退化为窄栏，可多会话并行切换）；
 按 e 则走经典全屏接管。跨运行时可通过高级操作交给其他运行时接力。tmux 为硬依赖。
 
@@ -25,6 +25,7 @@
     pickup claude [参数…]     # 直启：新建 Claude 会话，参数原样透传，默认全自动放行+后台保活
     pickup codex [参数…]      # 直启：新建 Codex 会话，同上
     pickup kimi [参数…]       # 直启：新建 Kimi 会话，同上
+    pickup cursor [参数…]     # 直启：新建 Cursor 会话，同上
     pickup --no-keepalive claude [参数…]  # 直启但不包后台保活
 """
 
@@ -99,21 +100,55 @@ def _format_relative_time(mtime: float, now: float | None = None) -> str:
     return datetime.fromtimestamp(mtime).strftime("%m-%d %H:%M")
 
 
+# 侧边栏 / 详情里 runtime 名配色：按 id 高区分度着色（不必严格品牌色）。
+RUNTIME_LABEL_STYLES = {
+    "claude": "#D97757",
+    "codex": "#60A5FA",
+    "cursor": "#A78BFA",
+    "kimi": "#F472B6",
+    "opencode": "#34D399",
+}
+
+
+def runtime_label_style(runtime_id: str) -> str:
+    """Rich/Textual 样式串：已知 runtime 用粗体品牌区分色，未知回退 dim。"""
+    color = RUNTIME_LABEL_STYLES.get(str(runtime_id or ""))
+    return f"bold {color}" if color else "dim"
+
+
 def _char_width(ch: str) -> int:
-    # 与 `embed._char_width`、Rich/Textual 的渲染宽度表保持一致。
+    # 与 `embed._char_width`、Rich/Textual 的渲染宽度表保持一致（`rich.cells.cell_len`）：
+    # 自实现的 `unicodedata.east_asian_width` 在 emoji、组合字符、ambiguous-width
+    # 字符上会跟 Rich 的排版结果不一致，本项目同时用这两套计算（列表卡片排版
+    # 和内嵌画面渲染各自有一份），会导致 CJK/emoji 对齐错位。
     return _rich_cell_len(ch)
 
 
 def _text_width(text: str) -> int:
-    # 必须整段计算；ZWJ emoji 等 grapheme 逐字符求和会失真。
+    # cell_len 直接对整段文本计算（内部已经处理了宽字符/组合字符的展开），
+    # 比逐字符调用 cell_len 再求和更准也更省——逐字符调用在 emoji 等需要
+    # 上下文判断的场景下反而会算错。
     return _rich_cell_len(text)
 
 
-def _fit_cell(text: object, width: int) -> str:
-    """按终端显示宽度截断并补齐，避免中文和图标把表格列挤歪。"""
+def _fit_cell(text: object, width: int, *, ellipsis: bool = False) -> str:
+    """按终端显示宽度截断并补齐，避免中文和图标把表格列挤歪。
+
+    ellipsis=True 时，放不下的尾部换成 `...`（按显示宽度计算，CJK/emoji 安全）。
+    """
     if width <= 0:
         return ""
-    chunks = _rich_chop_cells(str(text), width)
+    raw = str(text)
+    if ellipsis and _text_width(raw) > width:
+        marker = "..."
+        if width <= _text_width(marker):
+            chunks = _rich_chop_cells(marker, width)
+            fitted = chunks[0] if chunks else ""
+        else:
+            body = (_rich_chop_cells(raw, width - _text_width(marker)) or [""])[0]
+            fitted = body + marker
+        return fitted + " " * (width - _text_width(fitted))
+    chunks = _rich_chop_cells(raw, width)
     fitted = chunks[0] if chunks else ""
     return fitted + " " * (width - _text_width(fitted))
 
@@ -247,11 +282,68 @@ def _project_groups(sessions_by_source: dict[str, list[dict]]) -> list[dict]:
     return sorted(groups.values(), key=lambda p: (-p["count"], -p["latest_mtime"], p["label"]))
 
 
+def _fuzzy_match(query: str, *texts: str) -> bool:
+    """大小写无关模糊匹配：子串包含，或查询字符按序出现（子序列）。
+
+    空查询视为匹配全部。用于侧边栏项目搜索框过滤会话。
+    """
+    needle = (query or "").casefold().strip()
+    if not needle:
+        return True
+    for raw in texts:
+        hay = (raw or "").casefold()
+        if not hay:
+            continue
+        if needle in hay:
+            return True
+        it = iter(hay)
+        if all(ch in it for ch in needle):
+            return True
+    return False
+
+
+def _session_project_label(session: dict) -> str:
+    """会话所属项目的展示名（cwd 末级目录；未知目录用统一文案）。"""
+    cwd_key = _normalize_cwd(session.get("cwd"))
+    if not cwd_key:
+        return str(session.get("cwd_display") or UNKNOWN_PROJECT_LABEL)
+    base = os.path.basename(cwd_key)
+    return base or str(session.get("cwd_display") or UNKNOWN_PROJECT_LABEL)
+
+
 def _filter_sessions(sessions: list[dict], cwd_key: str | None) -> list[dict]:
     """按归一化工作目录精确匹配过滤；cwd_key 为 None 时原样返回（不过滤）。"""
     if cwd_key is None:
         return sessions
     return [s for s in sessions if _normalize_cwd(s.get("cwd")) == cwd_key]
+
+
+def _filter_sessions_by_query(
+    sessions: list[dict],
+    query: str,
+    *,
+    titles: dict[str, str] | None = None,
+) -> list[dict]:
+    """按项目名/路径/会话标题做大小写无关模糊过滤；空查询不过滤。"""
+    needle = (query or "").strip()
+    if not needle:
+        return sessions
+    titles = titles or {}
+    out: list[dict] = []
+    for session in sessions:
+        cwd_key = _normalize_cwd(session.get("cwd"))
+        title = titles.get(session_key(session), "")
+        fallback = str(session.get("fallback_title") or "")
+        if _fuzzy_match(
+            needle,
+            _session_project_label(session),
+            cwd_key,
+            str(session.get("cwd_display") or ""),
+            title,
+            fallback,
+        ):
+            out.append(session)
+    return out
 
 
 class SessionStore:
@@ -301,8 +393,14 @@ class SessionStore:
             return 0.0
 
     def load(self) -> None:
+        import observe
+
         try:
+            t0 = time.perf_counter()
             scanned = self.registry.scan_all(self.limit)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            session_count = sum(len(items) for items in scanned.values())
+            observe.event("scan_all", duration_ms=duration_ms, session_count=session_count, reason="load")
             self._merge_scanned(scanned)
             with self.lock:
                 self.load_error = None
@@ -337,8 +435,14 @@ class SessionStore:
         与 load() 共用合并逻辑，唯一区别是返回「会话集合是否真的变了」，
         供调用方只在有变化时才 dirty.set()，避免主循环无谓重定位光标。
         """
+        import observe
+
         try:
+            t0 = time.perf_counter()
             scanned = self.registry.scan_all(self.limit)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            session_count = sum(len(items) for items in scanned.values())
+            observe.event("scan_all", duration_ms=duration_ms, session_count=session_count, reason="refresh")
             before = self._sessions_signature()
             self._merge_scanned(scanned)
             changed = self._sessions_signature() != before
@@ -543,6 +647,20 @@ class SessionStore:
             self.conversations[key] = (mtime, list(messages))
         return messages
 
+    def peek_conversation(self, session: dict) -> list[ConversationMessage] | None:
+        """若缓存仍有效则返回对话副本，否则返回 None（不触发磁盘读取）。"""
+        key = session_key(session)
+        path = str(session.get("path") or "")
+        try:
+            mtime = os.stat(path).st_mtime if path else None
+        except OSError:
+            mtime = None
+        with self.lock:
+            cached = self.conversations.get(key)
+            if cached is not None and cached[0] == mtime:
+                return list(cached[1])
+        return None
+
 
 # 外层终端 OSC 10/11 应答原文（main() 启动时探测），供内嵌面板聚焦时经
 # refresh-client -r 注入托管 pane——pane 内 agent 的深/浅主题自动检测因此拿到真实终端背景。
@@ -650,27 +768,28 @@ def _background_rgb(osc_report: bytes | None) -> str | None:
 
 
 def _log_embed_error(where: str, exc: BaseException) -> None:
-    """内嵌后台线程的异常记录：TUI 接管终端期间 stderr 不可见，写文件留证（截断防涨爆）。"""
-    try:
-        path = os.path.join(os.path.dirname(titles.CACHE_FILE), "embed-error.log")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
-            os.truncate(path, 0)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"{datetime.now().isoformat(timespec='seconds')} [{where}] "
-                     f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}\n")
-    except OSError:
-        pass  # 日志写不进去就放弃，绝不能让日志本身把后台线程弄死
+    """内嵌后台线程的异常记录：TUI 接管终端期间 stderr 不可见，写文件留证。
 
+    转调 observe.log_exception：events.log 一条结构化 error，embed-error.log 留 traceback。
+    """
+    import observe
+
+    observe.log_exception(where, exc)
 
 def _new_session_cwd(store: SessionStore, nav, session: dict | None) -> str | None:
-    """新建会话优先沿用当前项目筛选，否则使用所选会话的工作目录。
+    """新建会话工作目录：搜索结果若恰好只剩一个项目则沿用，否则用所选会话目录。
 
-    `nav` 只需要有 `project_key` 属性（界面层的 `ui.nav.NavState`），这里不直接
+    `nav` 需要有 `project_query` 属性（界面层的 `ui.nav.NavState`），这里不直接
     依赖 ui 包的具体类型，避免 pickup.py ↔ ui 包出现循环 import。
     """
-    if nav.project_key is not None:
-        return nav.project_key or None
+    query = str(getattr(nav, "project_query", "") or "").strip()
+    if query:
+        titles = getattr(store, "display_titles", None) or {}
+        visible = _filter_sessions_by_query(store.all_sessions(), query, titles=titles)
+        keys = {_normalize_cwd(s.get("cwd")) for s in visible}
+        keys.discard("")
+        if len(keys) == 1:
+            return next(iter(keys))
     if session is not None:
         cwd_key = _normalize_cwd(session.get("cwd"))
         return cwd_key or None
@@ -906,7 +1025,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "pickup：终端会话接力工具。\n"
-            "列出 Claude Code / Codex / OpenCode / Kimi Code 最近的会话，选择后原生恢复或跨运行时接力。\n"
+            "列出 Claude Code / Codex / OpenCode / Kimi Code / Cursor 最近的会话，选择后原生恢复或跨运行时接力。\n"
             "默认启动交互式 TUI（Textual），需要真实终端；非真实终端自动退化为 JSON。\n"
             "大模型 Agent 结构化查询请用 list/search/show/context/describe 子命令。"
         ),
@@ -919,7 +1038,7 @@ def main() -> None:
             "  pickup describe        # 查看 list/search/show/context 等子命令的用法\n"
             "\n"
             "JSON 输出字段说明：\n"
-            "  runtime        运行时标识（claude / codex / opencode / kimi）\n"
+            "  runtime        运行时标识（claude / codex / opencode / kimi / cursor）\n"
             "  id             会话 ID\n"
             "  title          会话标题（本地临时兜底，不调用 AI）\n"
             "  cwd            原会话工作目录\n"
@@ -983,7 +1102,15 @@ def main() -> None:
     # 依赖它），但现在跟上面的后台扫描线程是并行的，不再是"扫描 + 探测"首尾相加。
     global _OSC_REPORT
     _OSC_REPORT = _probe_osc_colours()
+    import observe
+    observe.init(debug=bool(os.environ.get("PICKUP_DEBUG")))
     if os.environ.get("PICKUP_DEBUG"):
+        observe.debug(
+            "osc_probe",
+            report_present=_OSC_REPORT is not None,
+            in_tmux=bool(os.environ.get("TMUX")),
+            theme_report=embed.supports_theme_report(),
+        )
         print(f"[pickup debug] 外层终端 OSC 10/11 探测: {_OSC_REPORT!r} "
               f"(tmux={'是' if os.environ.get('TMUX') else '否'}, "
               f"refresh -r 支持={'是' if embed.supports_theme_report() else '否'})",

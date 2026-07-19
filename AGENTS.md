@@ -1,10 +1,30 @@
+<!-- managed:inherited-agents:start -->
+<!-- source: /Users/geraltgraham/Codes/pickup/AGENTS.md -->
+# pickup
+
+终端会话接力 CLI，支持跨 Claude Code / Codex / OpenCode / Kimi Code / Cursor 会话恢复与接力。
+
+通用工程规范：[Python/通用](../_standards/)
+
+## 文档导航
+
+- [cli/AGENTS.md](cli/AGENTS.md)：改、评审或发布 pickup CLI 工具前必读（含界面改动后的截图验收）。Remote：`ssh://git@10.10.10.2:2222/Max/pickup.git`
+
+## 组件一览
+
+| 目录 | 技术栈 | 状态 |
+|---|---|---|
+| `cli/` | Python | 活跃 |
+
+<!-- managed:inherited-agents:end -->
+
 # pickup 项目规范
 
 ## 文档导航
 
 - `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力前必读。
-- `docs/MAINTAINER_GUIDE.md`：修改、评审、排查或优化标题生成、扫描排序、扫描性能/启动耗时、界面列宽、配色/可读性（含浅色背景终端适配）、状态列/会话存活判断、会话预览（含消息级时间戳、实时刷新与会话缓存失效策略）、运行时边界（含跨运行时接手提示词的对话摘录）、会话保活（`keepalive.py`，含 tmux 隔离、pid 祖先链匹配、回收策略）、内嵌面板（`embed.py` + `ui/embed_pane.py` 的 `EmbedPane`，含控制模式通道、输入延迟、跨终端/触控板滚动兼容、回滚状态、鼠标拖拽选词的取舍、IME 光标锚定、深/浅主题背景色注入、「连接中…」卡死）、直启子命令（`pickup claude`/`pickup codex`，含 `auto_approve_args` 设计取舍）、`agent_api.py` 机器接口（含新增字段/参数、只读边界取舍、`AgentApiTests` 测试写法）、打包发布和 GitHub 开源维护前必读。
-- `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义前必读；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里。
+- `docs/MAINTAINER_GUIDE.md`：修改、评审、排查或优化标题生成、扫描排序、扫描性能/启动耗时（含首屏异步 `store.load`）、界面列宽/侧边栏配色与标题省略、runtime 名配色（`pickup.runtime_label_style`）、TUI 可观测性（`observe.py` / `events.log` / F12 截图 / `pickup diagnose`）、TUI 刷新（列表原地更新、spinner 省刷）、状态列/会话存活判断、会话预览（右栏完整对话、消息级时间戳、缓存按 mtime 失效；Space 全屏预览已退役）、运行时边界（含跨运行时接手提示词的对话摘录）、会话保活（`keepalive.py`，含 tmux 隔离、pid 祖先链匹配、回收策略）、内嵌面板（`embed.py` + `ui/embed_pane.py` 的 `EmbedPane`，含控制模式通道与抓帧 `request()`、真彩色直通、Line API 局部重绘、输入延迟、跨终端/触控板滚动兼容、回滚状态、鼠标拖拽选词的取舍、IME 光标锚定、深/浅主题背景色注入、「连接中…」卡死）、直启子命令（`pickup claude`/`pickup codex`，含 `auto_approve_args` 设计取舍）、`agent_api.py` 机器接口（含新增字段/参数、只读边界取舍、`AgentApiTests` 测试写法）、打包发布和 GitHub 开源维护前必读。
+- `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义前必读（含 `diagnose` 与界面异常排查）；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里。
 - `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界前必读。
 - `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求前必读。
 
@@ -15,7 +35,7 @@
 - 跨运行时接力统一走“源适配器导出 `Handoff` → 目标适配器生成 `LaunchPlan`”，禁止增加 Claude→Gemini、Codex→Gemini 等两两转换分支。
 - 同运行时使用原生恢复；跨运行时必须新建目标会话、让目标 Agent 按需读取原始 JSONL，不能改写或伪造原会话。
 - 标题生成是独立服务，不属于任何运行时适配器。生成后端统一走 `titlegen.py` 的 `TitleGenerator` 抽象，`titles.py` 不得直接拼接任何 CLI 命令；`titlegen.py` 与 `runtime/` 互不 import——运行时适配器管「怎么恢复/接力会话」，标题生成器管「怎么无头问一次模型」，两者后端恰好重名但职责不同，不要合并。标题和界面状态使用“运行时 + 会话 ID”作为唯一键，新增运行时不得退回纯会话 ID。新增标题生成后端时，若该 CLI 会把生成调用落盘成会话历史，对应扫描器必须加 `titles.PROMPT_MARKER` 前缀过滤。
-- 会话预览使用全屏页面；预览页回车必须直接原生恢复当前会话，关闭预览时必须清屏并让主列表按当前终端尺寸完整重绘，禁止改回覆盖主列表的居中弹窗。
+- 会话预览：选中非进行中会话时，右栏直接展示完整对话（与旧 Space 全屏预览同款内容）；进行中/已托管会话右栏展示内嵌实时终端。Space 全屏预览页已退役，禁止再加回第二套预览入口。
 - `agent_api.py`（`pickup list`/`search`/`show`/`context`/`describe`）是只读数据接口，禁止新增任何执行/拉起副作用命令——pickup 只负责把会话数据交出来，怎么用是调用方的事。暴露更多可见性字段（如运行中会话的 `live`/`pid`）不违反这条约束，只要新字段本身来自扫描/只读探测、不触发任何拉起或写操作；真正"接管/下发指令给运行中会话"的能力不属于 pickup，留给调用方基于这些数据自行实现。命令参数与 `pickup describe` 的输出必须共用同一份 `COMMANDS` 定义，不能各写一份导致漂移。新增或修改子命令时同步 `docs/SKILL.md`。
 - Agent 接口里 `list`/`search` 的 `--limit` 固定表示每个运行时的扫描深度，`--top` 才表示最终返回条数；`--compact` 必须同时做到紧凑 JSON 和精简默认字段。改这三个参数或 `show --out` 大结果落盘行为时，同步 `pickup describe`、`docs/SKILL.md` 和 `docs/MAINTAINER_GUIDE.md`。
 - 会话保活（`keepalive.py`）是运行时无关的启动包装层，只在 `registry` 生成 `LaunchPlan` 之后、`execute_launch` 之前介入，禁止塞进 `runtime/` 某个具体适配器，也禁止让适配器感知 tmux 的存在。改保活匹配/回收逻辑前先读 `docs/MAINTAINER_GUIDE.md`「会话保活」节。`pickup claude`/`pickup codex` 直启子命令默认带 `_DirectLaunch` 进 TUI、经 `embed.host_session` 托管（与界面内「新建会话」同一路径），仅非真实终端 / `--no-keepalive` / 内嵌不可用时退回 `keepalive.enabled`/`wrap_plan` + `execute_launch` 旧路径（保活的第三个调用点，与 TUI 的 `_launch()` 复用同一套开关语义）。
@@ -42,7 +62,7 @@ print(f'{(time.perf_counter()-t)*1000:.0f}ms')
 改动代码、界面或运行时适配器后至少执行：
 
 ```bash
-python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_common.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py runtime/*.py ui/*.py test_*.py
+python3 -m py_compile pickup.py scan_claude.py scan_codex.py scan_opencode.py scan_kimi.py scan_cursor.py scan_common.py titles.py titlegen.py models.py agent_api.py keepalive.py embed.py observe.py runtime/*.py ui/*.py test_*.py
 python3 -m unittest -v
 ```
 
@@ -52,6 +72,17 @@ python3 -m unittest -v
 - 高级操作弹窗（`ui/modals.py` 的 `choose_target_runtime`）动态列出注册表中的运行时。
 - 默认选中第一个已安装的其他运行时。
 - `Esc` 先关闭弹窗，再退出主界面。
+- 选中已结束会话时右栏是完整对话预览（含 `● 你` / 运行时名角色行），不再出现「最近提问 / 最近回复」摘要块。
+
+**界面改动后的截图验收（必要步骤，不能只靠单测文字断言）：** Agent / 维护者必须自己进 TUI 出图并肉眼看图，确认布局与文案没有明显回归。标准做法（Textual Pilot → SVG → PNG，与当初 README 截图同一路径）：
+
+```bash
+cd cli
+pip install cairosvg   # 首次；ImageMagick convert 渲 Rich SVG 常出空白图，不要当主路径
+python3 docs/screenshots/capture.py   # → docs/screenshots/list.png
+```
+
+然后用读图工具打开 `docs/screenshots/list.png`（以及必要时其它新截图）检查：左栏搜索框与卡片、右栏完整对话、Footer、有无截断错乱、错误文案（如残留「最近提问」、空白右栏、运行时名缺失、标题整行转圈）。**runtime 配色不要只靠这张 SVG→PNG 判断**（导出常把真彩色压成灰阶）；颜色用真机 TUI 或 `SessionCard.render_line` 的 segment style 验收，见 `docs/MAINTAINER_GUIDE.md` 侧边栏配色踩坑。中文若成豆腐块，多半是截图环境缺 CJK 字体——本机（`root@10.10.10.2` / suzhou）需有 `fonts-noto-cjk`（`Noto Sans Mono CJK SC`）；`capture.py` 已按该字体族改写 SVG。属出图环境问题，不要当成产品回归。README 若仍引用旧「全屏预览」图，界面语义变了必须同步换图与说明。截图使用虚构演示数据，禁止把真实用户会话内容写进仓库。
 
 **改动 `keepalive.py`、`pickup.py` 里保活相关的接线、`embed.py`/`ui/embed_pane.py` 内嵌面板、或 `pickup claude`/`pickup codex` 直启子命令时，除单测外必须额外跑一次真实 tmux 冒烟**：内嵌面板与界面交互（控制通道、滚轮转发、copy-mode、光标、主题注入、「连接中…」回归；界面层已从 curses 换成 Textual，鼠标拖拽选词这版暂未实现，见 `docs/MAINTAINER_GUIDE.md`「内嵌面板」节）的统一入口是仓库根的端到端脚本——直接跑 `bash selftest.sh`（约 90 秒，独立 tmux socket + 隔离 fake HOME，只创建/清理自己名下的 `pickup-claude-aaaa1111/bbbb2222` 会话，不碰其他保活会话），全部断言全绿才算过。用 `python3 -c "import keepalive; from models import LaunchPlan; print(keepalive.wrap_plan(LaunchPlan(('sleep','300'),None),'claude','smoketest'))"` 拿到真实 argv 后执行（加 `-d` 变成后台创建，不实际 attach），确认 `tmux -L pickup-keepalive list-sessions` 能看到会话、`keepalive.annotate()` 能靠 pid 匹配上、`keepalive.reap_idle(now=<未来时间戳>)` 能正确回收、正常退出（跑一个立即结束的命令如 `true`）后会话不留残留；测试用的 socket 用完后确认没有残留 `tmux -L pickup-keepalive` 进程（`ps aux | grep "[t]mux -L pickup-keepalive"` 应为空）。改完配置内容（`keepalive.py` 里的 `_TMUX_CONFIG` 常量）后，额外跑一次 `pip install --target <临时目录> .` 确认真实安装产物里没有缺文件（这个包用扁平 `py_modules` 分发，不会自动带上任何非 `.py` 文件）。直启子命令额外验证：把 `claude`/`codex` 指向本机 `true`（或一个会 sleep 的 fake 脚本）放到 `PATH` 最前面，跑 `pickup --no-keepalive claude <参数>` 确认参数原样透传且垫上了危险参数、用户已带危险参数时不重复；默认路径（真实终端内跑 `pickup claude`）确认进入 TUI 侧边栏模式、新会话包进 `tmux -L pickup-keepalive` 并显示在右栏；非真实终端（管道）则确认退回 `tmux -L pickup-keepalive` 包装后的 execvp 全屏接管。**本机若已有其他真实保活会话在跑（`tmux -L pickup-keepalive list-sessions` 能看到非本次测试创建的 `pickup-*`/`sc-*` 会话），冒烟测试一律只操作自己新建的会话名，不得 `kill-session` 或以其他方式影响已存在的会话**——那些通常是该机器上真实在跑的 Agent 会话。
 
@@ -61,4 +92,19 @@ python3 -m unittest -v
 
 ## 本机入口
 
-源码主模块已改名 `sc.py` → `pickup.py`（sessionContinue 时代残留清理）；`pickup` 命令可能是 pip 安装到 site-packages 的独立副本（`pip show pickup` 可见版本），不随源码目录更新。验证界面/行为改动时要确认跑的是当前源码：`cd cli && python3 pickup.py`，或先 `python3 -m pip install --user .` 重装；仍不生效时核对 `command -v pickup`、`pip show pickup` 和源码哈希，确认没有运行另一台机器或旧目录中的副本。
+源码主模块已改名 `sc.py` → `pickup.py`（sessionContinue 时代残留清理）；`pickup` 命令可能是 pip 安装到 site-packages 的独立副本（`pip show pickup` 可见版本），**不随源码目录更新**。验证界面/行为改动时要确认跑的是当前源码：`cd cli && python3 pickup.py`，或先重装：
+
+```bash
+cd cli
+python3 -m pip install --user --force-reinstall --no-deps .
+# 本机曾出现 pip install -e . 因 setuptools/easy_install 权限失败；force-reinstall 非 editable 更稳
+```
+
+仍不生效时核对 `command -v pickup`、`pip show pickup` 和：
+
+```bash
+python3 -c "import pickup; print(pickup.__file__); print(pickup.runtime_label_style('claude'))"
+# 期望：路径指向刚装的 site-packages 或当前 cli/pickup.py，且打印 bold #D97757
+```
+
+确认没有运行另一台机器或旧目录中的副本；改完配色/布局后必须**重启**已打开的 TUI，旧进程不会热加载。

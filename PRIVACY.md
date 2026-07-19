@@ -1,12 +1,13 @@
 # Privacy
 
-`pickup` is designed as a local terminal utility for existing Claude Code, Codex CLI, OpenCode, and Kimi Code CLI users.
+`pickup` is designed as a local terminal utility for existing Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and Cursor Agent CLI users.
 
 ## Data It Reads
 
 - Claude Code history under `~/.claude/projects/`.
 - Codex CLI history under `~/.codex/sessions/`.
 - Codex session names from `~/.codex/session_index.jsonl` when present.
+- Cursor Agent CLI history under `~/.cursor/chats/` (per-chat `meta.json` / `store.db`)
 - OpenCode history from its SQLite database at `~/.local/share/opencode/opencode.db` (or the
   directory pointed to by `OPENCODE_DATA_DIR`), opened with a read-only connection (`mode=ro`).
   The tool never writes to this database.
