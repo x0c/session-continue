@@ -710,11 +710,29 @@ def _spawn_title_daemon(limit: int) -> None:
 
 def _require_tmux() -> None:
     """pickup 的会话托管/内嵌面板/断线保活全部建立在 tmux 之上，属于硬依赖；
-    缺失时明确报错并给出安装提示，不静默降级出残废功能。"""
+    缺失或版本过旧时明确报错并给出安装/升级提示，不静默降级出残废功能。
+
+    版本下限检查复用 embed._tmux_version()：`new-session -e` 环境变量注入
+    （托管会话的 PICKUP_RUNTIME/PICKUP_SESSION_ID 等元数据唯一注入点）和
+    pause-after 流控通知都要求 tmux 3.2+，更旧版本上创建托管会话会直接失败，
+    报出的却是一个和版本无关的笼统 EmbedError，用户很难联想到升级 tmux。
+    版本解析不出（如 `tmux -V` 输出被魔改）时不阻断——宁可信任已通过的
+    `shutil.which` 探测，让真实失败在后续调用里自然暴露，不做过度拦截。"""
     if shutil.which("tmux") is None:
         print(
             "pickup 需要 tmux 才能运行，请先安装"
             "（macOS: brew install tmux；Debian/Ubuntu: sudo apt install tmux）。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    version = embed._tmux_version()
+    if version is not None and version < embed.MIN_TMUX_VERSION:
+        need_major, need_minor = embed.MIN_TMUX_VERSION
+        print(
+            f"pickup 需要 tmux {need_major}.{need_minor} 及以上版本"
+            f"（当前检测到 {version[0]}.{version[1]}）：会话托管依赖 "
+            "new-session -e 环境变量注入等 3.2+ 才有的特性，低于此版本会在创建"
+            "托管会话时失败。请升级 tmux 后重试。",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -2126,6 +2126,36 @@ class ProjectSidebarTests(unittest.TestCase):
         self.assertIsNone(pickup._new_session_cwd(store, nav, {"cwd": "/should/not/use"}))
 
 
+class TmuxRequirementTests(unittest.TestCase):
+    def test_supported_version_passes(self) -> None:
+        with (
+            mock.patch.object(pickup.shutil, "which", return_value="/usr/bin/tmux"),
+            mock.patch.object(pickup.embed, "_tmux_version", return_value=(3, 2)),
+        ):
+            pickup._require_tmux()
+
+    def test_unparseable_version_does_not_block(self) -> None:
+        with (
+            mock.patch.object(pickup.shutil, "which", return_value="/usr/bin/tmux"),
+            mock.patch.object(pickup.embed, "_tmux_version", return_value=None),
+        ):
+            pickup._require_tmux()
+
+    def test_old_version_reports_required_and_current_versions(self) -> None:
+        with (
+            mock.patch.object(pickup.shutil, "which", return_value="/usr/bin/tmux"),
+            mock.patch.object(pickup.embed, "_tmux_version", return_value=(3, 1)),
+            mock.patch("builtins.print") as print_mock,
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            pickup._require_tmux()
+
+        self.assertEqual(ctx.exception.code, 1)
+        output = " ".join(str(call) for call in print_mock.call_args_list)
+        self.assertIn("3.2", output)
+        self.assertIn("3.1", output)
+
+
 class DirectLaunchTests(unittest.TestCase):
     """`pickup claude [参数…]` / `pickup codex [参数…]` 直启透传子命令的分发逻辑。"""
 

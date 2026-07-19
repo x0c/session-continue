@@ -38,7 +38,7 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 ## Requirements
 
 - Python 3.10 or newer.
-- `tmux` (hard requirement — session hosting, embedded panes, and SSH keep-alive are all built on it).
+- `tmux` 3.2 or newer (hard requirement — session hosting, embedded panes, and SSH keep-alive are all built on it; `pickup` checks the version at startup and refuses to run on older tmux, since `new-session -e` environment injection requires 3.2+).
 - macOS or Linux terminal (any modern ANSI-capable terminal works; the UI is built with Textual, not curses).
 - Claude Code, Codex CLI, OpenCode, and/or Kimi Code CLI installed if you want to resume those sessions.
 
