@@ -25,11 +25,12 @@
 五个扫描器（scan_claude.py/scan_codex.py/scan_opencode.py/scan_kimi.py/scan_cursor.py）互不
 依赖运行时私有格式，但都需要几个完全相同的小工具：`shorten_cwd`（路径展示时
 把用户主目录替换成 `~`）、`parse_timestamp`（ISO8601 字符串转 epoch 秒）、
-`live_pids_by_process_name(process_name)`（OpenCode/Kimi 共用的"找同名存活进程
-→ 读其 cwd → 与会话工作目录匹配"判活兜底）。这些集中在 `scan_common.py`，
-避免四份重复实现各自演进出细微差异；新增第五个运行时扫描器时优先检查这里有
-没有能复用的 helper，不要先照抄再改。这个模块只放无状态纯函数，运行时私有的
-解析格式（JSONL 字段、SQLite 表结构等）仍留在各自的 scan_*.py 里。
+`live_processes` / `live_pids_by_process_name`（存活同名进程及其 cwd）、
+`process_command_line` / `process_environ` / `open_file_paths`（读命令行、环境变量、
+打开的文件路径，供 Cursor 等按正向证据精确绑会话）。这些集中在 `scan_common.py`，
+避免多份重复实现各自演进出细微差异；新增运行时扫描器时优先检查这里有没有能复用的
+helper，不要先照抄再改。这个模块只放无状态纯函数，运行时私有的解析格式
+（JSONL 字段、SQLite 表结构等）仍留在各自的 scan_*.py 里。
 
 ## Claude 扫描
 
@@ -215,7 +216,7 @@
 - 列表轻扫：`meta.json` + `prompt_history.json`（最新在前）；`path` 优先指向 `store.db`。
 - 完整对话：`load_conversation` 只读 `store.db` JSON blobs，提取 `<user_query>` 与 assistant 文本。
 - 运行时 id=`cursor`，可执行文件=`agent`，`auto_approve_args=("--force",)`；恢复 `agent --force --resume <id>`。
-- **同 cwd 多 agent 判活（2026-07 真机实报后修）**：跨助手接力会在项目目录新建一个无 `--resume` 的 `agent`，同时旧 Cursor 会话可能仍以 `--resume <chatId>` 跑着。旧实现用 `live_pids_by_process_name("agent")` 按 cwd 只留一个 pid，再标「该目录最新会话」存活——结果是新接续会话卡片标题正确，但 `keepalive.annotate` 把旧 tmux 画面绑上去，侧边栏/右栏串台。现改走 `live_processes` 保留全部进程：命令行能解析出 `--resume <uuid>` 的精确挂到对应会话；其余无 resume 的再按 cwd 挂到尚未标记、mtime 最新的会话。回归：`CursorScanTests.test_live_flags_bind_resume_and_new_agents_separately_in_same_cwd`。OpenCode/Kimi 仍用 cwd→单 pid 的保守策略（它们没有稳定的 resume 参数可解析）。
+- **同 cwd 多 agent 判活（2026-07 真机实报后修，同日再修串台）**：跨助手接力 / 空白新建会在项目目录起无 `--resume` 的 `agent`，同时旧会话可能仍以 `--resume <chatId>` 跑着。第一版用 `live_pids_by_process_name("agent")` 按 cwd 只留一个 pid，新接续标题会挂上旧保活画面。第二版改走 `live_processes` 保留全部进程，无 resume 时按「cwd → mtime 最新未标记会话」兜底——仍会把空壳欢迎页进程错绑到同目录更早的真实历史（真机：侧边栏「我想加个顶栏」、右栏却是空白 Cursor 欢迎页；`lsof` 显示该进程实际打开的是另一条 chat 的 `store.db`）。现绑定只认正向证据，优先级：① 命令行 `--resume <chatId>`；② 进程已打开的 `~/.cursor/chats/.../<chatId>/store.db`（含 wal/shm）；③ 环境变量 `PICKUP_SESSION_ID`/`SC_SESSION_ID`（仅完整会话 id，8 位空白新建临时标识不参与猜测）。**禁止**再按 cwd/mtime 猜测。回归：`CursorScanTests.test_live_flags_bind_resume_and_open_store_separately_in_same_cwd`、`test_live_flags_do_not_bind_blank_agent_to_older_cwd_history`、`test_live_flags_bind_via_pickup_session_env`。OpenCode/Kimi 仍用 cwd→单 pid 的保守策略（它们没有稳定的 resume 参数可解析）。
 
 ## 直启子命令（`pickup claude` / `pickup codex` / `pickup opencode` / `pickup kimi`）
 

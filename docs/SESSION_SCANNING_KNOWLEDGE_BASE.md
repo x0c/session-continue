@@ -110,7 +110,7 @@ sequenceDiagram
 | Codex | 活着的 `codex` 进程持有的 `rollout-*.jsonl` | 从打开的文件名提取会话 UUID | Linux 读 `/proc/<pid>/fd`；macOS 合并一次 `lsof` |
 | OpenCode | 同名进程的当前工作目录 | 同 cwd 仅最新会话标为运行中 | 无法探测时返回空映射 |
 | Kimi | `kimi-code` 进程的当前工作目录 | 同 cwd 仅最新会话标为运行中 | 无法探测时返回空映射 |
-| Cursor | `agent` 进程；优先解析命令行 `--resume <chatId>` | 有 `--resume` 时精确绑到对应会话；其余无 resume 的进程再按 cwd 挂到尚未标记、mtime 最新的会话。禁止再按「cwd → 单个 pid」折叠 | 无法探测时返回空列表 |
+| Cursor | `agent` 进程；优先解析命令行 `--resume <chatId>`，其次读打开的 `store.db` 路径，再次读 `PICKUP_SESSION_ID`/`SC_SESSION_ID` | 只按上述正向证据精确绑定；禁止再按「cwd → 最新会话」猜测。空白新建的临时 8 位标识不参与匹配 | 无法探测时返回空列表 |
 
 ### 2.3 完整对话按需加载
 
@@ -172,7 +172,7 @@ flowchart TD
 | 修改 OpenCode 查询或刷新跳过 | OpenCode 扫描器 | `scan_opencode.scan_sessions()`、`scan_signature()` | 历史为 SQLite；签名需同时覆盖 DB/WAL 和进程活性快照 |
 | 修改 OpenCode 完整预览 | OpenCode 扫描器 | `scan_opencode.load_conversation()` | 从 `message` 与 `part` 表合并同一消息的多个 text part |
 | 修改 Kimi 事件过滤或预览 | Kimi 扫描器 | `scan_kimi._iter_message_entries()`、`load_conversation()` | 只读 `agents/main/wire.jsonl`，跳过 think、工具快照和子 agent |
-| 修改 Cursor 扫描或预览 | Cursor 扫描器 | `scan_cursor.scan_sessions()`、`_apply_live_flags()`、`load_conversation()` | 列表不读 `store.db`；预览才读 blob；同 cwd 多 `agent` 必须按 `--resume` 精确绑定 |
+| 修改 Cursor 扫描或预览 | Cursor 扫描器 | `scan_cursor.scan_sessions()`、`_apply_live_flags()`、`load_conversation()` | 列表不读 `store.db`；预览才读 blob；同 cwd 多 `agent` 必须按 resume / 打开的 store.db / 完整 PICKUP_SESSION_ID 精确绑定，禁止 cwd 猜测 |
 | 修改共用路径、时间、cwd 判活 | 共享 helper | `scan_common.shorten_cwd()`、`parse_timestamp()`、`live_processes()`、`live_pids_by_process_name()`、`process_command_line()` | 只放无状态纯函数；需要全部同名进程时用 `live_processes`，不要先按 cwd 折叠 |
 | 修改跨运行时并发或扫描复用 | 注册表 | `runtime.registry.RuntimeRegistry.scan_all()` | 各运行时并发、异常隔离、结果副本隔离、签名命中跳过 |
 | 修改异步首屏、列表合并或预览缓存 | 会话存储 | `pickup.SessionStore.load()`、`refresh()`、`get_conversation()` | `store.load` 在后台线程，预览缓存按 mtime 失效 |
@@ -226,6 +226,7 @@ flowchart TD
 - **AI 易错点**【必须】OpenCode 的扫描签名同时包含 `opencode.db`、可选 `opencode.db-wal` 的 mtime 与按 cwd 排序的 pid 快照（原因：只看数据库文件会漏掉进程退出后的运行中状态变更）。
 - **AI 易错点**【禁止】把 OpenCode 当作 JSONL，或在只读失败时静默返回“没有会话” → 它是 SQLite；发现数据库但全部只读连接/查询失败时抛出错误，让注册表保留上一份成功结果。
 - **AI 易错点**【必须】Cursor 只扫描 `~/.cursor/chats/` 的 CLI 历史，列表阶段只读 `meta.json` 和 `prompt_history.json`，完整预览才读 `store.db`（原因：IDE agent transcripts 不属于本域，过早读大 SQLite 会破坏首屏预算）。
+- **AI 易错点**【禁止】Cursor 判活按「同 cwd 最新会话」猜测 → 只能用 `--resume`、已打开的 `store.db` 路径或完整 `PICKUP_SESSION_ID`（原因：空白新建的临时 8 位标识与历史 chatId 无关，cwd 兜底会把空壳欢迎页绑到同目录旧会话，侧边栏标题与右栏画面串台）。
 - **AI 易错点**【必须】过滤标题生成自产会话：Claude 和 Codex 的首条用户消息命中 `titles.PROMPT_MARKER` 时丢弃（原因：否则后台标题生成反向污染用户会话列表）。
 - **AI 易错点**【必须】Codex 过滤 `thread_source == "subagent"`，OpenCode 过滤 `parent_id IS NOT NULL`，Kimi 忽略非 main agent 的 wire 文件（原因：这些是助手内部子任务，不是用户发起的顶层会话，列出会造成重复）。
 - **AI 易错点**【性能】Claude、Codex、Kimi、Cursor 先用廉价 `stat` 排候选并凑够有效 `limit` 后停止；不得退回“完整解析全部历史再截断”（原因：首屏会随历史数量线性恶化）。

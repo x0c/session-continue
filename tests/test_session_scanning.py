@@ -3132,10 +3132,11 @@ class CursorScanTests(unittest.TestCase):
                 ],
             )
 
-    def test_live_flags_bind_resume_and_new_agents_separately_in_same_cwd(self) -> None:
-        """同 cwd 下旧 --resume 与接力新建的 agent 不得串到同一条会话。
+    def test_live_flags_bind_resume_and_open_store_separately_in_same_cwd(self) -> None:
+        """同 cwd 下旧 --resume 与打开了新 store.db 的 agent 不得串台。
 
-        真实故障：cwd→单 pid 折叠后，新接续会话标题挂上旧保活画面。
+        真机故障演进：cwd→最新会话兜底会把空壳/接力进程绑到同目录更早的历史，
+        侧边栏标题对、右栏却是另一场对话或空白欢迎页。
         """
         from pickup.scan import cursor as scan_cursor
 
@@ -3165,7 +3166,7 @@ class CursorScanTests(unittest.TestCase):
             )
             real_cwd = os.path.realpath(cwd)
             agents = [
-                (22807, real_cwd),  # 接力新建，无 --resume
+                (22807, real_cwd),  # 接力新建，无 --resume，但已打开新会话 store.db
                 (25594, real_cwd),  # 旧会话 --resume
             ]
             cmdlines = {
@@ -3177,6 +3178,12 @@ class CursorScanTests(unittest.TestCase):
                     f"/Users/x/.local/bin/agent --force --resume {old_id}"
                 ),
             }
+            open_paths = {
+                22807: [
+                    f"/Users/x/.cursor/chats/ws1/{new_id}/store.db",
+                ],
+                25594: [],
+            }
 
             def fake_cmdline(pid: int) -> str:
                 return cmdlines[pid]
@@ -3185,6 +3192,10 @@ class CursorScanTests(unittest.TestCase):
                 scan_cursor, "live_processes", return_value=agents
             ), mock.patch.object(
                 scan_cursor, "process_command_line", side_effect=fake_cmdline
+            ), mock.patch.object(
+                scan_cursor, "open_file_paths", return_value=open_paths
+            ), mock.patch.object(
+                scan_cursor, "process_environ", return_value={}
             ):
                 sessions = scan_cursor.scan_sessions(limit=10)
 
@@ -3193,6 +3204,84 @@ class CursorScanTests(unittest.TestCase):
             self.assertEqual(by_id[old_id]["pid"], 25594)
             self.assertTrue(by_id[new_id]["live"])
             self.assertEqual(by_id[new_id]["pid"], 22807)
+
+    def test_live_flags_do_not_bind_blank_agent_to_older_cwd_history(self) -> None:
+        """无 resume、未打开 store.db 的空壳 agent 不得冒充同目录历史会话。"""
+        from pickup.scan import cursor as scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = str(root / "proj")
+            Path(cwd).mkdir()
+            history_id = "210fc78f-20ea-4e94-89c6-257fe566b674"
+            self._chat(
+                root,
+                "ws1",
+                history_id,
+                title="Agent Runtime Selector",
+                cwd=cwd,
+                updated_ms=1_700_000_000_000,
+                prompts=["我想加个顶栏"],
+            )
+            real_cwd = os.path.realpath(cwd)
+            agents = [(80250, real_cwd)]
+
+            with mock.patch.object(scan_cursor, "CHATS_DIR", str(root)), mock.patch.object(
+                scan_cursor, "live_processes", return_value=agents
+            ), mock.patch.object(
+                scan_cursor,
+                "process_command_line",
+                return_value="/Users/x/.local/bin/agent --force",
+            ), mock.patch.object(
+                scan_cursor, "open_file_paths", return_value={80250: []}
+            ), mock.patch.object(
+                scan_cursor,
+                "process_environ",
+                return_value={"PICKUP_SESSION_ID": "01a1d8c7"},  # 空白新建临时 id
+            ):
+                sessions = scan_cursor.scan_sessions(limit=10)
+
+            self.assertEqual(len(sessions), 1)
+            self.assertFalse(sessions[0]["live"])
+            self.assertIsNone(sessions[0]["pid"])
+
+    def test_live_flags_bind_via_pickup_session_env(self) -> None:
+        """托管注入的完整 PICKUP_SESSION_ID 可在无 resume / 尚未打开 db 时精确绑定。"""
+        from pickup.scan import cursor as scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = str(root / "proj")
+            Path(cwd).mkdir()
+            chat_id = "5c2ab03a-4f61-4c80-9a47-a4c6c540e1c9"
+            self._chat(
+                root,
+                "ws1",
+                chat_id,
+                title=None,
+                cwd=cwd,
+                updated_ms=1_700_000_000_000,
+                prompts=["接续"],
+            )
+            real_cwd = os.path.realpath(cwd)
+
+            with mock.patch.object(scan_cursor, "CHATS_DIR", str(root)), mock.patch.object(
+                scan_cursor, "live_processes", return_value=[(55021, real_cwd)]
+            ), mock.patch.object(
+                scan_cursor,
+                "process_command_line",
+                return_value="/Users/x/.local/bin/agent --force",
+            ), mock.patch.object(
+                scan_cursor, "open_file_paths", return_value={55021: []}
+            ), mock.patch.object(
+                scan_cursor,
+                "process_environ",
+                return_value={"PICKUP_SESSION_ID": chat_id},
+            ):
+                sessions = scan_cursor.scan_sessions(limit=10)
+
+            self.assertTrue(sessions[0]["live"])
+            self.assertEqual(sessions[0]["pid"], 55021)
 
     def test_resume_id_from_cmdline_parses_equals_and_skips_minus_one(self) -> None:
         from pickup.scan import cursor as scan_cursor
@@ -3205,6 +3294,18 @@ class CursorScanTests(unittest.TestCase):
         )
         self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --resume=-1"))
         self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --force"))
+
+    def test_chat_ids_from_open_paths_dedupes_wal_shm(self) -> None:
+        from pickup.scan import cursor as scan_cursor
+
+        chat_id = "8150d335-b9dd-445c-8ed4-32b0276406fa"
+        paths = [
+            f"/Users/x/.cursor/chats/ws/{chat_id}/store.db-shm",
+            f"/Users/x/.cursor/chats/ws/{chat_id}/store.db",
+            f"/Users/x/.cursor/chats/ws/{chat_id}/store.db-wal",
+            "/Users/x/.cursor/chats/ws/other/meta.json",
+        ]
+        self.assertEqual(scan_cursor._chat_ids_from_open_paths(paths), [chat_id])
 
 
 class DeleteSessionScanTests(unittest.TestCase):

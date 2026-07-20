@@ -113,3 +113,96 @@ def process_command_line(pid: int) -> str:
         return out.decode(errors="replace").strip()
     except (OSError, subprocess.CalledProcessError, FileNotFoundError):
         return ""
+
+
+def process_environ(pid: int) -> dict[str, str]:
+    """读取进程环境变量；失败返回空字典。
+
+    供扫描器从托管注入的 ``PICKUP_SESSION_ID`` / ``SC_SESSION_ID`` 精确绑会话。
+    Linux 读 ``/proc/<pid>/environ``；macOS 用 ``ps eww``（输出混在命令行尾部）。
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                raw = f.read()
+            if not raw:
+                return {}
+            env: dict[str, str] = {}
+            for item in raw.split(b"\x00"):
+                if not item or b"=" not in item:
+                    continue
+                key, value = item.decode(errors="replace").split("=", 1)
+                env[key] = value
+            return env
+        out = subprocess.check_output(
+            ["ps", "eww", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    env: dict[str, str] = {}
+    # ps eww 把环境变量拼在同一行；只提取我们关心的键，避免把命令参数误当环境。
+    for key in (
+        "PICKUP_SESSION_ID",
+        "SC_SESSION_ID",
+        "PICKUP_RUNTIME",
+        "SC_RUNTIME",
+    ):
+        marker = f"{key}="
+        start = out.find(marker)
+        if start < 0:
+            continue
+        start += len(marker)
+        end = start
+        while end < len(out) and not out[end].isspace():
+            end += 1
+        env[key] = out[start:end]
+    return env
+
+
+def open_file_paths(pids: list[int]) -> dict[int, list[str]]:
+    """批量读取进程打开的文件路径；失败的 pid 不出现在结果里。
+
+    Linux 读 ``/proc/<pid>/fd``；其余平台一次 ``lsof -Fn``。
+    供 Cursor 等从打开的 ``store.db`` 反推真实会话 ID。
+    """
+    if not pids:
+        return {}
+    result: dict[int, list[str]] = {pid: [] for pid in pids}
+    if sys.platform.startswith("linux"):
+        for pid in pids:
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                names = os.listdir(fd_dir)
+            except OSError:
+                result.pop(pid, None)
+                continue
+            paths: list[str] = []
+            for name in names:
+                try:
+                    paths.append(os.readlink(os.path.join(fd_dir, name)))
+                except OSError:
+                    continue
+            result[pid] = paths
+        return {pid: paths for pid, paths in result.items() if paths is not None}
+
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-Fn", "-p", ",".join(str(pid) for pid in pids)],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    current: int | None = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                current = int(line[1:])
+            except ValueError:
+                current = None
+            continue
+        if current is None or current not in result:
+            continue
+        if line.startswith("n"):
+            result[current].append(line[1:])
+    return result

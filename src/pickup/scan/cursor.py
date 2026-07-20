@@ -25,7 +25,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
-from pickup.scan.common import live_processes, process_command_line
+from pickup.scan.common import (
+    live_processes,
+    open_file_paths,
+    process_command_line,
+    process_environ,
+)
 from pickup.scan.common import shorten_cwd as _shorten_cwd
 
 CHATS_DIR = os.path.expanduser("~/.cursor/chats")
@@ -35,6 +40,12 @@ _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
 _RESUME_ID_RE = re.compile(
     r"--resume(?:=|\s+)(?P<id>-1|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+# agent 打开的 ~/.cursor/chats/<workspace>/<chatId>/store.db（含 -wal/-shm）。
+_OPEN_CHAT_STORE_RE = re.compile(
+    r"/[.]cursor/chats/[^/]+/"
+    r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/store[.]db"
 )
 
 
@@ -216,48 +227,93 @@ def _resume_id_from_cmdline(cmdline: str) -> str | None:
     return resume_id
 
 
+def _chat_ids_from_open_paths(paths: list[str]) -> list[str]:
+    """从打开的文件路径提取 Cursor chatId；同一会话的 db/wal/shm 去重且保持次序。"""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for path in paths:
+        match = _OPEN_CHAT_STORE_RE.search(path.replace("\\", "/"))
+        if not match:
+            continue
+        chat_id = match.group("id")
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        ordered.append(chat_id)
+    return ordered
+
+
+def _session_for_pickup_ident(by_id: dict[str, dict], ident: str) -> dict | None:
+    """用托管注入的 PICKUP_SESSION_ID / SC_SESSION_ID 匹配会话。
+
+    原生恢复注入完整 chatId；空白新建/接力注入的是 8 位临时标识，
+    与历史 chatId 无对应关系，不得拿来碰运气前缀匹配。
+    """
+    text = str(ident or "").strip()
+    if not text:
+        return None
+    if text in by_id:
+        return by_id[text]
+    # 完整 UUID 才允许按无连字符形式或前缀对齐；短临时 id 直接放弃。
+    if len(text) < 32 and "-" not in text:
+        return None
+    compact = text.replace("-", "")
+    for session_id, session in by_id.items():
+        if session_id.replace("-", "") == compact:
+            return session
+        if session_id.startswith(text) or session_id.replace("-", "").startswith(compact):
+            return session
+    return None
+
+
+def _mark_live(session: dict, pid: int) -> bool:
+    """若会话尚未标记存活则写入 live/pid，返回是否本次新标记。"""
+    if session.get("live"):
+        return False
+    session["live"] = True
+    session["pid"] = pid
+    return True
+
+
 def _apply_live_flags(sessions: list[dict]) -> None:
     """给 Cursor 会话列表就地标注 live/pid。
 
-    同一工作目录常会同时跑多个 `agent`（旧会话 `--resume` + 跨助手接力新建）。
-    若仍按「cwd → 单个 pid」折叠，新接续会话的标题会绑到旧进程的保活画面，
-    表现为侧边栏是新会话、右栏却是另一个旧会话。
+    同一工作目录常会同时跑多个 `agent`（旧会话 `--resume`、空白新建、跨助手接力）。
+    旧实现在无 `--resume` 时按「cwd → mtime 最新未标记会话」兜底，会把空壳新建进程
+    错绑到同目录里更早的真实历史（真机：标题「我想加个顶栏」却打开空白欢迎页）。
 
-    绑定优先级：
-    1. 命令行带 `--resume <chatId>` 的进程，精确挂到对应会话；
-    2. 其余无 resume 的进程，按 cwd 挂到尚未标记、且 mtime 最新的会话。
+    绑定优先级（全部是正向证据，不再做 cwd 猜测）：
+    1. 命令行 `--resume <chatId>`；
+    2. 进程已打开的 `~/.cursor/chats/.../<chatId>/store.db`；
+    3. 环境变量 `PICKUP_SESSION_ID` / `SC_SESSION_ID`（仅完整会话 id）。
     """
     by_id = {str(session.get("id") or ""): session for session in sessions}
-    unmatched_by_cwd: dict[str, list[int]] = {}
-
-    for pid, cwd in live_processes("agent"):
-        resume_id = _resume_id_from_cmdline(process_command_line(pid))
-        if resume_id and resume_id in by_id:
-            session = by_id[resume_id]
-            if not session.get("live"):
-                session["live"] = True
-                session["pid"] = pid
-            continue
-        unmatched_by_cwd.setdefault(cwd, []).append(pid)
-
-    if not unmatched_by_cwd:
+    agents = list(live_processes("agent"))
+    if not agents:
         return
 
-    candidates_by_cwd: dict[str, list[dict]] = {}
-    for session in sessions:
-        if session.get("live"):
-            continue
-        cwd = str(session.get("cwd") or "")
-        if not cwd:
-            continue
-        candidates_by_cwd.setdefault(os.path.realpath(cwd), []).append(session)
+    open_paths = open_file_paths([pid for pid, _ in agents])
 
-    for cwd, pids in unmatched_by_cwd.items():
-        candidates = candidates_by_cwd.get(cwd) or []
-        # sessions 已按 mtime 降序；同 cwd 候选保持该顺序，逐个消费未绑定进程。
-        for pid, session in zip(pids, candidates):
-            session["live"] = True
-            session["pid"] = pid
+    for pid, _cwd in agents:
+        resume_id = _resume_id_from_cmdline(process_command_line(pid))
+        if resume_id and resume_id in by_id:
+            _mark_live(by_id[resume_id], pid)
+            continue
+
+        bound = False
+        for chat_id in _chat_ids_from_open_paths(open_paths.get(pid) or []):
+            session = by_id.get(chat_id)
+            if session is not None and _mark_live(session, pid):
+                bound = True
+                break
+        if bound:
+            continue
+
+        env = process_environ(pid)
+        ident = env.get("PICKUP_SESSION_ID") or env.get("SC_SESSION_ID") or ""
+        session = _session_for_pickup_ident(by_id, ident)
+        if session is not None:
+            _mark_live(session, pid)
 
 
 def _text_from_content(content) -> str:
