@@ -5,9 +5,12 @@ tmux 子进程一律 mock，不需要真实 tmux，可在无终端环境跑。
 
 from __future__ import annotations
 
+import base64
+import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -247,6 +250,70 @@ class SessionIoTests(unittest.TestCase):
         with mock.patch.object(embed.subprocess, "run") as run:
             embed.resize("pickup-claude-x", 20, 18)
         run.assert_not_called()
+
+
+class ImagePasteTests(unittest.TestCase):
+    """浏览器增强脚本裹哨兵的图片粘贴：识别、落盘、送路径进 pane。"""
+
+    def test_extract_pasted_image_roundtrip(self):
+        raw = b"\xff\xd8\xfffake-jpeg-bytes"
+        b64 = base64.b64encode(raw).decode()
+        wrapped = f"␞PICKUP_IMG_BEGIN␞{b64}␞PICKUP_IMG_END␞"
+        self.assertEqual(embed.extract_pasted_image(wrapped), raw)
+
+    def test_extract_pasted_image_none_for_plain_text(self):
+        self.assertIsNone(embed.extract_pasted_image("普通粘贴文本"))
+        self.assertIsNone(embed.extract_pasted_image(""))
+
+    def test_extract_pasted_image_none_for_bad_base64(self):
+        wrapped = "␞PICKUP_IMG_BEGIN␞***not-base64***␞PICKUP_IMG_END␞"
+        self.assertIsNone(embed.extract_pasted_image(wrapped))
+
+    def test_pane_cwd_parses_display_message(self):
+        with mock.patch.object(embed.subprocess, "check_output", return_value=b"/home/vibecoder/proj\n"):
+            self.assertEqual(embed._pane_cwd("s"), "/home/vibecoder/proj")
+
+    def test_pane_cwd_none_on_failure(self):
+        with mock.patch.object(embed.subprocess, "check_output",
+                               side_effect=subprocess.CalledProcessError(1, [])):
+            self.assertIsNone(embed._pane_cwd("s"))
+
+    def test_save_image_and_paste_path_uses_pane_cwd(self):
+        tmp_root = tempfile.mkdtemp()
+        try:
+            calls = []
+
+            def check_output_side_effect(argv, **_kwargs):
+                return (tmp_root + "\n").encode()
+
+            def run_side_effect(argv, **_kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(args=argv, returncode=0)
+
+            with mock.patch.object(embed.subprocess, "check_output",
+                                   side_effect=check_output_side_effect), \
+                    mock.patch.object(embed.subprocess, "run", side_effect=run_side_effect):
+                path = embed.save_image_and_paste_path("s", b"\xff\xd8\xff-fake")
+            self.assertIsNotNone(path)
+            self.assertTrue(path.startswith(tmp_root))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"\xff\xd8\xff-fake")
+            # 落盘后应经 paste() 把路径送进 pane（set-buffer + paste-buffer）
+            self.assertTrue(any("set-buffer" in c for c in calls))
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    def test_save_image_and_paste_path_falls_back_to_tempdir(self):
+        with mock.patch.object(embed.subprocess, "check_output",
+                               side_effect=subprocess.CalledProcessError(1, [])), \
+                mock.patch.object(embed.subprocess, "run", side_effect=_run_completed_ok):
+            path = embed.save_image_and_paste_path("s", b"data")
+        try:
+            self.assertIsNotNone(path)
+            self.assertTrue(path.startswith(tempfile.gettempdir()))
+        finally:
+            if path:
+                os.remove(path)
 
 
 class ControlModeTests(unittest.TestCase):

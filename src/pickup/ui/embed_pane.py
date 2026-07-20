@@ -49,7 +49,7 @@ from typing import Callable
 
 from rich.segment import Segment
 from rich.text import Text
-from textual import events
+from textual import events, work
 from textual.dom import NoScreen
 from textual.geometry import Region
 from textual.reactive import reactive
@@ -773,9 +773,25 @@ class EmbedPane(Widget):
             embed.send_key(name, translated[1])
 
     def _on_paste(self, event: events.Paste) -> None:
-        if self.session_name and not self.dead:
+        if not self.session_name or self.dead:
+            return
+        # 浏览器增强脚本（shell-gate 注入进 ttyd 页面）把剪贴板图片压缩后裹上
+        # 哨兵标记，经普通粘贴通道送到这里；识别到就落盘再把路径喂给 agent，
+        # 不当文本转发。普通文本粘贴走原有路径不受影响。
+        image_bytes = embed.extract_pasted_image(event.text)
+        if image_bytes is not None:
+            self._paste_image_worker(self.session_name, image_bytes)
+        else:
             embed.paste(self.session_name, event.text)
-            event.stop()
+        event.stop()
+
+    @work(thread=True, group="paste-image")
+    def _paste_image_worker(self, name: str, image_bytes: bytes) -> None:
+        # 查 pane 工作目录 + 落盘 + paste() 都要走 tmux 子进程/控制通道，
+        # 不能在主线程做（同类约束见 _host_and_focus 等其它 tmux 调用）。
+        path = embed.save_image_and_paste_path(name, image_bytes)
+        if path is None:
+            self.app.bell()
 
     def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         self._wheel(65, event.x, event.y, -WHEEL_SCROLL_LINES)
