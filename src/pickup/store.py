@@ -11,6 +11,7 @@ from pickup import embed, keepalive, titles
 from pickup.display import (
     _filter_sessions_by_query,
     _normalize_cwd,
+    _project_groups,
 )
 from pickup.models import ConversationMessage, session_key
 from pickup.runtime import RuntimeRegistry, default_registry
@@ -37,6 +38,11 @@ class SessionStore:
         # （或像某些 fake CLI 一样根本不注册）时，后台重扫替换会话字典后仍能立刻恢复
         # keepalive_name，避免 x 拒绝关闭、回车误开竞争进程。
         self.hosted: dict[str, str] = {}
+        # 跨运行时接力 / 空白新建：目标助手尚未落盘历史时，扫描器看不到条目。
+        # 这里暂存本进程插入的「运行中(托管)」占位卡，后台重扫时若磁盘仍无对应
+        # 会话且 tmux 还活着，就重新灌回列表；真实会话一经 annotate 挂上同一
+        # keepalive 名，占位卡即退役（见 _merge_scanned）。
+        self._provisional: dict[str, dict] = {}
         # 用户刚用 q 结束的会话键：杀掉到进程真正退出之间，扫描仍可能报 live=True。
         # 在确认已死之前强制按已结束展示，避免「托管 → 运行中 → 已结束」闪烁。
         self._force_ended: set[str] = set()
@@ -175,6 +181,30 @@ class SessionStore:
 
         with self.lock:
             self.sessions.update(scanned)
+            claimed_keepalive = {
+                session.get("keepalive_name")
+                for bucket in self.sessions.values()
+                for session in bucket
+                if session.get("keepalive_name")
+            }
+            for key, provisional in list(self._provisional.items()):
+                name = self.hosted.get(key) or provisional.get("keepalive_name")
+                if name and name in claimed_keepalive:
+                    # 真实会话已挂上同一托管名：占位卡退役，避免双卡。
+                    self._provisional.pop(key, None)
+                    self.hosted.pop(key, None)
+                    continue
+                if not name or not embed.is_alive(str(name)):
+                    self._provisional.pop(key, None)
+                    self.hosted.pop(key, None)
+                    continue
+                runtime_id = str(provisional.get("source") or "")
+                bucket = self.sessions.setdefault(runtime_id, [])
+                if any(session_key(session) == key for session in bucket):
+                    continue
+                provisional["keepalive_name"] = name
+                provisional["live"] = True
+                bucket.insert(0, provisional)
             by_key: dict[str, dict] = {}
             for bucket in self.sessions.values():
                 for session in bucket:
@@ -253,6 +283,63 @@ class SessionStore:
                         return session
         return None
 
+    def register_hosted_session(
+        self,
+        *,
+        runtime_id: str,
+        keepalive_name: str,
+        title: str,
+        cwd: str | None,
+        ident: str | None = None,
+    ) -> dict:
+        """跨运行时接力 / 空白新建：在扫描出真实历史前插入「运行中(托管)」占位卡。
+
+        返回写入列表的会话 dict；调用方应用其会话键选中左栏并挂右栏画面。
+        """
+        from pickup.scan.common import shorten_cwd
+        from pickup.models import format_message_time
+
+        session_id = ident or keepalive_name.rsplit("-", 1)[-1]
+        now = time.time()
+        cwd_text = str(cwd or "").strip()
+        session = {
+            "source": runtime_id,
+            "id": session_id,
+            "short_id": session_id.replace("-", "")[:12],
+            "cwd": cwd_text,
+            "cwd_display": shorten_cwd(cwd_text) if cwd_text else "",
+            "mtime": now,
+            "display_time": format_message_time(now),
+            "time_source": "provisional",
+            "event_time": now,
+            "file_mtime": now,
+            "size_bytes": 0,
+            "size_kb": 0,
+            "native_title": None,
+            "fallback_title": title or f"新{runtime_id}会话",
+            "status_tag": titles.STATUS_PENDING,
+            "live": True,
+            "pid": None,
+            "first_user_msg": "",
+            "last_user_msg": "",
+            "last_agent_msg": "",
+            "path": "",
+            "keepalive_name": keepalive_name,
+            "provisional": True,
+        }
+        key = session_key(session)
+        with self.lock:
+            self.hosted[key] = keepalive_name
+            self._force_ended.discard(key)
+            self._provisional[key] = session
+            bucket = self.sessions.setdefault(runtime_id, [])
+            bucket[:] = [item for item in bucket if session_key(item) != key]
+            bucket.insert(0, session)
+            self._order = [key] + [item for item in self._order if item != key]
+            self.display_titles[key] = session["fallback_title"]
+            self.generating.discard(key)
+        return session
+
     def mark_hosted(self, key: str, name: str | None) -> dict | None:
         """原子登记/清除托管会话，并同步更新当前扫描快照中的展示字段。
 
@@ -267,6 +354,7 @@ class SessionStore:
                 self._force_ended.discard(key)
             else:
                 self.hosted.pop(key, None)
+                self._provisional.pop(key, None)
                 self._force_ended.add(key)
             for bucket in self.sessions.values():
                 for session in bucket:
@@ -355,7 +443,6 @@ class SessionStore:
             if cached is not None and cached[0] == mtime:
                 return list(cached[1])
         return None
-
 
 
 def _new_session_cwd(store: SessionStore, nav, session: dict | None) -> str | None:

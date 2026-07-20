@@ -241,6 +241,9 @@ def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
 
 
 def main() -> None:
+    # 尽早挂崩溃钩子：TUI 闪退后 stderr 常被清掉，必须先落盘才能事后 diagnose。
+    observe.install_crash_hooks()
+
     # list/search/show/context/plan/describe 是面向 Agent 的机器可读子命令，整体转发给
     # agent_api，不与下面的 TUI/--json 旧参数共用同一个 parser。
     if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_ROOT_NAMES:
@@ -335,7 +338,6 @@ def main() -> None:
     # 这一步仍然必须在 UI 启动前同步完成（EmbedPane/MainScreen 的深浅色主题判断
     # 依赖它），但现在跟上面的后台扫描线程是并行的，不再是"扫描 + 探测"首尾相加。
     theme_mod._OSC_REPORT = _probe_osc_colours()
-    from pickup import observe
     observe.init(debug=bool(os.environ.get("PICKUP_DEBUG")))
     if os.environ.get("PICKUP_DEBUG"):
         observe.debug(

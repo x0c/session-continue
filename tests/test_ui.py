@@ -201,15 +201,59 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app._compositor_recovery_budget, 1)
         self.assertNotEqual(getattr(app, "_return_code", None), 1)
 
-        # 额度耗尽后仍走默认致命路径
+        # 额度耗尽后仍走默认致命路径，并落盘供 diagnose 读取
         app._compositor_recovery_budget = 0
         with (
             mock.patch.object(app, "_force_full_repaint", side_effect=_fake_force),
             mock.patch("textual.app.App._handle_exception") as fatal,
+            mock.patch("pickup.observe.log_exception") as logged,
         ):
             app._handle_exception(IndexError("list index out of range"))
         fatal.assert_called_once()
+        logged.assert_called_once()
+        self.assertEqual(logged.call_args.args[0], "TUI 未捕获异常")
         self.assertEqual(forced, [1], "额度耗尽后不应再尝试整屏重绘")
+
+    def test_fatal_tui_exception_is_logged_before_exit(self) -> None:
+        """非 compositor 自愈的致命异常必须写入 observe，不能只闪在终端。"""
+        from pickup import observe
+        import tempfile
+
+        store, _ = _make_store()
+        with tempfile.TemporaryDirectory() as tmp:
+            events_path = os.path.join(tmp, "events.log")
+            embed_path = os.path.join(tmp, "embed-error.log")
+            with (
+                mock.patch.object(observe, "CACHE_DIR", tmp),
+                mock.patch.object(observe, "EVENTS_LOG", events_path),
+                mock.patch.object(observe, "EMBED_ERROR_LOG", embed_path),
+            ):
+                observe.reset_for_tests()
+                observe.init(debug=False)
+                app = PickupApp(store, embed_ok=False)
+
+                def _boom() -> None:
+                    raise NameError("name '_project_groups' is not defined")
+
+                try:
+                    _boom()
+                except NameError as inner:
+                    class WorkerFailed(Exception):
+                        def __init__(self, error: BaseException) -> None:
+                            self.error = error
+                            super().__init__(f"Worker raised exception: {error!r}")
+
+                    wrapped = WorkerFailed(inner)
+                with mock.patch("textual.app.App._handle_exception"):
+                    app._handle_exception(wrapped)
+                last = observe.read_last_error()
+                self.assertIsNotNone(last)
+                assert last is not None
+                self.assertEqual(last["where"], "TUI 未捕获异常")
+                self.assertEqual(last["exc_type"], "NameError")
+                self.assertIn("_project_groups", last["traceback"])
+                self.assertIn("_boom", last["traceback"])
+                self.assertIn("via WorkerFailed", last["traceback"])
 
     async def test_f12_saves_screenshot_under_cache(self) -> None:
         from pickup import observe
@@ -908,8 +952,68 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
                 await _wait_until(lambda: not app.screen._host_busy)
                 self.assertTrue(pane.focus_session.called)
                 self.assertEqual(pane.focus_session.call_args_list[0].args[0], "pickup-claude-new")
-                # 新建路径没有关联会话，fallback 必须是 None
-                self.assertIsNone(pane.focus_session.call_args_list[0].args[1])
+                # 新建也会插入托管占位卡，fallback 用于详情头（不再是 None）
+                self.assertIsNotNone(pane.focus_session.call_args_list[0].args[1])
+                await _wait_until(
+                    lambda: any(
+                        s.get("keepalive_name") == "pickup-claude-new"
+                        for s in app.screen.query_one(SessionListView).visible_sessions()
+                    )
+                )
+
+    async def test_cross_runtime_handoff_shows_hosted_card_and_keeps_embed(self) -> None:
+        """回归：Claude→Cursor 接力后左栏立刻出现托管卡，右栏保持新 embed。
+
+        真机实报：按 a 选 Cursor 后 host_session 成功，但 Cursor 卡在 Workspace Trust、
+        尚未落盘 chat 时扫描器无条目；跨运行时路径又不 mark_hosted，左栏不冒新卡。
+        同时 `_rebuild_list` → `_follow_current_selection` 因仍选中源 Claude，把右栏
+        盖回对话预览，看起来像「什么都没发生」。
+        """
+        cursor = mock.Mock()
+        cursor.id = "cursor"
+        cursor.display_name = "Cursor"
+        cursor.is_available.return_value = True
+        cursor.scan_sessions.return_value = []
+        cursor.load_conversation.return_value = []
+        store, registry = _make_store(extra_runtimes=(cursor,))
+        registry.build_launch_plan = lambda request: LaunchPlan(("agent", "--force", "prompt"), "/tmp")
+        app = PickupApp(store, embed_ok=True)
+
+        with mock.patch("pickup.embed.host_session", return_value="pickup-cursor-handoff") as host_mock:
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(delay=0.2)
+                pane = app.screen.query_one(EmbedPane)
+                list_view = app.screen.query_one(SessionListView)
+
+                await pilot.press("down")
+                await pilot.press("a")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, RuntimePickerModal)
+                await pilot.press("down")  # claude 原生恢复 → cursor
+                await pilot.press("enter")
+                await _wait_until(lambda: host_mock.call_count == 1)
+                await _wait_until(lambda: not app.screen._host_busy)
+                # 等 call_next(_rebuild_list) 跑完
+                await _wait_until(
+                    lambda: any(
+                        s.get("keepalive_name") == "pickup-cursor-handoff"
+                        for s in list_view.visible_sessions()
+                    )
+                )
+                await pilot.pause(delay=0.05)
+
+                hosted = [
+                    s for s in list_view.visible_sessions()
+                    if s.get("keepalive_name") == "pickup-cursor-handoff"
+                ]
+                self.assertEqual(len(hosted), 1, "左栏应立刻出现 Cursor 托管占位卡")
+                self.assertEqual(hosted[0].get("source"), "cursor")
+                selected = list_view.selected_session()
+                self.assertIsNotNone(selected)
+                self.assertEqual(selected.get("keepalive_name"), "pickup-cursor-handoff")
+                self.assertEqual(pane.session_name, "pickup-cursor-handoff")
+                self.assertTrue(list_view.has_focus)
+                self.assertFalse(pane.has_focus)
 
 
 @unittest.skipUnless(HAS_TMUX, "内嵌面板依赖真实 tmux")

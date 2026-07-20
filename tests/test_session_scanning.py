@@ -2301,6 +2301,52 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertNotIn("claude:s0", store._force_ended)
         self.assertFalse(store.find_session("claude:s0").get("live"))
 
+    def test_register_hosted_session_survives_refresh_until_real_session_claims(self) -> None:
+        """跨运行时接力占位卡：磁盘尚无历史时重扫不能抹掉；真实会话挂上同名托管后退役。"""
+        cursor_runtime = mock.Mock()
+        cursor_runtime.id = "cursor"
+        cursor_runtime.display_name = "Cursor"
+        cursor_runtime.scan_signature.return_value = None
+        cursor_runtime.scan_sessions.return_value = []
+        registry = pickup.RuntimeRegistry((cursor_runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+
+        provisional = store.register_hosted_session(
+            runtime_id="cursor",
+            keepalive_name="pickup-cursor-abcd1234",
+            title="接力自 Claude",
+            cwd="/tmp/proj",
+        )
+        key = pickup.session_key(provisional)
+        self.assertEqual(provisional.get("keepalive_name"), "pickup-cursor-abcd1234")
+        self.assertTrue(provisional.get("provisional"))
+        self.assertEqual(store.find_session(key)["fallback_title"], "接力自 Claude")
+
+        with mock.patch.object(pickup.keepalive, "annotate"), mock.patch.object(
+            pickup.embed, "is_alive", return_value=True
+        ):
+            store.refresh()
+        kept = store.find_session(key)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept.get("keepalive_name"), "pickup-cursor-abcd1234")
+
+        real = {
+            "source": "cursor", "id": "real-uuid", "short_id": "realuuid", "mtime": 9.0,
+            "size_bytes": 1, "size_kb": 1, "native_title": "真会话", "fallback_title": "真会话",
+            "cwd": "/tmp/proj", "live": True, "pid": 42,
+            "keepalive_name": "pickup-cursor-abcd1234",
+        }
+        cursor_runtime.scan_sessions.return_value = [real]
+        with mock.patch.object(pickup.keepalive, "annotate"), mock.patch.object(
+            pickup.embed, "is_alive", return_value=True
+        ):
+            store.refresh()
+        self.assertIsNone(store.find_session(key))
+        self.assertIsNotNone(store.find_session("cursor:real-uuid"))
+        self.assertNotIn(key, store._provisional)
+
     def test_refresh_rebinds_hosted_name_via_embed_is_alive(self) -> None:
         """本进程托管记录在 annotate 未命中时，必须能调用 embed.is_alive 兜底回填。
 
@@ -2385,6 +2431,25 @@ class ProjectSidebarTests(unittest.TestCase):
         self.assertEqual(groups[0]["cwd_key"], "")
         self.assertEqual(groups[0]["label"], pickup.UNKNOWN_PROJECT_LABEL)
         self.assertEqual(groups[0]["count"], 2)
+
+    def test_session_store_projects_resolves_project_groups(self) -> None:
+        """SessionStore.projects 必须能调用 _project_groups，不能 NameError 闪退。"""
+        from pickup.store import SessionStore
+
+        runtime = mock.Mock(id="claude", display_name="Claude")
+        runtime.scan_signature.return_value = None
+        runtime.scan_sessions.return_value = []
+        registry = pickup.RuntimeRegistry((runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}), mock.patch.object(
+            pickup.keepalive, "annotate"
+        ):
+            store = SessionStore(limit=5, registry=registry)
+        store.sessions = {
+            "claude": [{"cwd": "/proj/a", "mtime": 3}, {"cwd": "/proj/b", "mtime": 1}],
+        }
+        groups = store.projects()
+        self.assertEqual([g["cwd_key"] for g in groups], ["/proj/a", "/proj/b"])
+        self.assertEqual(groups[0]["count"], 1)
 
     def test_disambiguate_adds_parent_only_on_conflict(self) -> None:
         labels = pickup._disambiguate_labels(["/a/x/cli", "/b/y/app"])

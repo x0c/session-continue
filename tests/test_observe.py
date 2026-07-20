@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -115,6 +116,93 @@ class ObserveTests(unittest.TestCase):
         self.assertIn("RuntimeError", body)
         self.assertIn("boom", body)
         self.assertIn("Traceback", body)
+
+    def test_read_last_error_returns_none_when_missing(self) -> None:
+        self.assertIsNone(self.observe.read_last_error())
+
+    def test_read_last_error_returns_most_recent_entry(self) -> None:
+        self.observe.init(debug=False)
+        try:
+            raise RuntimeError("first")
+        except RuntimeError as exc:
+            self.observe.log_exception("早期", exc)
+        try:
+            raise NameError("name '_project_groups' is not defined")
+        except NameError as exc:
+            self.observe.log_exception("TUI 未捕获异常", exc)
+        last = self.observe.read_last_error()
+        self.assertIsNotNone(last)
+        assert last is not None
+        self.assertEqual(last["where"], "TUI 未捕获异常")
+        self.assertEqual(last["exc_type"], "NameError")
+        self.assertIn("_project_groups", last["exc_msg"])
+        self.assertIn("Traceback", last["traceback"])
+        self.assertIn("ts", last)
+
+    def test_crash_hooks_log_uncaught_exception(self) -> None:
+        self.observe.init(debug=False)
+        self.observe.install_crash_hooks()
+        try:
+            raise ValueError("fatal flash")
+        except ValueError:
+            # 模拟 sys.excepthook：把当前异常交给 hook，而不是真的退出进程。
+            exc_type, exc, tb = sys.exc_info()
+            assert exc_type is not None and exc is not None
+            sys.excepthook(exc_type, exc, tb)
+        last = self.observe.read_last_error()
+        self.assertIsNotNone(last)
+        assert last is not None
+        self.assertEqual(last["where"], "进程未捕获异常")
+        self.assertEqual(last["exc_type"], "ValueError")
+        self.assertIn("fatal flash", last["exc_msg"])
+
+    def test_log_exception_unwraps_worker_failed_style_wrapper(self) -> None:
+        """Textual WorkerFailed 只带短消息；必须展开 .error 写出内层完整栈。"""
+        self.observe.init(debug=False)
+
+        def _boom() -> None:
+            raise NameError("name '_project_groups' is not defined")
+
+        try:
+            _boom()
+        except NameError as inner:
+            class WorkerFailed(Exception):
+                def __init__(self, error: BaseException) -> None:
+                    self.error = error
+                    super().__init__(f"Worker raised exception: {error!r}")
+
+            wrapped = WorkerFailed(inner)
+            self.observe.log_exception("TUI 未捕获异常", wrapped)
+
+        rows = self._lines()
+        self.assertEqual(rows[0]["exc_type"], "NameError")
+        self.assertIn("_project_groups", rows[0]["exc_msg"])
+        self.assertEqual(rows[0]["via"], "WorkerFailed")
+        last = self.observe.read_last_error()
+        self.assertIsNotNone(last)
+        assert last is not None
+        self.assertEqual(last["exc_type"], "NameError")
+        self.assertIn("_project_groups", last["exc_msg"])
+        self.assertIn("Traceback", last["traceback"])
+        self.assertIn("_boom", last["traceback"])
+        self.assertIn("via WorkerFailed", last["traceback"])
+
+    def test_log_exception_unwraps_cause_chain(self) -> None:
+        self.observe.init(debug=False)
+        try:
+            try:
+                raise NameError("name '_project_groups' is not defined")
+            except NameError as inner:
+                raise RuntimeError("wrapper") from inner
+        except RuntimeError as wrapped:
+            self.observe.log_exception("TUI 未捕获异常", wrapped)
+        rows = self._lines()
+        self.assertEqual(rows[0]["exc_type"], "NameError")
+        self.assertEqual(rows[0]["via"], "RuntimeError")
+        last = self.observe.read_last_error()
+        assert last is not None
+        self.assertEqual(last["exc_type"], "NameError")
+        self.assertIn("via RuntimeError", last["traceback"])
 
 
 class PickupEmbedErrorBridgeTests(unittest.TestCase):

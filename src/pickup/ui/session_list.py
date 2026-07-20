@@ -258,18 +258,20 @@ class SessionListView(ListView):
     def is_new_session_selected(self) -> bool:
         return self.index == 0
 
-    async def rebuild(self, *, keep_selection: bool = True) -> None:
+    async def rebuild(self, *, keep_selection: bool = True, select_key: str | None = None) -> None:
         """按当前筛选重建条目；尽量保持原有选中的会话不变（后台重扫后调用）。
 
         会话集合（顺序+成员）没变时走原地更新——只换 SessionCard 手上的
         session 引用、按需 refresh()，不碰 ListView 子项结构；集合真的变了
         （新增/删除/顺序变化）才走批量清空重建，见 docs/MAINTAINER_GUIDE.md
         「界面」节的性能优化记录。
+
+        `select_key`：跨运行时接力 / 空白新建后强制选中刚插入的托管占位卡。
         """
         import pickup
 
-        previous_key = None
-        if keep_selection:
+        previous_key = select_key
+        if previous_key is None and keep_selection:
             selected = self.selected_session()
             if selected is not None:
                 previous_key = pickup.session_key(selected)
@@ -278,7 +280,7 @@ class SessionListView(ListView):
         new_keys = [pickup.session_key(session) for session in sessions]
         t0 = time.perf_counter()
 
-        if new_keys == self._current_session_keys():
+        if new_keys == self._current_session_keys() and select_key is None:
             self._update_cards_in_place(sessions)
             if previous_key is None and self.index is None:
                 self.index = 1 if sessions else 0
@@ -320,6 +322,7 @@ class SessionListView(ListView):
         for i, session in enumerate(sessions):
             if previous_key is not None and pickup.session_key(session) == previous_key:
                 new_index = i + 1
+                break
         if previous_key is not None:
             self.index = new_index
         elif not had_session_cards:

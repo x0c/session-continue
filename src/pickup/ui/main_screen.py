@@ -219,8 +219,8 @@ class MainScreen(Screen):
             self.store.dirty.clear()
             self.call_next(self._rebuild_list)
 
-    async def _rebuild_list(self) -> None:
-        await self.query_one(SessionListView).rebuild()
+    async def _rebuild_list(self, select_key: str | None = None) -> None:
+        await self.query_one(SessionListView).rebuild(select_key=select_key)
         self._update_header()
         if self.embed_ok:
             pane = self.query_one(EmbedPane)
@@ -463,12 +463,17 @@ class MainScreen(Screen):
 
         `request` 可能是 `LaunchRequest`（恢复/接力）或 `NewSessionRequest`（空白新建）。
         后者没有关联会话，不能读 `.session`——按 `n` 新建时曾经因此闪退。
+
+        跨运行时接力 / 空白新建时目标助手可能尚未落盘历史（例如 Cursor 卡在
+        Workspace Trust），扫描器看不到条目；必须立刻插入托管占位卡并选中它，
+        否则左栏空白、随后的 `_rebuild_list` 还会按仍选中的源会话把右栏盖回去。
         """
         import pickup
 
         self._host_busy = False
         pane = self.query_one(EmbedPane)
         fallback = None
+        select_key = None
         if isinstance(request, pickup.LaunchRequest):
             current = request.session
             if same_runtime:
@@ -477,10 +482,32 @@ class MainScreen(Screen):
                 if marked is None:
                     request.session["keepalive_name"] = name
                 current = marked or request.session
+            else:
+                source_name = self.store.registry.get(
+                    str(request.session.get("source") or "")
+                ).display_name
+                title = request.title or f"接力自 {source_name}"
+                current = self.store.register_hosted_session(
+                    runtime_id=request.target_runtime_id,
+                    keepalive_name=name,
+                    title=title,
+                    cwd=str(request.session.get("cwd") or "") or None,
+                )
+                select_key = pickup.session_key(current)
+            fallback = lambda s=current: self._render_detail(s)
+        else:
+            runtime = self.store.registry.get(request.target_runtime_id)
+            current = self.store.register_hosted_session(
+                runtime_id=request.target_runtime_id,
+                keepalive_name=name,
+                title=f"新{runtime.display_name}会话",
+                cwd=request.cwd,
+            )
+            select_key = pickup.session_key(current)
             fallback = lambda s=current: self._render_detail(s)
         # 托管成功只更新右栏画面；键盘焦点留在侧边栏，点右栏才进入内嵌交互。
         pane.focus_session(name, fallback)
-        self.call_next(self._rebuild_list)
+        self.call_next(self._rebuild_list, select_key)
 
     def _host_direct_launch(self) -> None:
         if self._host_busy:

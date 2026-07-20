@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -347,8 +348,32 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn("cache_dir", data)
         self.assertIn("events_log", data)
         self.assertIn("embed_error_log", data)
+        self.assertIn("last_error", data)
         self.assertEqual(data["runtime_label_style_claude"], "bold #D97757")
         self.assertIsInstance(data["hints"], list)
+
+    def test_diagnose_includes_last_error_from_embed_log(self) -> None:
+        from pickup import observe
+
+        with tempfile.TemporaryDirectory() as cache:
+            events = os.path.join(cache, "events.log")
+            embed_err = os.path.join(cache, "embed-error.log")
+            with mock.patch.object(observe, "CACHE_DIR", cache), mock.patch.object(
+                observe, "EVENTS_LOG", events
+            ), mock.patch.object(observe, "EMBED_ERROR_LOG", embed_err):
+                observe.reset_for_tests()
+                observe.init(debug=False)
+                try:
+                    raise NameError("name '_project_groups' is not defined")
+                except NameError as exc:
+                    observe.log_exception("TUI 未捕获异常", exc)
+                result = agent_api.cmd_diagnose(argparse_namespace(), self.registry)
+        self.assertTrue(result["ok"])
+        last = result["data"]["last_error"]
+        self.assertIsNotNone(last)
+        self.assertEqual(last["where"], "TUI 未捕获异常")
+        self.assertEqual(last["exc_type"], "NameError")
+        self.assertIn("_project_groups", last["traceback"])
 
     # ---- dispatch: envelope + exit codes end-to-end ----
 

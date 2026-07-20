@@ -107,6 +107,7 @@ class PickupApp(App):
 
         Textual 默认 `_handle_exception` 一律退出。真机在拖动窗口时偶发
         `ChopsUpdate` 的 `chops[y]` IndexError（spans 仍引用旧高度）。
+        自愈失败或其它未捕获异常：落盘后再走默认退出，供事后 diagnose。
         """
         if isinstance(error, IndexError) and self._compositor_recovery_budget > 0:
             self._compositor_recovery_budget -= 1
@@ -115,6 +116,12 @@ class PickupApp(App):
                 return
             except Exception:
                 pass
+        try:
+            from pickup.observe import log_exception
+
+            log_exception("TUI 未捕获异常", error)
+        except Exception:
+            pass
         super()._handle_exception(error)
 
     def on_mount(self) -> None:
