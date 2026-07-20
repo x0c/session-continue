@@ -40,6 +40,11 @@ class OpenCodeRuntime(BaseRuntime):
             str(session.get("path") or ""), str(session.get("id") or "")
         )
 
+    def delete_session(self, session: SessionInfo) -> None:
+        scan_opencode.delete_session(
+            str(session.get("path") or ""), str(session.get("id") or "")
+        )
+
     def build_resume_plan(self, session: SessionInfo) -> LaunchPlan:
         return LaunchPlan(
             argv=(self.executable, "-s", str(session["id"])),

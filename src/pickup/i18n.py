@@ -27,6 +27,10 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "End session",
         "zh": "结束会话",
     },
+    "action.delete_session": {
+        "en": "Delete",
+        "zh": "删除",
+    },
     "action.close_pane": {
         "en": "Close pane",
         "zh": "关闭面板",
@@ -148,8 +152,8 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "zh": "↑↓ 选择   Enter 确认   Esc 返回",
     },
     "modal.confirm_hint": {
-        "en": "q Confirm   any other key Cancel",
-        "zh": "q 确认   其他键取消",
+        "en": "{confirm_key} Confirm   any other key Cancel",
+        "zh": "{confirm_key} 确认   其他键取消",
     },
     "modal.not_installed": {
         "en": "{action} (not installed)",
@@ -187,9 +191,21 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "q confirm   any other key cancel",
         "zh": "q 确认   其他键取消",
     },
+    "confirm.delete_session": {
+        "en": "Delete session “{title}”? This permanently erases the local history and cannot be undone",
+        "zh": "删除会话「{title}」？将永久抹掉本地历史，不可恢复",
+    },
+    "confirm.delete_running_session": {
+        "en": "Session “{title}” is still running. Deleting will end it first, then permanently erase the local history — this cannot be undone",
+        "zh": "会话「{title}」正在进行中。删除会先结束它，再永久抹掉本地历史，不可恢复",
+    },
     "notify.screenshot": {
         "en": "Screenshot saved: {path}",
         "zh": "已截图 {path}",
+    },
+    "notify.delete_failed": {
+        "en": "Delete failed: {error}",
+        "zh": "删除失败：{error}",
     },
     "time.just_now": {
         "en": "just now",
@@ -214,6 +230,53 @@ _MESSAGES: dict[str, dict[str, str]] = {
     "list_separator": {
         "en": ", ",
         "zh": "、",
+    },
+    "update.available": {
+        "en": "New version v{version} available — click to update",
+        "zh": "发现新版本 v{version}，点击更新",
+    },
+    "update.updating": {
+        "en": "Updating…",
+        "zh": "更新中…",
+    },
+    "update.done_restart": {
+        "en": "Updated to v{version} — click to restart",
+        "zh": "已更新到 v{version}，点此重启",
+    },
+    "update.failed_retry": {
+        "en": "Update failed — click to retry",
+        "zh": "更新失败，点此重试",
+    },
+    "update.dismiss": {
+        "en": "×",
+        "zh": "×",
+    },
+    "update.cli_dev_hint": {
+        "en": "This pickup looks like a source/dev install and can't self-update. "
+              "Please pull the latest code manually, or reinstall via "
+              "https://github.com/{repo}#install.",
+        "zh": "当前 pickup 是源码/开发方式安装，无法自动更新。"
+              "请手动拉取最新代码，或参考 https://github.com/{repo}#install 重新安装。",
+    },
+    "update.cli_check_failed": {
+        "en": "Failed to check the latest version (network issue?). Please try again later.",
+        "zh": "检查最新版本失败（可能是网络问题），请稍后重试。",
+    },
+    "update.cli_latest": {
+        "en": "Already on the latest version (v{version}).",
+        "zh": "已是最新版本（v{version}）。",
+    },
+    "update.cli_updating": {
+        "en": "Updating to v{version}…",
+        "zh": "正在更新到 v{version}…",
+    },
+    "update.cli_failed": {
+        "en": "Update failed. See the output above for details.",
+        "zh": "更新失败，详见上方输出。",
+    },
+    "update.cli_updated": {
+        "en": "Updated to v{version}. Restart pickup to use the new version.",
+        "zh": "已更新到 v{version}，重启 pickup 后生效。",
     },
 }
 

@@ -85,6 +85,15 @@ class BaseRuntime(ABC):
     def build_new_session_plan(self, cwd: str | None) -> LaunchPlan:
         """构造不关联任何已有会话历史的空白新会话计划。"""
 
+    def delete_session(self, session: SessionInfo) -> None:
+        """彻底删除该会话在本地磁盘上的历史，不可恢复。
+
+        保留默认实现（而非 abstractmethod），原因同 `build_continue_plan`：避免
+        既有第三方适配器因新增可选能力无法实例化。默认直接报错，调用方（TUI）
+        据此提示"该运行时尚未支持删除"。
+        """
+        raise LaunchError(f"运行时 {self.id} 尚未支持删除会话")
+
     def export_handoff(self, session: SessionInfo, title: str) -> Handoff:
         """把运行时私有会话导出为统一接力信息。"""
         raw_history_path = str(session.get("path") or "")

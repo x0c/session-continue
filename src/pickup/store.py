@@ -283,6 +283,26 @@ class SessionStore:
                         return session
         return None
 
+    def remove_session(self, key: str) -> None:
+        """从当前内存状态里彻底摘除一条会话，供删除动作调用后立即消失。
+
+        磁盘历史已被 `runtime.delete_session` 抹掉；这里只是让 UI 不必等下一轮
+        `refresh()` 才发现它没了。清理范围覆盖 `_merge_scanned`/`mark_hosted`/
+        `register_hosted_session` 会写入的每一处按 key 索引的结构，任何一处漏清都
+        会让卡片残留或状态机不一致（如 `generating` 漏清会让转圈圈永远转下去）。
+        """
+        with self.lock:
+            for bucket in self.sessions.values():
+                bucket[:] = [session for session in bucket if session_key(session) != key]
+            self._order = [k for k in self._order if k != key]
+            self.display_titles.pop(key, None)
+            self.generating.discard(key)
+            self.conversations.pop(key, None)
+            self.hosted.pop(key, None)
+            self._provisional.pop(key, None)
+            self._force_ended.discard(key)
+            self._projects = None
+
     def register_hosted_session(
         self,
         *,

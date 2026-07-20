@@ -130,10 +130,10 @@ class RuntimePickerModal(ModalScreen[str | None]):
 
 
 class ConfirmModal(ModalScreen[bool]):
-    """q 确认 / 其他键取消的确认框，取代 _confirm_kill_keepalive。
+    """confirm_key 确认 / 其他键取消的确认框，取代 _confirm_kill_keepalive。
 
-    打开瞬间会短暂忽略按键：结束会话本身由 `q` 触发，若同一按键落到弹窗里会
-    立刻被当成确认。挂载后等一帧再接收确认/取消。
+    打开瞬间会短暂忽略按键：触发弹窗的动作键（结束会话是 `q`，删除会话是 `x`）
+    若同一按键落到弹窗里会立刻被当成确认。挂载后等一帧再接收确认/取消。
     """
 
     DEFAULT_CSS = """
@@ -149,9 +149,10 @@ class ConfirmModal(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, confirm_key: str = "q") -> None:
         super().__init__()
         self._message = message
+        self._confirm_key = confirm_key
         self._armed = False
 
     def compose(self) -> ComposeResult:
@@ -159,7 +160,7 @@ class ConfirmModal(ModalScreen[bool]):
 
         with Vertical():
             yield Label(self._message)
-            yield Label(t("modal.confirm_hint"), classes="hint")
+            yield Label(t("modal.confirm_hint", confirm_key=self._confirm_key), classes="hint")
 
     def on_mount(self) -> None:
         self.call_after_refresh(self._arm)
@@ -171,7 +172,7 @@ class ConfirmModal(ModalScreen[bool]):
         event.stop()
         if not self._armed:
             return
-        self.dismiss(event.key in ("q", "Q"))
+        self.dismiss(event.key in (self._confirm_key, self._confirm_key.upper()))
 
 
 # ---------------------------------------------------------------------------

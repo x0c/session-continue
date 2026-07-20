@@ -230,6 +230,32 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     return results
 
 
+def delete_session(db_path: str, session_id: str) -> None:
+    """彻底删除单个 OpenCode 会话，不可恢复。
+
+    OpenCode 所有会话共享一个 SQLite 库，删除必须按 session_id 精确删行，不能
+    像其他运行时那样直接删文件（会连带删掉全部其他会话）。这是全仓第一处
+    可写 SQLite 连接（其余所有 DB 访问，包括本文件的 `_connect_ro`，都是
+    `mode=ro` 只读打开）；按外键依赖顺序在一个事务内删 part → message →
+    session，成功后 commit，任何一步失败自动 rollback，不会留下半删状态。
+    """
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn.execute(
+            "DELETE FROM part WHERE message_id IN "
+            "(SELECT id FROM message WHERE session_id = ?)",
+            (session_id,),
+        )
+        conn.execute("DELETE FROM message WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM session WHERE id = ?", (session_id,))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def load_conversation(db_path: str, session_id: str) -> list[ConversationMessage]:
     """按时间顺序读取用户消息和助手最终答复；同一消息的多个 text part 合并为一条。"""
     conn = _connect_ro(db_path)

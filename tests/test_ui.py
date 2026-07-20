@@ -372,6 +372,40 @@ class SessionStoreFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("retrying", search.placeholder)
 
 
+class SessionStoreRemoveSessionTests(unittest.TestCase):
+    """store.remove_session：删除动作成功后立即摘除内存状态，不必等下一轮 refresh()。"""
+
+    def test_remove_session_clears_every_key_indexed_structure(self) -> None:
+        store, _ = _make_store()
+        key = "claude:s0"
+        session = store.find_session(key)
+        self.assertIsNotNone(session)
+        # 人为塞满所有按 key 索引的结构，验证 remove_session 逐一清干净。
+        store.display_titles[key] = "标题"
+        store.generating.add(key)
+        store.conversations[key] = (1.0, [])
+        store.hosted[key] = "pickup-claude-fake"
+        store._provisional[key] = dict(session)
+        store._force_ended.add(key)
+
+        store.remove_session(key)
+
+        self.assertIsNone(store.find_session(key))
+        self.assertNotIn(key, store._order)
+        self.assertNotIn(key, store.display_titles)
+        self.assertNotIn(key, store.generating)
+        self.assertNotIn(key, store.conversations)
+        self.assertNotIn(key, store.hosted)
+        self.assertNotIn(key, store._provisional)
+        self.assertNotIn(key, store._force_ended)
+
+    def test_remove_session_leaves_other_sessions_untouched(self) -> None:
+        store, _ = _make_store()
+        store.remove_session("claude:s0")
+        self.assertIsNotNone(store.find_session("claude:s1"))
+        self.assertIsNotNone(store.find_session("claude:s2"))
+
+
 class SessionCardVisualTests(unittest.TestCase):
     """侧边栏两行卡片的列布局和状态样式不能随刷新优化再次回退。"""
 
@@ -1677,6 +1711,43 @@ class ModalTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(delay=0.2)
         self.assertTrue(result_holder.get("result"))
 
+    async def test_confirm_modal_custom_key_confirms_and_q_no_longer_does(self) -> None:
+        """删除会话复用 ConfirmModal 但确认键换成 x；默认键 q 此时不应再生效。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            result_holder = {}
+
+            async def _open():
+                result_holder["result"] = await app.push_screen_wait(
+                    ConfirmModal("删除？", confirm_key="x")
+                )
+
+            app.run_worker(_open())
+            await pilot.pause(delay=0.3)
+            await pilot.press("q")  # 不再是确认键，应按取消处理
+            await pilot.pause(delay=0.2)
+        self.assertFalse(result_holder.get("result"))
+
+    async def test_confirm_modal_custom_key_x_confirms(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            result_holder = {}
+
+            async def _open():
+                result_holder["result"] = await app.push_screen_wait(
+                    ConfirmModal("删除？", confirm_key="x")
+                )
+
+            app.run_worker(_open())
+            await pilot.pause(delay=0.3)
+            await pilot.press("x")
+            await pilot.pause(delay=0.2)
+        self.assertTrue(result_holder.get("result"))
+
 
 class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_q_key_confirm_kills_and_clears_keepalive_name(self) -> None:
@@ -1710,6 +1781,95 @@ class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("keepalive_name", current)
         self.assertFalse(current.get("live"))
         self.assertIsNone(current.get("pid"))
+
+
+class DeleteSessionFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_x_key_confirm_deletes_ended_session_and_removes_card(self) -> None:
+        sessions = [{
+            "source": "claude", "id": "s0", "short_id": "s0", "mtime": time.time(),
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "会话0",
+            "cwd": "/tmp", "live": False, "path": "/tmp/s0.jsonl",
+        }]
+        store, registry = _make_store(sessions=sessions)
+        claude_runtime = registry.get("claude")
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            await pilot.press("down")
+            await pilot.press("x")
+            await pilot.pause(delay=0.3)  # worker 推弹窗 + ConfirmModal 武装
+            self.assertIsInstance(app.screen, ConfirmModal)
+            await pilot.press("x")
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            self.assertEqual(list_view._session_cards(), [])
+        claude_runtime.delete_session.assert_called_once_with(sessions[0])
+        self.assertIsNone(store.find_session("claude:s0"))
+
+    async def test_x_key_other_key_cancels_and_keeps_session(self) -> None:
+        sessions = [{
+            "source": "claude", "id": "s0", "short_id": "s0", "mtime": time.time(),
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "会话0",
+            "cwd": "/tmp", "live": False, "path": "/tmp/s0.jsonl",
+        }]
+        store, registry = _make_store(sessions=sessions)
+        claude_runtime = registry.get("claude")
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            await pilot.press("down")
+            await pilot.press("x")
+            await pilot.pause(delay=0.3)
+            await pilot.press("n")  # 非确认键，取消
+            await pilot.pause(delay=0.2)
+        claude_runtime.delete_session.assert_not_called()
+        self.assertIsNotNone(store.find_session("claude:s0"))
+
+    async def test_x_key_on_running_session_kills_keepalive_then_deletes(self) -> None:
+        sessions = [{
+            "source": "claude", "id": "s0", "short_id": "s0", "mtime": time.time(),
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "会话0",
+            "cwd": "/tmp", "live": True, "pid": 4242, "keepalive_name": "pickup-claude-fake",
+            "path": "/tmp/s0.jsonl",
+        }]
+        store, registry = _make_store(sessions=sessions)
+        claude_runtime = registry.get("claude")
+        app = PickupApp(store, embed_ok=False)
+        with mock.patch("pickup.keepalive.kill") as kill_mock:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause(delay=0.2)
+                await pilot.press("down")
+                await pilot.press("x")
+                await pilot.pause(delay=0.3)
+                self.assertIsInstance(app.screen, ConfirmModal)
+                await pilot.press("x")
+                await pilot.pause(delay=0.2)
+                list_view = app.screen.query_one(SessionListView)
+                self.assertEqual(list_view._session_cards(), [])
+        kill_mock.assert_called_once_with("pickup-claude-fake")
+        claude_runtime.delete_session.assert_called_once()
+        self.assertIsNone(store.find_session("claude:s0"))
+
+    async def test_delete_failure_keeps_card_and_notifies(self) -> None:
+        sessions = [{
+            "source": "claude", "id": "s0", "short_id": "s0", "mtime": time.time(),
+            "size_bytes": 1, "size_kb": 1, "native_title": None, "fallback_title": "会话0",
+            "cwd": "/tmp", "live": False, "path": "/tmp/s0.jsonl",
+        }]
+        store, registry = _make_store(sessions=sessions)
+        claude_runtime = registry.get("claude")
+        claude_runtime.delete_session.side_effect = OSError("模拟磁盘删除失败")
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            await pilot.press("down")
+            await pilot.press("x")
+            await pilot.pause(delay=0.3)
+            await pilot.press("x")
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            self.assertEqual(len(list_view._session_cards()), 1)
+        self.assertIsNotNone(store.find_session("claude:s0"))
 
 
 if __name__ == "__main__":

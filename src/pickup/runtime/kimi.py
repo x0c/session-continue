@@ -30,6 +30,9 @@ class KimiRuntime(BaseRuntime):
     def load_conversation(self, session: SessionInfo) -> list[ConversationMessage]:
         return scan_kimi.load_conversation(str(session.get("path") or ""))
 
+    def delete_session(self, session: SessionInfo) -> None:
+        scan_kimi.delete_session(str(session.get("path") or ""))
+
     def build_resume_plan(self, session: SessionInfo) -> LaunchPlan:
         return LaunchPlan(
             argv=(

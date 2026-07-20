@@ -493,6 +493,12 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     return results[:limit]
 
 
+def delete_session(path: str) -> None:
+    """彻底删除单个 Claude Code 会话（一个会话就是一个 JSONL 文件），不可恢复。"""
+    if os.path.isfile(path):
+        os.unlink(path)
+
+
 def load_conversation(path: str) -> list[ConversationMessage]:
     """按时间顺序读取真实用户消息和 Claude 的每段文本回复。
 

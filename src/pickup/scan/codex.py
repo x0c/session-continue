@@ -405,6 +405,17 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     return results[:limit]
 
 
+def delete_session(path: str) -> None:
+    """彻底删除单个 Codex 会话（一个会话就是一个 rollout JSONL 文件），不可恢复。
+
+    `session_index.jsonl` 里可能仍留有该会话的 id -> thread_name 索引条目，
+    但会话文件已不存在，扫描结果里永远不会再出现它，索引残留无害；本版不
+    额外清理该索引文件（追加写、无删除接口，清理成本与收益不成比例）。
+    """
+    if os.path.isfile(path):
+        os.unlink(path)
+
+
 def load_conversation(path: str) -> list[ConversationMessage]:
     """按时间顺序读取真实用户消息和 Codex 的助手消息（含任务执行中的过程叙述 commentary 和最终答复 final_answer）。"""
     messages: list[ConversationMessage] = []

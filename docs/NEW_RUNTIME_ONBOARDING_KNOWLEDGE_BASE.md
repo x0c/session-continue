@@ -40,6 +40,7 @@ classDiagram
       +build_new_plan(handoff)
       +build_new_session_plan(cwd)
       +export_handoff(session, title)
+      +delete_session(session)
     }
     class ClaudeRuntime
     class CodexRuntime
@@ -88,6 +89,7 @@ sequenceDiagram
 1. **确认真实数据与命令能力**：在本机实际创建、续接并结束至少一个新助手会话；记录历史目录或数据库、会话 ID、工作目录、用户/助手正文、时间、原生恢复命令、空白新建命令，以及可安全使用的自动批准参数。不要只依据官网文档推断参数。
 2. **实现扫描与预览**：新增 `scan_<助手>.py`，把私有历史转换成完整 `SessionInfo`；列表扫描保持轻量，完整对话在 `load_conversation` 按需读取。过滤内部子任务、空会话、系统注入和标题生成留下的噪音会话。
 3. **实现助手运行时**：新增 `runtime/<助手>.py` 的 `BaseRuntime` 子类，声明稳定的 id、显示名、可执行命令、历史阅读提示和唯一一处的 `auto_approve_args`；实现扫描、预览、原生恢复、跨助手目标新建、空白新建。仅在确实支持且已验证时实现带指令的原生续接。
+   同时实现 `delete_session(session)`（终端界面 `x` 删除会话用；`BaseRuntime` 默认实现是直接报错，不覆写就等于该助手不支持删除）：删除是彻底抹掉、不可恢复，必须先确认新助手的历史存储形态再决定实现方式——单文件（如 Claude/Codex 的 JSONL）直接 `os.unlink`；每会话一个目录（如 Kimi/Cursor）要整目录 `shutil.rmtree`，只删 `path` 指向的那一个文件会留下同目录的其他元数据文件；**所有会话共享同一份存储时（如 OpenCode 的单个 SQLite 库）绝对不能删文件本身**，必须开一个可写连接、按会话 ID 精确删除对应的行（含外键关联表，按依赖顺序删除、一次事务提交），否则会连带清空其他会话的历史。详见 `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md` 和各 `scan_<助手>.py` 里 `delete_session()` 的实现与测试。
 4. **注册一次**：在 `runtime/registry.py` 导入并加入 `default_registry()`。注册表顺序就是默认显示/选择顺序之一；id 必须唯一，且扫描结果的 `source` 必须与其一致。
 5. **补展示配色**：仅在 `src/pickup/theme.py` 的 `RUNTIME_LABEL_STYLES` 加一行 `id → 色值`，使列表、详情和预览角色名通过同一个 `runtime_label_style` 自动取得样式。
 6. **补测试**：在 `test_runtime.py` 覆盖新助手自身恢复、空白新建、作为跨助手目标、作为跨助手源（有真实可读历史样例时）；补相应扫描器测试，锁定私有格式的过滤和解析。
@@ -125,6 +127,7 @@ sequenceDiagram
 | 新助手接手其他助手 | `runtime/<助手>.py` | `build_new_plan(handoff)` | 新建目标会话，把统一接力提示词作为首条任务，不伪造恢复 |
 | 新助手空白开局 | `runtime/<助手>.py` | `build_new_session_plan(cwd)` | 不带任何历史或接力提示词，只在有效工作目录启动 |
 | 新助手作为接力来源 | `runtime/base.py` | `export_handoff(session, title)` | 统一校验历史路径、附带格式提示与摘要；必要时在适配器补充会话定位信息 |
+| 彻底删除会话（可选能力） | `runtime/<助手>.py`、`scan_<助手>.py` | `delete_session(session)` | 基类默认报错（不覆写=不支持删除）；单文件直接 unlink，每会话一目录要整目录 `shutil.rmtree`，共享存储（如 OpenCode SQLite）必须开可写连接按会话 ID 精确删行，不能删文件本身 |
 | 注册与扫描缓存 | `runtime/registry.py` | `default_registry()`、`scan_all(limit)` | 注册一次；扫描并发且单助手异常隔离 |
 | 直启参数透传 | `runtime/registry.py` | `build_passthrough_plan` | 只补 `auto_approve_args`，用户已传入时不重复 |
 | 统一会话键与接力正文 | `models.py` | `session_key`、`Handoff.render_prompt` | 标题键按「助手运行时 + 会话 ID」隔离；接力提示词禁止改写源历史 |
@@ -171,6 +174,7 @@ sequenceDiagram
 - **AI 易错点**【必须】新助手配色只在 `RUNTIME_LABEL_STYLES` 新增一行；不要在界面组件重复硬编码颜色。未知 id 已有弱化回退样式。
 - **AI 易错点**【必须】扫描器返回完整统一会话字段，并隔离私有历史格式；列表扫描不可因一条损坏记录崩溃。真实历史中的显式 `null`、系统事件、内部子任务和已删除工作目录都应按该助手格式处理。
 - 【消歧】「同助手恢复」与「跨助手接力」不是同一能力：前者复用原会话 ID 与原生命令，后者启动全新目标会话并给出源历史位置；不能为了统一命令外观把后者伪装成恢复。
+- **AI 易错点**【必须】实现 `delete_session` 前先确认该助手的历史是不是多个会话共享同一份存储（单个数据库/单个索引文件）；共享存储绝不能直接删文件，必须按会话 ID 精确删行，否则会把其他用户会话一起删掉且不可恢复。判断依据是 `SessionInfo.path` 的真实含义——同一助手的多条会话若 `path` 指向同一个文件（如 OpenCode 的 `opencode.db`），就是共享存储。
 
 ## §7 验证路径
 
@@ -208,6 +212,8 @@ sequenceDiagram
    - OpenCode：单 SQLite + WAL，签名可用但自动批准参数受子命令限制；
    - Kimi：工作区/会话目录与协议事件流，接力到目标时可能只能非交互运行；
    - Cursor：CLI 历史目录与按需 SQLite 预览，恢复命令为 `agent --resume`。
+
+8. **删除能力验证（若实现了 `delete_session`）**：删除不可恢复，一律用临时构造的假会话验证，不要碰真实历史。至少覆盖：调用后该会话确实从磁盘消失（文件被删/目录被整体删除/数据库对应行被删）；共享存储的助手额外断言删除后**其他会话仍能正常扫描且内容未变**（防止误删连带其他会话）；未实现 `delete_session` 时终端界面按 `x` 应提示「尚未支持删除会话」而不是崩溃。
 
 ## §8 关联文档
 

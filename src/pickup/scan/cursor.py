@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 
@@ -297,6 +298,19 @@ def _assistant_text_from_blob(obj: dict) -> str | None:
         return None
     text = _text_from_content(obj.get("content")).strip()
     return text or None
+
+
+def delete_session(path: str) -> None:
+    """彻底删除单个 Cursor 会话，不可恢复。
+
+    `path` 可能是 store.db 文件（存在时）或会话目录本身（不存在时，见
+    `_build_session_info`），与 `load_conversation` 同款归一后整个会话目录一起删——
+    `meta.json`/`prompt_history.json`/`store.db` 都在同一目录下，只删 store.db
+    会留下其余两个文件。
+    """
+    chat_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    if os.path.isdir(chat_dir):
+        shutil.rmtree(chat_dir)
 
 
 def load_conversation(path: str) -> list[ConversationMessage]:

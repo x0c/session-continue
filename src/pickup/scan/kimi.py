@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -304,6 +305,18 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             info["live"] = True
             info["pid"] = pid
     return results
+
+
+def delete_session(path: str) -> None:
+    """彻底删除单个 Kimi Code 会话，不可恢复。
+
+    `path` 是 `_wire_path()` 返回的 `.../<workspace_id>/<session_id>/agents/main/wire.jsonl`，
+    只删这一个文件会留下 state.json、agents/ 及其他子 agent 目录；必须整个会话目录
+    （wire.jsonl 往上数三级）一起删。
+    """
+    session_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    if os.path.isdir(session_dir):
+        shutil.rmtree(session_dir)
 
 
 def load_conversation(path: str) -> list[ConversationMessage]:

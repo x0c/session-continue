@@ -1,7 +1,7 @@
 """主屏：左栏会话列表 + 右栏预览/内嵌终端（pickup 唯一界面）。
 
 按键语义（/ 聚焦项目搜索 / a 高级操作 / n 新建 /
-q 结束会话 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
+q 结束会话 / x 删除会话 / c 关闭面板 / Esc 退出）；选中非进行中会话时右栏直接
 展示完整对话预览。侧边栏选中或回车托管后，键盘焦点仍留在列表——只有鼠标点到右栏
 才与内嵌会话交互；右栏滚轮/预览翻页与焦点无关，鼠标在右栏上即可滚动。
 侧边栏顶部为项目搜索框，大小写无关模糊匹配项目名与会话标题。
@@ -43,6 +43,7 @@ _ACTION_I18N = {
     "handoff": "action.advanced",
     "new_session": "action.new",
     "kill_keepalive": "action.kill_session",
+    "delete_session": "action.delete_session",
     "close_pane": "action.close_pane",
     "save_screenshot": "action.screenshot",
     "preview_home": "action.preview_home",
@@ -59,6 +60,7 @@ def _main_bindings() -> list[Binding]:
         Binding("a", "handoff", t("action.advanced")),
         Binding("n", "new_session", t("action.new")),
         Binding("q", "kill_keepalive", t("action.kill_session")),
+        Binding("x", "delete_session", t("action.delete_session")),
         Binding("c", "close_pane", t("action.close_pane"), show=False),
         Binding("f12", "save_screenshot", t("action.screenshot"), show=False),
         # 右栏静态对话预览滚动（列表聚焦时也生效；优先级高于 ListView 的同名键）
@@ -648,6 +650,48 @@ class MainScreen(Screen):
             return
         keepalive.kill(keepalive_name)
         self.store.mark_hosted(pickup.session_key(session), None)
+        await self._rebuild_list()
+
+    @work
+    async def action_delete_session(self) -> None:
+        """x：彻底删除选中会话的本地历史，不可恢复；运行中/托管会话先结束再删。
+
+        二次确认按 x（而不是复用 q），与结束会话共用同一套 ConfirmModal 交互形态，
+        只是把确认键换成触发本动作的键，避免用户记混"删除按 x 确认却按了 q"。
+        """
+        import sqlite3
+        import pickup
+        from pickup import keepalive
+        from pickup.runtime import LaunchError
+
+        session_list = self.query_one(SessionListView)
+        session = session_list.selected_session()
+        if session is None:
+            self.app.bell()
+            return
+        key = pickup.session_key(session)
+        keepalive_name = session.get("keepalive_name")
+        title = self.store.get_title(session)
+        message_key = "confirm.delete_running_session" if keepalive_name else "confirm.delete_session"
+        confirmed = await self.app.push_screen_wait(
+            ConfirmModal(t(message_key, title=title), confirm_key="x")
+        )
+        if not confirmed:
+            return
+        if keepalive_name:
+            keepalive.kill(keepalive_name)
+            self.store.mark_hosted(key, None)
+            if self.embed_ok:
+                pane = self.query_one(EmbedPane)
+                if pane.session_name == keepalive_name:
+                    pane.clear()
+        try:
+            self.store.registry.get(str(session.get("source") or "")).delete_session(session)
+        except (LaunchError, OSError, sqlite3.Error) as exc:
+            self.notify(t("notify.delete_failed", error=exc))
+            self.app.bell()
+            return
+        self.store.remove_session(key)
         await self._rebuild_list()
 
     def action_close_pane(self) -> None:

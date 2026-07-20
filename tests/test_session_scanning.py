@@ -3207,6 +3207,140 @@ class CursorScanTests(unittest.TestCase):
         self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --force"))
 
 
+class DeleteSessionScanTests(unittest.TestCase):
+    """各运行时 scan.delete_session：验证目标会话被彻底抹掉，且不影响其他会话。
+
+    各运行时存储形态不同（单文件 / 每会话目录 / 共享 SQLite），覆盖每一种，
+    重点断言「删对了、没删多」——尤其是 OpenCode 共享库，误删会波及其他会话。
+    """
+
+    def test_claude_delete_session_removes_only_target_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target.jsonl"
+            other = Path(td) / "other.jsonl"
+            target.write_text('{"type":"user"}\n', encoding="utf-8")
+            other.write_text('{"type":"user"}\n', encoding="utf-8")
+
+            scan_claude.delete_session(str(target))
+
+            self.assertFalse(target.exists())
+            self.assertTrue(other.exists())
+
+    def test_claude_delete_session_missing_file_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "does-not-exist.jsonl")
+            scan_claude.delete_session(missing)  # 不应抛异常
+
+    def test_codex_delete_session_removes_only_target_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "rollout-2026-01-01T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
+            other = Path(td) / "rollout-2026-01-02T00-00-00-11111111-2222-3333-4444-555555555555.jsonl"
+            target.write_text("{}\n", encoding="utf-8")
+            other.write_text("{}\n", encoding="utf-8")
+
+            scan_codex.delete_session(str(target))
+
+            self.assertFalse(target.exists())
+            self.assertTrue(other.exists())
+
+    def test_kimi_delete_session_removes_whole_session_dir_not_just_wire_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sessions_dir = Path(td) / "sessions"
+            target_dir = _make_kimi_session(
+                sessions_dir, "wd1", "session_target",
+                {"workDir": "/tmp", "title": "目标会话"},
+                [_kimi_user_event("你好", 1000)],
+            )
+            other_dir = _make_kimi_session(
+                sessions_dir, "wd1", "session_other",
+                {"workDir": "/tmp", "title": "其他会话"},
+                [_kimi_user_event("在吗", 1000)],
+            )
+            wire_path = str(target_dir / "agents" / "main" / "wire.jsonl")
+
+            scan_kimi.delete_session(wire_path)
+
+            self.assertFalse(target_dir.exists())  # 整个会话目录（state.json 等）都要没了
+            self.assertTrue(other_dir.exists())
+            self.assertTrue((other_dir / "state.json").exists())
+
+    def test_cursor_delete_session_removes_whole_chat_dir(self) -> None:
+        from pickup.scan import cursor as scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target_dir = root / "ws1" / "target-chat"
+            other_dir = root / "ws1" / "other-chat"
+            target_dir.mkdir(parents=True)
+            other_dir.mkdir(parents=True)
+            (target_dir / "meta.json").write_text("{}", encoding="utf-8")
+            (target_dir / "store.db").write_text("", encoding="utf-8")
+            (other_dir / "meta.json").write_text("{}", encoding="utf-8")
+
+            # path 是 store.db（存在时的常见情况），delete_session 要能反推出会话目录。
+            scan_cursor.delete_session(str(target_dir / "store.db"))
+
+            self.assertFalse(target_dir.exists())
+            self.assertTrue(other_dir.exists())
+
+    def test_cursor_delete_session_accepts_dir_path_when_no_store_db(self) -> None:
+        from pickup.scan import cursor as scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            target_dir = Path(td) / "ws1" / "target-chat"
+            target_dir.mkdir(parents=True)
+            (target_dir / "meta.json").write_text("{}", encoding="utf-8")
+
+            scan_cursor.delete_session(str(target_dir))
+
+            self.assertFalse(target_dir.exists())
+
+    def test_opencode_delete_session_removes_only_target_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "opencode.db"
+            _make_opencode_db(
+                db_path,
+                sessions=[
+                    {"id": "ses_target", "directory": "/tmp", "title": "目标会话",
+                     "time_created": 1000, "time_updated": 1000},
+                    {"id": "ses_other", "directory": "/tmp", "title": "其他会话",
+                     "time_created": 2000, "time_updated": 2000},
+                ],
+                messages=[
+                    {"id": "msg_target", "session_id": "ses_target", "time_created": 1000,
+                     "data": {"role": "user"}},
+                    {"id": "msg_other", "session_id": "ses_other", "time_created": 2000,
+                     "data": {"role": "user"}},
+                ],
+                parts=[
+                    {"id": "part_target", "message_id": "msg_target", "session_id": "ses_target",
+                     "time_created": 1000, "data": {"type": "text", "text": "目标正文"}},
+                    {"id": "part_other", "message_id": "msg_other", "session_id": "ses_other",
+                     "time_created": 2000, "data": {"type": "text", "text": "其他正文"}},
+                ],
+            )
+
+            scan_opencode.delete_session(str(db_path), "ses_target")
+
+            conn = sqlite3.connect(str(db_path))
+            try:
+                session_ids = {row[0] for row in conn.execute("SELECT id FROM session")}
+                message_ids = {row[0] for row in conn.execute("SELECT id FROM message")}
+                part_ids = {row[0] for row in conn.execute("SELECT id FROM part")}
+            finally:
+                conn.close()
+
+            self.assertEqual(session_ids, {"ses_other"})
+            self.assertEqual(message_ids, {"msg_other"})
+            self.assertEqual(part_ids, {"part_other"})
+
+            # 其他会话仍能正常扫描出来，证明库本身没有被破坏。
+            with mock.patch.object(scan_opencode, "_db_paths", return_value=[str(db_path)]), \
+                 mock.patch.object(scan_opencode, "live_pids_by_process_name", return_value={}):
+                remaining = scan_opencode.scan_sessions(limit=10)
+            self.assertEqual([s["id"] for s in remaining], ["ses_other"])
+
+
 class StartupLatencyTests(unittest.TestCase):
     """首屏延迟测量：改动扫描/界面/标题相关代码后必须跑这个用例并如实汇报耗时。
 
