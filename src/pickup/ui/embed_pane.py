@@ -47,7 +47,9 @@ import threading
 import time
 from typing import Callable
 
+from rich.cells import cell_len
 from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import events, work
 from textual.dom import NoScreen
@@ -70,6 +72,30 @@ def _row_to_strip(row: list) -> Strip:
     if not spans:
         return Strip([Segment(text)] if text else [])
     return Strip([Segment(text[start:end], style) for start, end, style in spans])
+
+
+def _apply_cell_aware_offsets(strip: Strip, y: int) -> Strip:
+    """等价于 `Strip.apply_offsets(0, y)`，但按 cell 宽度（而不是字符数）推进
+    x 坐标去标注每个 Segment 的起始列。
+
+    Textual 自带的 `apply_offsets` 用 `x += len(segment.text)` 累加偏移量——
+    对纯 ASCII 没问题，但 CJK/emoji 等占两格的宽字符只算一个字符，会少算
+    一半。托管画面里一行经常混排中英文，行内每多一个宽字符，后面所有
+    Segment 标注的列坐标就多偏移 1，鼠标拖选映射回文本位置时逐字符累积
+    偏差——这正好解释了真机反馈"划词高亮跟实际选中位置有偏差，且时准时不
+    准"：纯 ASCII 行、或选区落在行首第一个 Segment 内时不受影响，偏差量随
+    选区前面出现的宽字符数量变化。这是 Rich/Textual 上游 `Strip.apply_offsets`
+    的通用限制（用 Rich `Text` 走默认渲染路径的 Textual 部件不会触发，因为
+    它们走的是另一条 `Visual.to_strips` 编译路径），这里在托管面板自己的
+    渲染入口本地绕过，不改 Textual 本身。
+    """
+    segments = []
+    x = 0
+    for text, style, _ in strip:
+        offset_style = Style.from_meta({"offset": (x, y)})
+        segments.append(Segment(text, style + offset_style if style else offset_style))
+        x += cell_len(text)
+    return Strip(segments, strip.cell_length)
 
 # 滚轮一格滚动的行数，与旧版 PREVIEW_MOUSE_SCROLL_LINES 保持一致的手感
 WHEEL_SCROLL_LINES = 3
@@ -449,8 +475,11 @@ class EmbedPane(Widget):
         if strip.cell_length != width:
             strip = strip.adjust_cell_length(width)
         # 自定义 Line API 不会像 Textual 默认 Rich 渲染路径那样自动附加文本
-        # 坐标；缺少 offset 元数据时，拖选只能把整个 Widget 识别为全选。
-        strip = strip.apply_offsets(0, y)
+        # 坐标；缺少 offset 元数据时，拖选只能把整个 Widget 识别为全选。改用
+        # 按 cell 宽度推进的 _apply_cell_aware_offsets（而不是 Textual 自带的
+        # Strip.apply_offsets），修复行内含 CJK/emoji 时拖选高亮错位，见该
+        # 函数 docstring。
+        strip = _apply_cell_aware_offsets(strip, y)
         return self._apply_selection(strip, y)
 
     def _apply_selection(self, strip: Strip, y: int) -> Strip:

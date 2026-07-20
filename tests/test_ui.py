@@ -1508,6 +1508,34 @@ class EmbedPaneWheelTests(unittest.TestCase):
         self.assertEqual(pane.history_offset, 7)
 
 
+class EmbedPaneSelectionOffsetTests(unittest.TestCase):
+    """拖选高亮列坐标回归：2026-07-20 真机反馈"划词高亮跟实际选中位置有偏差，
+    且偏差有时准有时不准"——根因是 Textual 自带的 Strip.apply_offsets 按字符数
+    （而不是 cell 宽度）累加 x 坐标，CJK 等宽字符占两格却只算一个字符，行内
+    宽字符越多、偏移越大，纯 ASCII 行则不受影响（正好对应"有时准有时不准"）。
+    pickup 改用本地的 _apply_cell_aware_offsets 绕过这个上游限制。"""
+
+    def test_offsets_advance_by_cell_width_not_character_count(self):
+        from rich.segment import Segment
+        from textual.strip import Strip
+
+        from pickup.ui.embed_pane import _apply_cell_aware_offsets
+
+        # 10 个中文字符（每个占 2 格，共 20 格）+ 紧跟一段 ASCII。
+        cjk = "已经修复并部署上线了"
+        strip = Strip([Segment(cjk), Segment("ok")])
+
+        offset_strip = _apply_cell_aware_offsets(strip, 3)
+        segments = list(offset_strip)
+
+        first_offset = segments[0].style.meta["offset"]
+        second_offset = segments[1].style.meta["offset"]
+        self.assertEqual(first_offset, (0, 3))
+        # 第二段起始列必须是 20（cell 宽度），不是 10（字符数）——这正是
+        # 之前偏移会随行内 CJK 字符数量累积漂移的根因。
+        self.assertEqual(second_offset, (20, 3))
+
+
 class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
     """窗口缩放：行宽即时裁补；tmux resize + 抓帧必须防抖，不能拖动期狂刷。"""
 
