@@ -1536,6 +1536,40 @@ class EmbedPaneSelectionOffsetTests(unittest.TestCase):
         self.assertEqual(second_offset, (20, 3))
 
 
+class EmbedPaneSelectionStyleTests(unittest.IsolatedAsyncioTestCase):
+    """拖选高亮不能盖住文字：2026-07-20 真机反馈"高亮把选中的文字整个遮住看
+    不见"。headless 启动真实 app 打印证据确认——Textual 默认
+    screen-selection-foreground 是 transparent（保留原前景语义），但
+    get_component_rich_style 会把它预解析成一个具体色且恰好等于选区背景色，
+    整段套上去后前景==背景，文字隐形。修复：前景 transparent 时只染背景、
+    保留每个 Segment 原本的前景色。"""
+
+    async def test_selection_style_preserves_foreground(self) -> None:
+        from rich.segment import Segment
+        from rich.style import Style
+        from textual.strip import Strip
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(120, 30)) as pilot:
+            pane = EmbedPane()
+            await app.screen.mount(pane)
+            await pilot.pause()
+
+            sel = pane._selection_style()
+            # 关键断言：选区样式不覆盖前景（保留原文字色），但要有背景色
+            self.assertIsNone(sel.color, "选区前景应留空以保留原文字色，否则会盖住文字")
+            self.assertIsNotNone(sel.bgcolor, "选区必须有背景色才能体现选中")
+
+            # 端到端：一段有明确前景的文字套上选区样式后，前景必须原样保留、
+            # 且不等于背景（等于就等于看不见）
+            base = Strip([Segment("Hello 中文", Style(color="#e0e0e0"))])
+            highlighted = base.crop(0, base.cell_length).apply_style(sel)
+            seg = list(highlighted)[0]
+            self.assertEqual(seg.style.color.triplet.hex, "#e0e0e0")
+            self.assertNotEqual(seg.style.color, seg.style.bgcolor)
+
+
 class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
     """窗口缩放：行宽即时裁补；tmux resize + 抓帧必须防抖，不能拖动期狂刷。"""
 

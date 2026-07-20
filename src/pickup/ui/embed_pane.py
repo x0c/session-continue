@@ -56,6 +56,7 @@ from textual.dom import NoScreen
 from textual.geometry import Region
 from textual.reactive import reactive
 from textual.strip import Strip
+from textual.style import Style as VisualStyle
 from textual.visual import Visual, visualize
 from textual.widget import Widget
 
@@ -166,6 +167,9 @@ class EmbedPane(Widget):
         self._static_key: tuple | None = None
         self._static_strips_cache: list[Strip] | None = None
         self._cursor: tuple[int, int, bool] | None = None
+        # 选区高亮样式缓存，键是当前主题名（主题切换时自动失效重算）；避免在
+        # render_line 热路径里每行每帧都重新解析一次组件样式。
+        self._selection_style_cache: tuple[str, Style] | None = None
         self._detail_renderer = detail_renderer
         self._on_focus_list = on_focus_list
         self._osc_report = osc_report
@@ -503,12 +507,43 @@ class EmbedPane(Widget):
         end = max(start, min(end, cell_length))
         if start == end:
             return strip
-        selection_style = self.screen.get_component_rich_style("screen--selection")
+        selection_style = self._selection_style()
         return Strip.join((
             strip.crop(0, start),
             strip.crop(start, end).apply_style(selection_style),
             strip.crop(end),
         ))
+
+    def _selection_style(self) -> Style:
+        """拖选高亮要叠加的 Rich 样式（按主题名缓存）。
+
+        **不能**直接用 `get_component_rich_style("screen--selection")` 整段套上去：
+        Textual 默认主题的 `screen-selection-foreground` 是 `transparent`（alpha 0），
+        语义是「保留原文字前景色，只给背景着色」；而 `get_component_rich_style`
+        会把这个 transparent 前景**预解析成一个具体颜色**——实测（headless 启动
+        真实 app 打印）这个值恰好等于选区背景色（都被解析成 `#094472`），于是
+        整段套上去后前景和背景变成同一个色，选中的文字被背景整个盖住、彻底看
+        不见（真机反馈"高亮把文字都遮住了"的根因）。Textual 自己的渲染路径用的
+        是 `textual.style.Style`（保留 alpha 语义，transparent 前景=不改前景），
+        这里在自定义 Line API 路径上手动复刻同一语义：前景 transparent 时只取
+        选区背景、保留每个 Segment 原本的前景色；前景确有颜色（其它主题可能设了
+        对比色）时才连前景一起套用。
+        """
+        theme_name = self.app.current_theme.name
+        cached = self._selection_style_cache
+        if cached is not None and cached[0] == theme_name:
+            return cached[1]
+        screen = self.screen
+        rich_style = screen.get_component_rich_style("screen--selection")
+        visual = VisualStyle.from_styles(screen.get_component_styles("screen--selection"))
+        foreground = visual.foreground
+        if foreground is None or foreground.a == 0:
+            # 前景 transparent：只染背景，前景留空（保留原文字色）
+            style = Style(bgcolor=rich_style.bgcolor)
+        else:
+            style = rich_style
+        self._selection_style_cache = (theme_name, style)
+        return style
 
     def selection_updated(self, selection) -> None:
         # 基础缓存刻意不含选区样式；选区变化只需重绘，render_line 会按最新
