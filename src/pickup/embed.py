@@ -696,12 +696,12 @@ class ControlChannel:
                 pass
 
 
-_channel: ControlChannel | None = None
+_channels: dict[str, ControlChannel] = {}
 _channel_lock = threading.Lock()
 
 
 def open_channel(name: str, on_output=None) -> ControlChannel | None:
-    """聚焦托管会话时打开控制通道；同时只维护一条，切换会话时自动关旧开新。
+    """聚焦托管会话时打开控制通道；按 tmux 会话名维护通道池，多分屏可同时存活。
 
     同名复用时也要把 on_output 换成最新调用者传入的回调——host_session 会在
     真实命令跑起来前就为注入背景色调用一次（回调是 None），EmbedPane 稍后
@@ -710,33 +710,38 @@ def open_channel(name: str, on_output=None) -> ControlChannel | None:
 
     打开失败（tmux 缺失、会话刚退出）返回 None，全部发送路径自动回退外部 fork。
     """
-    global _channel
     with _channel_lock:
-        if _channel is not None and (_channel.dead or _channel.name != name):
-            _channel.close()
-            _channel = None
-        if _channel is None:
+        ch = _channels.get(name)
+        if ch is not None and (ch.dead or ch.name != name):
+            ch.close()
+            _channels.pop(name, None)
+            ch = None
+        if ch is None:
             try:
-                _channel = ControlChannel(name, on_output)
+                ch = ControlChannel(name, on_output)
+                _channels[name] = ch
             except OSError:
-                _channel = None
+                return None
         elif on_output is not None:
-            _channel.on_output = on_output
-        return _channel
+            ch.on_output = on_output
+        return ch
 
 
-def close_channel() -> None:
-    """关闭当前控制通道（分栏关闭、TUI 退出前必须调用，否则孤儿控制 client
-    会一直挂在保活服务端上）。"""
-    global _channel
+def close_channel(name: str | None = None) -> None:
+    """关闭控制通道。指定 name 时只关该会话；省略 name 时关闭全部（应用退出兜底）。"""
     with _channel_lock:
-        if _channel is not None:
-            _channel.close()
-            _channel = None
+        if name is None:
+            for ch in list(_channels.values()):
+                ch.close()
+            _channels.clear()
+            return
+        ch = _channels.pop(name, None)
+        if ch is not None:
+            ch.close()
 
 
 def _active_channel(name: str) -> ControlChannel | None:
-    ch = _channel
+    ch = _channels.get(name)
     if ch is not None and not ch.dead and ch.name == name:
         return ch
     return None

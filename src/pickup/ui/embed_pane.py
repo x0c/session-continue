@@ -187,7 +187,8 @@ class EmbedPane(Widget):
         self._set_real_cursor(False)  # 卸载时收起我们打开的真实光标，别把它漏给退出后的终端
         self._stop.set()
         self._poke.set()
-        embed.close_channel()
+        if self.session_name:
+            embed.close_channel(self.session_name)
 
     # ---- 对外接口：聚焦/切换托管会话 ----
 
@@ -239,6 +240,7 @@ class EmbedPane(Widget):
 
     def clear(self) -> None:
         self._capture_generation += 1
+        old_name = self.session_name
         self.session_name = None
         self._detail_renderer = None
         self._grid = None
@@ -246,7 +248,8 @@ class EmbedPane(Widget):
         self._cursor = None
         self.dead = False
         self.detail_offset = 0
-        embed.close_channel()
+        if old_name:
+            embed.close_channel(old_name)
         self.invalidate_detail()
 
     def invalidate_detail(self) -> None:

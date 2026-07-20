@@ -1,6 +1,6 @@
 # 终端界面领域知识库
 
-终端界面是 pickup 面向人的唯一交互入口：用户在左右分栏中浏览会话、筛选项目、预览已结束会话的完整对话，并可新建、恢复、接力或结束会话。主实现是 Textual 的 `MainScreen` / `PickupApp`；文档正文统一称为“终端界面”。
+终端界面是 pickup 面向人的唯一交互入口：用户在左栏会话列表与右栏（最多三格均分）中浏览会话、筛选项目、预览已结束会话的完整对话，并可新建、恢复、接力或结束会话。主实现是 Textual 的 `MainScreen` / `PickupApp`；文档正文统一称为“终端界面”。
 
 ## §0 目录索引
 
@@ -26,7 +26,8 @@ pickup 的价值是让用户从一个终端界面中继续或接力不同 Coding
 
 | 主称谓 | 用户可见含义 | 实现别名 / 边界 |
 |---|---|---|
-| 终端界面 | 整个左右分栏的交互页面 | `PickupApp` 承载应用，`MainScreen` 承载主屏 |
+| 终端界面 | 左栏列表 + 右栏（顶栏助手按钮 + 最多三格内嵌） | `PickupApp` 承载应用，`MainScreen` 承载主屏；`SplitPaneArea` 管右栏 |
+| 分屏组合记忆 | 活跃会话并排布局的隐式记忆（切走再回来自动恢复同伴） | `split_layout.py` → `~/.cache/pickup/split-layout.json`；仅活跃/托管会话 |
 | 侧边栏会话列表 | 左栏的搜索框、新建会话入口及会话卡片 | `SessionListView`、`SessionCard`、`NewSessionCard` |
 | 筛选项目 | 顶部输入框按项目名、路径和标题筛选会话 | `NavState.project_query`；不是独立项目列表页 |
 | 新建会话 | 以选定项目和运行时创建空白会话 | 顶部“＋ 新建会话”的完整选择流程，以及 `n` 快捷路径 |
@@ -132,7 +133,8 @@ stateDiagram-v2
 
 | 目录（相对项目根） | 内容 | 关键文件 |
 |---|---|---|
-| `ui/` | Textual 终端界面组件、状态与弹窗 | `main_screen.py`、`app.py`、`session_list.py`、`nav.py`、`modals.py`、`embed_pane.py` |
+| `ui/` | Textual 终端界面组件、状态与弹窗 | `main_screen.py`、`app.py`、`session_list.py`、`nav.py`、`modals.py`、`embed_pane.py`、`split_pane_area.py`、`runtime_top_bar.py` |
+| 项目根 | 分屏组合记忆 | `split_layout.py` → `~/.cache/pickup/split-layout.json` |
 | `docs/screenshots/` | 虚构演示数据的截图验收脚本与产物位置 | `capture.py` |
 | `docs/` | 维护约束、相邻领域知识库与截图说明 | `MAINTAINER_GUIDE.md`、本文件 |
 | 项目根 | 启动、会话展示状态、宽度计算与可观测入口 | `pickup.py`、`i18n.py`、`observe.py` |

@@ -22,7 +22,7 @@ import dataclasses
 
 from pickup import i18n, updater
 from pickup.i18n import t
-from pickup.ui.embed_pane import EmbedPane
+from pickup.ui.split_pane_area import SplitPaneArea
 from pickup.ui.modals import ConfirmModal, choose_target_runtime, new_session_flow
 from pickup.ui.nav import NavState
 from pickup.ui.session_list import SessionListView
@@ -103,8 +103,11 @@ class MainScreen(Screen):
         runtime_ids = store.registry.ids
         source = next((rid for rid in runtime_ids if store.sessions[rid]), runtime_ids[0])
         self.nav = NavState(source=source)
-        self._host_busy = False
+        self._host_pending = 0
         self._preview_gen = 0
+        from pickup import split_layout
+
+        self._split_store = split_layout.load_layout()
         self._update_channel: str | None = None
         self._update_latest: str | None = None
 
@@ -114,7 +117,14 @@ class MainScreen(Screen):
                 yield Input(placeholder=t("filter.placeholder"), id="project-search")
                 yield SessionListView(self.store, self.nav, id="session-list")
             if self.embed_ok:
-                yield EmbedPane(id="embed-pane", on_focus_list=self._focus_list, osc_report=self.osc_report)
+                yield SplitPaneArea(
+                    self.store,
+                    on_runtime_pick=self._on_runtime_pick,
+                    on_pane_close=self._on_pane_close,
+                    on_focus_list=self._focus_list,
+                    osc_report=self.osc_report,
+                    id="split-pane-area",
+                )
         yield UpdateToast(
             on_update=self._on_update_toast_update,
             on_restart=self._on_update_toast_restart,
@@ -147,6 +157,120 @@ class MainScreen(Screen):
         else:
             self.query_one(SessionListView).focus()
             self.call_after_refresh(self._follow_current_selection)
+            self.call_after_refresh(self._try_restore_startup_layout)
+
+    def _split_area(self) -> SplitPaneArea:
+        return self.query_one(SplitPaneArea)
+
+    def _is_session_active(self, key: str) -> bool:
+        import pickup
+
+        session = self.store.find_session(key)
+        if session is None:
+            return False
+        return bool(session.get("keepalive_name") or session.get("live"))
+
+    def _save_split_layout(self) -> None:
+        from pickup import split_layout
+
+        if not self.embed_ok:
+            return
+        area = self._split_area()
+        keys = [
+            k for k in area.ordered_session_keys()
+            if self._is_session_active(k) and not k.startswith("__")
+        ]
+        if not keys:
+            return
+        focus = area._focus_key if area._focus_key in keys else keys[0]  # noqa: SLF001
+        self._split_store.set_group(area.current_project, keys, focus_key=focus)
+        split_layout.save_layout(self._split_store)
+
+    def _on_pane_close(self, session_key: str) -> None:
+        from pickup import split_layout
+
+        self._split_store.remove_session(session_key)
+        split_layout.save_layout(self._split_store)
+        self._focus_list()
+
+    def _on_runtime_pick(self, runtime_id: str) -> None:
+        import pickup
+
+        area = self._split_area()
+        if not area.can_add_pane():
+            self.notify(t("split.full"))
+            self.app.bell()
+            return
+        session_list = self.query_one(SessionListView)
+        session = session_list.selected_session()
+        cwd = area.current_project or pickup.usable_cwd(
+            pickup._new_session_cwd(self.store, self.nav, session)
+        )
+        if cwd is None:
+            self.notify(t("split.no_project"))
+            self.app.bell()
+            return
+        request = pickup.NewSessionRequest(runtime_id, cwd)
+        self._embed_open(request, add_pane=True)
+
+    def _try_restore_startup_layout(self) -> None:
+        """启动时恢复上次活跃项目的分屏组合（仅活跃/托管会话）。"""
+        if not self.embed_ok or self.direct is not None:
+            return
+        from pickup import split_layout
+
+        self._split_store.prune_inactive(self._is_session_active)
+        split_layout.save_layout(self._split_store)
+        focus = self._split_store.last_focus_key
+        if focus and self._is_session_active(focus):
+            self._show_session_group(focus)
+            return
+        project = self._split_store.last_project
+        if not project:
+            return
+        for group in self._split_store.groups.values():
+            if group.project_cwd != project:
+                continue
+            alive = [k for k in group.session_keys if self._is_session_active(k)]
+            if alive:
+                self._show_session_group(alive[0])
+                return
+
+    def _show_session_group(self, focus_key: str) -> None:
+        from pickup import split_layout
+
+        project, keys = split_layout.resolve_active_group(
+            self._split_store,
+            focus_key,
+            is_active=self._is_session_active,
+            find_session=self.store.find_session,
+        )
+        entries = self._build_hosted_entries(keys)
+        if not entries:
+            return
+        self._split_area().show_hosted_group(
+            project, entries, focus_key=focus_key,
+        )
+        self._save_split_layout()
+
+    def _build_hosted_entries(
+        self, keys: list[str],
+    ) -> list[tuple[dict, str | None, object]]:
+        entries: list[tuple[dict, str | None, object]] = []
+        for key in keys:
+            session = self.store.find_session(key)
+            if session is None:
+                continue
+            kname = session.get("keepalive_name")
+            if kname or session.get("live"):
+                entries.append(
+                    (session, str(kname) if kname else None, lambda s=session: self._render_detail(s)),
+                )
+            else:
+                entries.append(
+                    (session, None, lambda s=session: self._render_detail(s)),
+                )
+        return entries
 
     # ---- 首屏异步加载：main() 把 store.load() 挪到后台线程异步跑，这里等它跑完
     # 再渲染真实列表（骨架已经在 compose() 时就显示出来了：空列表 + "＋ 新建会话"） ----
@@ -233,13 +357,16 @@ class MainScreen(Screen):
             self.call_next(self._rebuild_list)
 
     async def _rebuild_list(self, select_key: str | None = None) -> None:
-        await self.query_one(SessionListView).rebuild(select_key=select_key)
+        from pickup import split_layout
+
+        if self.embed_ok:
+            self._split_store.prune_inactive(self._is_session_active)
+            split_layout.save_layout(self._split_store)
+        in_split = self._split_area().active_session_keys() if self.embed_ok else set()
+        await self.query_one(SessionListView).rebuild(select_key=select_key, in_split_keys=in_split)
         self._update_header()
         if self.embed_ok:
-            pane = self.query_one(EmbedPane)
-            # SessionCard 已换成最新扫描对象；静态详情缓存也必须失效并重新跟随，
-            # 否则右栏仍会展示旧闭包里的标题/状态/对话预览。
-            pane.invalidate_detail()
+            self._split_area().invalidate_all_details()
             self._follow_current_selection()
 
     def _update_header(self) -> None:
@@ -273,24 +400,51 @@ class MainScreen(Screen):
         if not self.embed_ok:
             return
         session_list = self.query_one(SessionListView)
-        pane = self.query_one(EmbedPane)
-        # 面板已持有键盘焦点时不跟随列表：直启会话、或用户已明确 Enter 聚焦某个
-        # 托管会话，都不应被列表初次挂载/后台重扫触发的 highlight 事件覆盖画面。
-        if pane.has_focus:
+        area = self._split_area()
+        if area.any_embed_focused():
             return
         if session_list.is_new_session_selected():
-            pane.show_detail(lambda: Text(t("detail.new_session_hint")))
+            # 已在新建提示格时勿重复挂载，否则 remount 会抢走列表焦点
+            if area.ordered_session_keys() == ["__hint__"]:
+                return
+            area.show_new_session_hint()
             return
         session = session_list.selected_session()
         if session is None:
             return
-        name = session.get("keepalive_name")
-        if name:
-            pane.focus_session(str(name), lambda s=session: self._render_detail(s))
-        else:
+        import pickup
+
+        key = pickup.session_key(session)
+        kname = session.get("keepalive_name")
+        if kname or session.get("live"):
+            # 当前右侧已是该组合时跳过 remount，避免抢走列表焦点
+            current = set(area.ordered_session_keys())
+            from pickup import split_layout
+
+            project, keys = split_layout.resolve_active_group(
+                self._split_store,
+                key,
+                is_active=self._is_session_active,
+                find_session=self.store.find_session,
+            )
+            if current == set(keys) and key in current:
+                return
+            entries = self._build_hosted_entries(keys)
+            if entries:
+                area.show_hosted_group(project, entries, focus_key=key)
+                self._save_split_layout()
+            return
+        # 已在单格预览同一会话：只失效缓存并重新暖加载，避免 remount 抢焦点
+        if area.ordered_session_keys() == [key] and not any(
+            p.keepalive_name for p in area._panes  # noqa: SLF001
+        ):
             self._preview_gen += 1
             self._warm_conversation(session, self._preview_gen)
-            pane.show_detail(lambda s=session: self._render_detail(s))
+            area.invalidate_all_details()
+            return
+        self._preview_gen += 1
+        self._warm_conversation(session, self._preview_gen)
+        area.show_single_preview(session, lambda s=session: self._render_detail(s))
 
     def _detail_header(self, session: dict) -> Text:
         import pickup
@@ -322,7 +476,12 @@ class MainScreen(Screen):
         runtime_name = runtime.display_name
         runtime_style = pickup.runtime_label_style(runtime.id)
         try:
-            width = max(20, (self.query_one(EmbedPane).size.width or 40) - 2)
+            area = self._split_area()
+            cells = area._cells()  # noqa: SLF001
+            if cells:
+                width = max(20, (cells[0].embed_pane().size.width or 40) - 2)
+            else:
+                width = 40
         except Exception:
             width = 40
         lines = pickup._preview_lines(messages, runtime_name, width)
@@ -352,10 +511,10 @@ class MainScreen(Screen):
     def _refresh_preview_detail(self) -> None:
         if not self.embed_ok:
             return
-        pane = self.query_one(EmbedPane)
-        if pane.session_name or pane.has_focus:
+        area = self._split_area()
+        if area.any_embed_focused():
             return
-        pane.invalidate_detail()
+        area.invalidate_all_details()
 
     # ---- 会话选择/新建 ----
 
@@ -389,54 +548,68 @@ class MainScreen(Screen):
         else:
             self.app.exit(result=request)
 
-    def _embed_open(self, request) -> None:
+    def _embed_open(self, request, *, add_pane: bool = False) -> None:
         """准备启动计划（不涉及阻塞 I/O）后，把 `embed.host_session` 这个真正阻塞的
         tmux 子进程调用甩给后台 worker（见 `_host_and_focus`），不在 Textual 事件
         循环所在线程上跑——tmux 卡顿（系统负载高/磁盘慢）时 `_CREATE_TIMEOUT` 上限
         有 5s，同步跑会把整个 UI 冻住那么久。"""
         from pickup import keepalive
         import pickup
+        from pickup.split_layout import MAX_PANES
 
         same_runtime = isinstance(request, pickup.LaunchRequest) and (
             request.session.get("source") == request.target_runtime_id
         )
-        pane = self.query_one(EmbedPane)
+        area = self._split_area()
         if isinstance(request, pickup.LaunchRequest):
             key = pickup.session_key(request.session)
             current = self.store.find_session(key) or request.session
             request = pickup.LaunchRequest(current, request.target_runtime_id, request.title)
             existing = request.session.get("keepalive_name") if same_runtime else None
             if existing:
-                # 只挂接右栏画面，不抢键盘焦点——点右栏才与内嵌会话交互。
-                pane.focus_session(
-                    str(existing), lambda s=request.session: self._render_detail(s),
-                )
+                if add_pane:
+                    area.add_hosted_pane(
+                        current, str(existing),
+                        lambda s=current: self._render_detail(s),
+                        focus=True,
+                    )
+                else:
+                    self._show_session_group(key)
                 return
-            if self._host_busy:
+            if self._host_pending > 0 and not add_pane:
+                self.app.bell()
+                return
+            if add_pane and (area.pane_count() + self._host_pending) >= MAX_PANES:
+                self.notify(t("split.full"))
                 self.app.bell()
                 return
             plan = self.store.registry.build_launch_plan(request)
             ident = request.session["id"] if same_runtime else keepalive.new_session_ident()
         else:
-            if self._host_busy:
+            if not add_pane and area.pane_count() > 0 and not area.can_add_pane():
+                self.notify(t("split.full"))
+                self.app.bell()
+                return
+            if self._host_pending > 0 and not add_pane:
+                self.app.bell()
+                return
+            if add_pane and (area.pane_count() + self._host_pending) >= MAX_PANES:
+                self.notify(t("split.full"))
                 self.app.bell()
                 return
             plan = self.store.registry.build_new_session_plan(request)
             ident = keepalive.new_session_ident()
 
-        # pane.content_size 是 Textual 的 DOM/布局状态，必须在主线程读完再进 worker，
-        # 不能在后台线程里访问 Widget 属性。创建尺寸抬到 embed 下限，避免首帧极窄排版。
-        from pickup import embed as embed_mod
-
-        pane_size = pane.content_size
-        width, height = embed_mod.normalize_host_size(pane_size.width, pane_size.height)
-        self._host_busy = True
+        width, height = area.host_pane_size()
+        self._host_pending += 1
         self._host_and_focus(
-            request, plan, ident, same_runtime, width, height,
+            request, plan, ident, same_runtime, width, height, add_pane=add_pane,
         )
 
     @work(thread=True, group="host")
-    def _host_and_focus(self, request, plan, ident, same_runtime, width, height) -> None:
+    def _host_and_focus(
+        self, request, plan, ident, same_runtime, width, height, *, add_pane: bool = False,
+    ) -> None:
         from pickup import embed
         from pickup import observe
         import pickup
@@ -464,14 +637,18 @@ class MainScreen(Screen):
             runtime=runtime,
             ok=True,
         )
-        self.app.call_from_thread(self._on_embed_hosted, request, name, same_runtime)
+        self.app.call_from_thread(
+            self._on_embed_hosted, request, name, same_runtime, add_pane,
+        )
 
     def _on_host_failed(self) -> None:
-        """host worker 失败收尾：释放单飞锁并给用户终端响铃。"""
-        self._host_busy = False
+        """host worker 失败收尾：释放托管计数并给用户终端响铃。"""
+        self._host_pending = max(0, self._host_pending - 1)
         self.app.bell()
 
-    def _on_embed_hosted(self, request, name: str, same_runtime: bool) -> None:
+    def _on_embed_hosted(
+        self, request, name: str, same_runtime: bool, add_pane: bool = False,
+    ) -> None:
         """`_host_and_focus` worker 成功后的收尾：只在主线程操作 Textual/store 状态。
 
         `request` 可能是 `LaunchRequest`（恢复/接力）或 `NewSessionRequest`（空白新建）。
@@ -483,8 +660,8 @@ class MainScreen(Screen):
         """
         import pickup
 
-        self._host_busy = False
-        pane = self.query_one(EmbedPane)
+        self._host_pending = max(0, self._host_pending - 1)
+        area = self._split_area()
         fallback = None
         select_key = None
         if isinstance(request, pickup.LaunchRequest):
@@ -518,21 +695,29 @@ class MainScreen(Screen):
             )
             select_key = pickup.session_key(current)
             fallback = lambda s=current: self._render_detail(s)
-        # 托管成功只更新右栏画面；键盘焦点留在侧边栏，点右栏才进入内嵌交互。
-        pane.focus_session(name, fallback)
+        if add_pane:
+            area.add_hosted_pane(current, name, fallback, focus=False)
+        else:
+            import pickup as pickup_mod
+
+            key = pickup.session_key(current)
+            project = pickup_mod._normalize_cwd(current.get("cwd"))
+            area.show_hosted_group(
+                project,
+                [(current, name, fallback)],
+                focus_key=key,
+            )
+        self._save_split_layout()
         self.call_next(self._rebuild_list, select_key)
 
     def _host_direct_launch(self) -> None:
-        if self._host_busy:
+        if self._host_pending >= 3:
             self.app.bell()
             return
         direct = self.direct
-        pane = self.query_one(EmbedPane)
-        from pickup import embed as embed_mod
-
-        pane_size = pane.content_size
-        width, height = embed_mod.normalize_host_size(pane_size.width, pane_size.height)
-        self._host_busy = True
+        area = self._split_area()
+        width, height = area.host_pane_size()
+        self._host_pending += 1
         self._host_direct_worker(direct, width, height)
 
     @work(thread=True, group="host")
@@ -567,11 +752,22 @@ class MainScreen(Screen):
         self.app.call_from_thread(self._on_direct_hosted, name)
 
     def _on_direct_hosted(self, name: str) -> None:
-        self._host_busy = False
-        pane = self.query_one(EmbedPane)
-        pane.focus_session(name)
-        # 直启是「打开就操作」：焦点落到右栏。侧边栏点选/回车路径不抢焦点。
-        self.set_focus(pane)
+        self._host_pending = max(0, self._host_pending - 1)
+        area = self._split_area()
+        direct = self.direct
+        session = {
+            "source": direct.runtime_id,
+            "id": direct.ident,
+            "fallback_title": "",
+            "keepalive_name": name,
+            "cwd": "",
+        }
+        area.show_hosted_group("", [(session, name, None)])
+        cells = area._cells()  # noqa: SLF001
+        if cells:
+            pane = cells[0].embed_pane()
+            pane.focus_session(name)
+            self.set_focus(pane)
 
     def _focus_list(self) -> None:
         self.query_one(SessionListView).focus()
@@ -585,7 +781,8 @@ class MainScreen(Screen):
         if event.input.id != "project-search":
             return
         self.nav.project_query = event.value
-        await self.query_one(SessionListView).rebuild(keep_selection=True)
+        in_split = self._split_area().active_session_keys() if self.embed_ok else set()
+        await self.query_one(SessionListView).rebuild(keep_selection=True, in_split_keys=in_split)
         self._update_header()
         self._follow_current_selection()
 
@@ -640,7 +837,11 @@ class MainScreen(Screen):
             self.app.bell()
             return
         request = pickup.NewSessionRequest(self.nav.source, cwd)
-        await self._open_or_exit(request)
+        if self.embed_ok:
+            area = self._split_area()
+            self._embed_open(request, add_pane=area.pane_count() > 0)
+        else:
+            self.app.exit(result=request)
 
     @work
     async def action_kill_keepalive(self) -> None:
@@ -660,7 +861,14 @@ class MainScreen(Screen):
         if not confirmed:
             return
         keepalive.kill(keepalive_name)
-        self.store.mark_hosted(pickup.session_key(session), None)
+        key = pickup.session_key(session)
+        self.store.mark_hosted(key, None)
+        from pickup import split_layout
+
+        self._split_store.remove_session(key)
+        split_layout.save_layout(self._split_store)
+        if self.embed_ok:
+            self._split_area().remove_by_keepalive(keepalive_name)
         await self._rebuild_list()
 
     @work
@@ -692,10 +900,12 @@ class MainScreen(Screen):
         if keepalive_name:
             keepalive.kill(keepalive_name)
             self.store.mark_hosted(key, None)
+            from pickup import split_layout
+
+            self._split_store.remove_session(key)
+            split_layout.save_layout(self._split_store)
             if self.embed_ok:
-                pane = self.query_one(EmbedPane)
-                if pane.session_name == keepalive_name:
-                    pane.clear()
+                self._split_area().remove_by_keepalive(keepalive_name)
         try:
             self.store.registry.get(str(session.get("source") or "")).delete_session(session)
         except (LaunchError, OSError, sqlite3.Error) as exc:
@@ -708,24 +918,25 @@ class MainScreen(Screen):
     def action_close_pane(self) -> None:
         if not self.embed_ok:
             return
-        self.query_one(EmbedPane).clear()
+        self._split_area().close_focused_pane()
+        self._save_split_layout()
         self._focus_list()
 
     def action_preview_home(self) -> None:
         if self.embed_ok:
-            self.query_one(EmbedPane).scroll_detail_home()
+            self._split_area().scroll_preview_home()
 
     def action_preview_end(self) -> None:
         if self.embed_ok:
-            self.query_one(EmbedPane).scroll_detail_end()
+            self._split_area().scroll_preview_end()
 
     def action_preview_page_up(self) -> None:
         if self.embed_ok:
-            self.query_one(EmbedPane).scroll_detail_page(-1)
+            self._split_area().scroll_preview_page(-1)
 
     def action_preview_page_down(self) -> None:
         if self.embed_ok:
-            self.query_one(EmbedPane).scroll_detail_page(1)
+            self._split_area().scroll_preview_page(1)
 
     def action_save_screenshot(self) -> None:
         """F12：导出当前 TUI 到 ~/.cache/pickup/screenshots/（用户主动触发）。"""

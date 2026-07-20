@@ -20,6 +20,8 @@ The tool reads these files to build a recent-session list, extract a compact pre
 
 - Generated title cache under `~/.cache/pickup/titles.json`.
 - A lock file under `~/.cache/pickup/titles.lock` while title generation is running.
+- Active split-pane layout memory under `~/.cache/pickup/split-layout.json` (which hosted
+  sessions were last shown side-by-side in the right pane; session keys and project paths only).
 - Update-check state under `~/.cache/pickup/update.json` (which version you last dismissed, and on
   which day) — only written when you click "dismiss" on the update notification or run `pickup update`.
 
