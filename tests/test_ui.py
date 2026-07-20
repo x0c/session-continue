@@ -465,6 +465,41 @@ class SessionCardVisualTests(unittest.TestCase):
                 f"{source} runtime label should be bold, spans={runtime_spans}",
             )
 
+    def test_project_name_is_bold_but_title_is_not(self) -> None:
+        """侧边栏「项目名: 标题」：项目名 bold、标题 dim，形成可见对比。"""
+        card = self._card(cwd="/tmp/pickup", display_title="修复侧边栏展示")
+        with mock.patch.object(
+            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 2),
+        ):
+            rendered = card.render()
+
+        first_line = rendered.plain.splitlines()[0]
+        project_start = first_line.index("pickup")
+        project_end = project_start + len("pickup")
+        title_start = first_line.index("修复侧边栏展示")
+        runtime_start = first_line.rfind("OpenCode")
+
+        project_spans = [
+            span for span in rendered.spans
+            if span.start <= project_start and span.end >= project_end
+        ]
+        self.assertTrue(
+            any("bold" in str(span.style).lower() for span in project_spans),
+            f"project name should be bold, spans={project_spans}",
+        )
+        title_spans = [
+            span for span in rendered.spans
+            if span.start <= title_start < span.end and span.end <= runtime_start
+        ]
+        self.assertTrue(
+            any("dim" in str(span.style).lower() for span in title_spans),
+            f"title should be dim, spans={title_spans}",
+        )
+        self.assertFalse(
+            any("bold" in str(span.style).lower() for span in title_spans),
+            f"title should not be bold, spans={title_spans}",
+        )
+
     def test_generating_title_keeps_spinner_without_bold(self) -> None:
         card = self._card(generating=True)
         with mock.patch.object(
@@ -475,12 +510,18 @@ class SessionCardVisualTests(unittest.TestCase):
         first_line = rendered.plain.splitlines()[0]
         runtime_start = first_line.rfind("OpenCode")
         self.assertTrue(rendered.plain.startswith("◐ "))
-        # 只断言标题段不加粗；右上角 runtime 名允许 bold + 配色。
-        title_spans = [
+        # spinner 本身不加粗；项目名允许 bold（与标题对比）。
+        spinner_end = len("◐ ")
+        spinner_spans = [
             span for span in rendered.spans
-            if span.start < runtime_start and span.end <= runtime_start
+            if span.start < spinner_end and span.end <= runtime_start
         ]
-        self.assertFalse(any("bold" in str(span.style) for span in title_spans))
+        self.assertFalse(
+            any(
+                "bold" in str(span.style).lower() and span.end <= spinner_end
+                for span in spinner_spans
+            )
+        )
 
     def test_running_status_is_green_but_ended_status_is_not(self) -> None:
         cases = (

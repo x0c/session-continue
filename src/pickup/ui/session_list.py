@@ -111,9 +111,8 @@ class SessionCard(Widget):
             if project_path
             else str(session.get("cwd_display") or t("project.unknown"))
         )
-        title_prefix = f"{project}: "
-        if is_gen:
-            title_prefix = f"{self._spin_char} {title_prefix}"
+        spinner_prefix = f"{self._spin_char} " if is_gen else ""
+        title_prefix = f"{spinner_prefix}{project}: "
         width = max(10, self.size.width or 40)
 
         runtime = store.registry.get(str(session.get("source") or ""))
@@ -130,7 +129,15 @@ class SessionCard(Widget):
         status_cell = pickup._fit_cell(status_text, status_width)
         time_cell = pickup._fit_cell_right(relative_time, time_width)
 
+        # 项目名 bold、其后「: 标题」dim——终端里比单纯 bold 更有对比。
         out = Text(title_cell)
+        content_len = len(title_cell.rstrip(" "))
+        project_start = len(spinner_prefix)
+        project_end = min(project_start + len(project), content_len)
+        if project_end > project_start:
+            out.stylize("bold", project_start, project_end)
+        if content_len > project_end:
+            out.stylize("dim", project_end, content_len)
         out.append(runtime_cell, style=pickup.runtime_label_style(runtime_id))
         out.append("\n")
         out.append(status_cell, style="green" if is_running else "dim")
