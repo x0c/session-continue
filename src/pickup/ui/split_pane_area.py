@@ -175,9 +175,18 @@ class PaneCell(Vertical):
                 return child
         return None
 
+    def _pane_header(self) -> _PaneHeader | None:
+        """分栏重建/卸载过程中标题栏可能尚未挂上或已卸下。"""
+        for child in self.children:
+            if isinstance(child, _PaneHeader):
+                return child
+        return None
+
     def set_title(self, title: str) -> None:
         self._title = title
-        self.query_one(_PaneHeader).set_title(title)
+        header = self._pane_header()
+        if header is not None:
+            header.set_title(title)
 
     def focus_embed(self) -> None:
         pane = self.embed_pane()
@@ -191,7 +200,13 @@ class PaneCell(Vertical):
         self.call_after_refresh(self._sync_active_marker)
 
     def _sync_active_marker(self) -> None:
-        self.query_one(_PaneHeader).set_active(self.has_focus_within)
+        # 双击顶栏助手、快速增删分栏时，焦点回调可能落在「标题栏尚未 compose
+        # / 旧格已卸下」的中间态；真机复现：NoMatches: '_PaneHeader'。缺标题栏
+        # 时静默跳过即可，下一轮焦点事件会再同步。
+        header = self._pane_header()
+        if header is None:
+            return
+        header.set_active(self.has_focus_within)
 
 
 class SplitPaneArea(Vertical):
@@ -245,9 +260,6 @@ class SplitPaneArea(Vertical):
         )
         with Horizontal(id="pane-row"):
             yield Static(t("split.empty_hint"), id="pane-row-empty")
-
-    def active_session_keys(self) -> set[str]:
-        return {p.session_key for p in self._panes if p.keepalive_name}
 
     def pane_count(self) -> int:
         return len(self._panes)

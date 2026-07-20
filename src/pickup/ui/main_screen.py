@@ -362,8 +362,7 @@ class MainScreen(Screen):
         if self.embed_ok:
             self._split_store.prune_inactive(self._is_session_active)
             split_layout.save_layout(self._split_store)
-        in_split = self._split_area().active_session_keys() if self.embed_ok else set()
-        await self.query_one(SessionListView).rebuild(select_key=select_key, in_split_keys=in_split)
+        await self.query_one(SessionListView).rebuild(select_key=select_key)
         self._update_header()
         if self.embed_ok:
             self._split_area().invalidate_all_details()
@@ -781,8 +780,7 @@ class MainScreen(Screen):
         if event.input.id != "project-search":
             return
         self.nav.project_query = event.value
-        in_split = self._split_area().active_session_keys() if self.embed_ok else set()
-        await self.query_one(SessionListView).rebuild(keep_selection=True, in_split_keys=in_split)
+        await self.query_one(SessionListView).rebuild(keep_selection=True)
         self._update_header()
         self._follow_current_selection()
 

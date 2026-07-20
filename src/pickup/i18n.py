@@ -143,10 +143,6 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "Select a session in a project first",
         "zh": "请先选择某个项目下的会话",
     },
-    "status.in_split": {
-        "en": "▸",
-        "zh": "▸",
-    },
     "detail.pick_session": {
         "en": "Select a session to view details",
         "zh": "选择一个会话查看详情",

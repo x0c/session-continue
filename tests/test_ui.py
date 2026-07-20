@@ -1208,6 +1208,25 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(pane.has_focus)
 
 
+class PaneCellHeaderSyncTests(unittest.TestCase):
+    """分栏标题栏在重建中间态可能缺失；焦点同步不得因此崩掉（真机：双击顶栏 OpenCode）。"""
+
+    def test_sync_active_marker_tolerates_missing_header(self) -> None:
+        from pickup.ui.split_pane_area import PaneCell, PaneSpec
+
+        cell = PaneCell(
+            PaneSpec(session_key="k", cell_id="c1"),
+            title="t",
+            on_close=lambda: None,
+            on_focus_list=lambda: None,
+            osc_report=None,
+        )
+        # 未 mount / 未 compose：子节点为空
+        cell._sync_active_marker()  # noqa: SLF001 — 不得抛 NoMatches
+        cell.set_title("new-title")
+        self.assertEqual(cell._title, "new-title")  # noqa: SLF001
+
+
 @unittest.skipUnless(HAS_TMUX, "内嵌面板依赖真实 tmux")
 class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
     """用真实（但轻量）tmux 会话验证 MainScreen ↔ EmbedPane ↔ embed.py 接线。"""

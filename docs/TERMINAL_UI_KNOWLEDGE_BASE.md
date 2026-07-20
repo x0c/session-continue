@@ -211,7 +211,7 @@ stateDiagram-v2
 - **AI 易错点**【右栏滚动语义】静态对话的 `detail_offset`（0 为顶部，增大表示更靠后）与实时画面的 `history_offset`（0 为直播底部）方向相反。滚轮进入静态对话时必须取反，保证“下滚看更晚内容”。
 - **AI 易错点**【点击选择】会动态增删的会话卡、新建项和弹窗菜单项必须关闭 Textual 文本拖选；它们的点击语义是选择/确认。右栏内嵌实时终端保留文本选择和 Ctrl+C 复制，不能全局关闭。
 - **AI 易错点**【窗口缩放必须防抖】拖动终端窗口时备用屏幕会被终端自行 reflow，差分重绘会花屏，需要整屏全量重绘清残影；但全量重绘、`tmux resize-window` 和唤醒抓帧都必须在尺寸停稳（约 120ms）后再做一次，禁止每次 Resize 都狂刷。拖动期右栏只按当前宽度裁补旧缓存行即可。
-- **AI 易错点**【右栏顶栏与分栏标题】助手顶栏按钮靠右排列，背景必须与底部操作栏共用 `$footer-background`，避免出现割裂的纯黑色条。侧边栏与右栏之间、右栏各分栏之间统一保留一列空白间隔：`SplitPaneArea` 左侧 `margin-left: 1`，第二格及后续 `PaneCell` 左侧 `margin-left: 1`；不画任何分隔线或边框，避免终端字体把线条字符渲成连续方块。标题栏使用非纯黑的 `$surface` 灰色背景，活跃分栏切换为 `$primary-muted`（弱化主色底，避免高饱和蓝条抢过内嵌内容），文字统一用 `auto 90%` 保证深浅主题下的对比度。禁止再用整圈边框或标题前圆点表示焦点。
+- **AI 易错点**【右栏顶栏与分栏标题】助手顶栏按钮靠右排列，背景必须与底部操作栏共用 `$footer-background`，避免出现割裂的纯黑色条。侧边栏与右栏之间、右栏各分栏之间统一保留一列空白间隔：`SplitPaneArea` 左侧 `margin-left: 1`，第二格及后续 `PaneCell` 左侧 `margin-left: 1`；不画任何分隔线或边框，避免终端字体把线条字符渲成连续方块。标题栏使用非纯黑的 `$surface` 灰色背景，活跃分栏切换为 `$primary-muted`（弱化主色底，避免高饱和蓝条抢过内嵌内容），文字统一用 `auto 90%` 保证深浅主题下的对比度。禁止再用整圈边框或标题前圆点表示焦点。`PaneCell._sync_active_marker` / `set_title` 必须容忍标题栏尚未挂上或已卸下（双击顶栏快速加格时焦点回调会落在中间态），禁止对 `_PaneHeader` 裸 `query_one`。
 - **AI 易错点**【壳层配色层级】pickup 自有主题是 `pickup-dark` / `pickup-light`（冷静工作台），不是 Textual 默认主题。筛选框用 `$panel` / 聚焦 `$primary-muted`，禁止再铺 `$primary-darken-*` 大色块；列表选中只靠主题 `block-cursor-*` 抬一层冷灰蓝底，**禁止**再给 `ListItem.-highlight` 加 `border-left`——`tall`/`solid` 边框在终端里会和选中底拼成「双蓝条」。饱和色只留给助手标签、运行中状态、警告/错误。
 - 【隐性依赖】`Footer` 展示的是 `MainScreen.BINDINGS` 的本地化 description。验证时中文环境必须看到 `a 高级操作`，英文环境必须看到 `a Advanced`；不要再手绘底部帮助行。
 - 【隐性依赖】真实终端冒烟必须运行当前源码 `python3 -m pickup` 或先覆盖安装。用户 shell 中的 `pickup` 可能指向旧 site-packages 副本；布局、配色或按键改动后也必须重启已打开的终端界面。

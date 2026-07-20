@@ -52,7 +52,6 @@ class SessionCard(Widget):
         *,
         display_title: str | None = None,
         is_generating: bool = False,
-        in_split: bool = False,
     ) -> None:
         super().__init__()
         self.session = session
@@ -63,7 +62,6 @@ class SessionCard(Widget):
         # display_titles dict 和 generating set，卡片一多就是重复的拷贝开销。
         self.display_title = display_title if display_title is not None else session["fallback_title"]
         self.is_generating = is_generating
-        self.in_split = in_split
         self._render_signature = self._compute_signature()
 
     def _compute_signature(self) -> tuple:
@@ -72,20 +70,17 @@ class SessionCard(Widget):
         return (
             self.display_title,
             self.is_generating,
-            self.in_split,
             bool(session.get("live")),
             session.get("keepalive_name"),
             session.get("mtime"),
         )
 
-    def apply_update(self, session: dict, display_title: str, is_generating: bool, *, in_split: bool | None = None) -> bool:
+    def apply_update(self, session: dict, display_title: str, is_generating: bool) -> bool:
         """原地更新路径专用：替换会话引用与展示态，仅当渲染相关字段确实变化
         时才 refresh()。返回是否触发了 refresh，供调用方按需断言/统计。"""
         self.session = session
         self.display_title = display_title
         self.is_generating = is_generating
-        if in_split is not None:
-            self.in_split = in_split
         signature = self._compute_signature()
         changed = signature != self._render_signature
         self._render_signature = signature
@@ -117,8 +112,7 @@ class SessionCard(Widget):
             else str(session.get("cwd_display") or t("project.unknown"))
         )
         spinner_prefix = f"{self._spin_char} " if is_gen else ""
-        split_prefix = f"{t('status.in_split')} " if self.in_split else ""
-        title_prefix = f"{split_prefix}{spinner_prefix}{project}: "
+        title_prefix = f"{spinner_prefix}{project}: "
         width = max(10, self.size.width or 40)
 
         runtime = store.registry.get(str(session.get("source") or ""))
@@ -199,7 +193,6 @@ class SessionListView(ListView):
         # 页头占位文案 / 新建会话目录解析共用，禁止在本类另开一份状态。
         self.nav = nav
         self._spin_frame = 0
-        self._in_split_keys: set[str] = set()
 
     async def on_mount(self) -> None:
         await self.rebuild()
@@ -254,7 +247,6 @@ class SessionListView(ListView):
                 session,
                 display_titles.get(key, session["fallback_title"]),
                 key in generating,
-                in_split=key in self._in_split_keys,
             )
 
     def visible_sessions(self) -> list[dict]:
@@ -307,7 +299,6 @@ class SessionListView(ListView):
         *,
         keep_selection: bool = True,
         select_key: str | None = None,
-        in_split_keys: set[str] | None = None,
     ) -> None:
         """按当前筛选重建条目；尽量保持原有选中的会话不变（后台重扫后调用）。
 
@@ -320,7 +311,6 @@ class SessionListView(ListView):
         """
         import pickup
 
-        self._in_split_keys = in_split_keys or set()
         previous_key = select_key
         if previous_key is None and keep_selection:
             previous_key = self._displayed_selected_key()
@@ -354,7 +344,6 @@ class SessionListView(ListView):
                         pickup.SPINNER_FRAMES[0],
                         display_title=display_titles.get(key, session["fallback_title"]),
                         is_generating=key in generating,
-                        in_split=key in self._in_split_keys,
                     )
                 )
             )
