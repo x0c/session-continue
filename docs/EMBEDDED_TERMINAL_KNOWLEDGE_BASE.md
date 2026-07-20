@@ -163,6 +163,7 @@ stateDiagram-v2
 | 抓取实时画面 | `embed.py` | `capture()`、`pane_state()` | 优先经控制通道请求，失效时回退外部只读 tmux 调用 |
 | 控制通道协议 | `embed.py` | `ControlChannel.request()`、`command()`、`close()` | FIFO 对应命令响应、处理 `%output` / `%pause` / `%exit`、可幂等关闭 |
 | 常规输入 | `ui/embed_pane.py` | `EmbedPane._on_key()`、`_on_paste()` | 文本、特殊键、Ctrl+C、Ctrl+\ 和粘贴的用户语义分流；仅右栏聚焦时生效 |
+| 剪贴板图片粘贴 | `embed.py` | `extract_pasted_image()`、`save_image_and_paste_path()`、`_pane_cwd()` | 识别哨兵包裹的 base64 图片、落盘、经 `paste()` 把路径喂给聚焦中的 agent；由 `EmbedPane._on_paste()` 分流调用（后台 worker，见 `_paste_image_worker`） |
 | 鼠标滚轮与历史 | `ui/embed_pane.py` | `EmbedPane._wheel()`、`_scroll()` | 按鼠标命中区处理，与键盘焦点无关；转发鼠标或变更应用层回滚偏移 |
 | 鼠标后台发送 | `embed.py` | `send_mouse_sequence()`、`_wheel_send_loop()` | 发送 SGR 滚轮序列、限速并在队列饱和时丢弃旧事件 |
 | 屏幕解析与真彩色 | `embed.py` | `parse_screen()`、`_SgrState.apply()`、`cell_style()` | 解析 SGR；RGB 直接交给 Rich，保留宽字符和组合字符 |
@@ -213,6 +214,7 @@ stateDiagram-v2
 - **AI 易错点**【隐性依赖】IME 依赖 pane 内正确且可见的真实硬件光标。焦点、抓帧、尺寸变化均要更新 `App.cursor_position`；失焦、会话结束或内部光标隐藏时收起外层光标。
 - **AI 易错点**【禁止】把托管窗缩到极窄（低于 `MIN_HOST_WIDTH`×`MIN_HOST_HEIGHT`）-> 创建用 `normalize_host_size` 抬下限，后续缩放用 `should_resize_host` 过滤；过窄直接跳过（原因：助手会按当前列数硬换行写入 scrollback，恢复宽度后往上滚仍是窄条历史，无法自动还原）。
 - **AI 易错点**【禁止】侧边栏选中、回车托管或直启成功后自动把键盘焦点抢到右栏 -> 焦点必须留在侧边栏，只有鼠标点到右栏才进入内嵌交互；滚轮按命中区处理，与焦点无关。
+- **AI 易错点**【隐性依赖】剪贴板图片粘贴走的哨兵协议（`␞PICKUP_IMG_BEGIN␞<base64>␞PICKUP_IMG_END␞`，`embed.py` 的 `_IMG_SENTINEL_BEGIN`/`_IMG_SENTINEL_END`）是与远程网页终端网关 `shell-gate`（另一仓库，`internal/server/web/enhance.js`）之间的跨仓库约定 —— 改任一侧的哨兵字符串都必须同步另一侧，否则粘贴的图片会被当成普通文本整段发给 agent，不会报错也不会落盘，只能靠肉眼发现。本域看不到 `shell-gate` 侧代码，改动前先确认对方现状。
 - 【消歧】**关闭分栏**只隐藏内嵌实时终端并让会话继续运行；**结束会话**才会停止运行中的助手。二者不能互相替代。
 - 【叫法统一】正文使用“内嵌实时终端”；实现中可见 `embed`、`EmbedPane`、`capture-pane`。正文使用“运行中(托管)”；实现中可见 `host_session`、hosted、保活会话名。
 
