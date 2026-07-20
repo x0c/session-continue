@@ -265,6 +265,30 @@ class SessionListView(ListView):
     def is_new_session_selected(self) -> bool:
         return self.index == 0
 
+    def _displayed_selected_key(self) -> str | None:
+        """按当前已渲染的 DOM 卡片（而非刚重算过的 `visible_sessions()`）取回
+        「用户此刻实际选中的会话」键。
+
+        `self.index` 是 DOM 子项下标；只有在 DOM 与 store 同步时它才等价于
+        `visible_sessions()` 的下标。后台重扫时 store 先于 DOM 更新（新会话
+        按 mtime 置顶插入），此时若仍用 `selected_session()`（内部按新算出的
+        `visible_sessions()` 索引 `self.index`）推导原选中会话，会因列表顺序
+        已变而错指到相邻会话——真实复现过：聚焦第三条时后台刷出新会话，
+        高亮和右栏跟着串到第二条。`rebuild()` 必须用这个方法取原选中键，
+        `selected_session()` 仍保留给用户交互期（回车/删除/结束会话等），
+        那些时刻 DOM 与 store 本就同步，不受影响。
+        """
+        import pickup
+
+        idx = self.index
+        if idx is None or idx == 0:
+            return None
+        cards = self._session_cards()
+        pos = idx - 1
+        if 0 <= pos < len(cards):
+            return pickup.session_key(cards[pos].session)
+        return None
+
     async def rebuild(self, *, keep_selection: bool = True, select_key: str | None = None) -> None:
         """按当前筛选重建条目；尽量保持原有选中的会话不变（后台重扫后调用）。
 
@@ -279,9 +303,7 @@ class SessionListView(ListView):
 
         previous_key = select_key
         if previous_key is None and keep_selection:
-            selected = self.selected_session()
-            if selected is not None:
-                previous_key = pickup.session_key(selected)
+            previous_key = self._displayed_selected_key()
 
         sessions = self.visible_sessions()
         new_keys = [pickup.session_key(session) for session in sessions]

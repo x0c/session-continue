@@ -17,13 +17,24 @@ from dataclasses import dataclass
 # 关掉 Textual 默认开启的 Kitty 键盘协议。必须在任何 `import textual` 之前设置。
 os.environ.setdefault("TEXTUAL_DISABLE_KITTY_KEY", "1")
 
-from pickup import agent_api, embed, keepalive, observe, titles
+from pickup import agent_api, embed, keepalive, observe, titles, updater
 from pickup.models import LaunchPlan, LaunchRequest, NewSessionRequest
 from pickup.observe import log_embed_error as _log_embed_error
 from pickup.runtime import LaunchError, RuntimeRegistry, default_registry, execute_launch, usable_cwd
 from pickup.store import SessionStore, _new_session_cwd
 from pickup import theme as theme_mod
 from pickup.theme import _probe_osc_colours
+
+
+def _restart_process() -> None:
+    """客户端自动更新：升级成功、用户点了「重启」后，用新装好的磁盘代码
+    re-exec 一个全新 pickup 进程，原样透传本次启动的命令行参数。
+
+    tmux 保活会话与本进程无关，重启不影响已托管会话；execv 成功后本进程
+    直接被替换，不会返回。"""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, "-m", "pickup", *sys.argv[1:]])
 
 @dataclass(frozen=True)
 class _DirectLaunch:
@@ -231,6 +242,9 @@ def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
     chosen = run_app(store, True, _DirectLaunch(plan, runtime_id, ident), theme_mod._OSC_REPORT)
     # 兜底关闭内嵌控制通道，同 main() 的退出路径
     pkg.embed.close_channel()
+    if isinstance(chosen, pkg.updater.RestartRequest):
+        pkg._restart_process()
+        return
     if chosen is None:
         return
     try:
@@ -248,6 +262,10 @@ def main() -> None:
     # agent_api，不与下面的 TUI/--json 旧参数共用同一个 parser。
     if len(sys.argv) > 1 and sys.argv[1] in agent_api.COMMAND_ROOT_NAMES:
         sys.exit(agent_api.dispatch(sys.argv[1:]))
+
+    # `pickup update`：手动触发客户端自动更新，不放进只读的 agent_api。
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        sys.exit(updater.cli_update())
 
     # `pickup claude …` / `pickup codex …`（可选前置 --no-keepalive）是直启透传子命令，同样整体
     # 绕开下面的 TUI/--json 旧参数 parser；分发探测此处只需运行时 ID 集合。
@@ -357,6 +375,9 @@ def main() -> None:
     # c 键关分栏才会关，Esc 退出/回车全屏接管等退出路径不经那条分支——不在这里统一
     # 兜底就会把孤儿控制 client 留在保活服务端上。close_channel 无通道时是空操作。
     embed.close_channel()
+    if isinstance(chosen, updater.RestartRequest):
+        _restart_process()
+        return
     if chosen is None:
         return
 

@@ -6,16 +6,18 @@ from datetime import datetime as datetime  # 供测试用 pickup.datetime.fromti
 import shutil as shutil
 import sys as sys
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 from pickup import embed as embed  # noqa: F401
 from pickup import keepalive as keepalive  # noqa: F401
 from pickup import titles as titles  # noqa: F401
+from pickup import updater as updater  # noqa: F401
 from pickup.cli import (  # noqa: F401
     _DirectLaunch,
     _dispatch_direct_launch,
     _launch,
     _require_tmux,
+    _restart_process,
     _spawn_title_daemon,
     main,
 )

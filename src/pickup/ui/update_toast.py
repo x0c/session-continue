@@ -2,11 +2,18 @@
 
 外层 UpdateToast 用 `dock: bottom` + `align: right bottom` 把自己锚到屏幕右下角
 （镜像 Textual 内置 Toast/ToastRack 的定位手法：单个 leaf widget 自身 docked 时
-无法把自己右对齐——`align` 只作用于容器的子节点，所以外层必须是容器，真正的
-可点击主体是内部子节点）。不挂进 `#list-pane`，不受侧边栏末行间隔的硬约定牵连。
+无法把自己右对齐——`align` 只作用于容器的子节点，所以外层必须是容器）。不挂进
+`#list-pane`，不受侧边栏末行间隔的硬约定牵连。
 
 状态机：hidden → available(version) → updating → done(version) / failed。
 点击主体按当前状态触发不同回调；仅 available 状态下额外露出一个"忽略"命中区。
+
+真机调试踩坑记录：本文件早期版本把状态刷新方法命名为 `_render`，与 Textual
+`Widget` 基类自身用来计算可绘制内容的内部方法 `_render()` 同名，被悄悄覆盖后
+框架在需要自绘（如 dock+align 容器里子节点未占满的空白区域）时拿到 `None`
+而不是真正的 Visual，导致 `Visual.to_strips` 内部崩溃（`None.render_strips`）。
+教训：自定义 Widget 子类的私有方法一律避免 `_render`/`render`/其它任何与
+Textual 基类同名的下划线前缀方法。
 """
 
 from __future__ import annotations
@@ -31,15 +38,15 @@ class _ToastBody(Static):
 
     def __init__(self, on_click: Callable[[], None], **kwargs) -> None:
         super().__init__("", **kwargs)
-        self._on_click = on_click
+        self._on_click_cb = on_click
 
     def on_click(self, event: events.Click) -> None:
         event.stop()
-        self._on_click()
+        self._on_click_cb()
 
 
 class _ToastClose(Static):
-    """浮层的"忽略"小命中区，只在 available 状态下挂载。"""
+    """浮层的"忽略"小命中区，只在 available 状态下可见。"""
 
     ALLOW_SELECT = False
 
@@ -60,11 +67,11 @@ class _ToastClose(Static):
 
     def __init__(self, on_click: Callable[[], None], **kwargs) -> None:
         super().__init__(t("update.dismiss"), **kwargs)
-        self._on_click = on_click
+        self._on_click_cb = on_click
 
     def on_click(self, event: events.Click) -> None:
         event.stop()
-        self._on_click()
+        self._on_click_cb()
 
 
 class UpdateToast(Container):
@@ -105,6 +112,12 @@ class UpdateToast(Container):
     }
     UpdateToast _ToastBody:hover {
         background: $primary-darken-1;
+    }
+    UpdateToast #toast-close {
+        display: none;
+    }
+    UpdateToast.-available #toast-close {
+        display: block;
     }
     """
 
@@ -156,20 +169,18 @@ class UpdateToast(Container):
         self._set_state("hidden")
 
     # ---- 内部 ----
+    # 注意：下面这个刷新方法不能叫 `_render`——见文件顶部踩坑记录，会和 Textual
+    # Widget 基类的同名内部方法冲突导致崩溃。
 
     def _set_state(self, state: str) -> None:
         self._state = state
         if not self.is_mounted:
             return
-        self._render()
+        self._sync_display()
 
-    def on_mount(self) -> None:
-        self._render()
-
-    def _render(self) -> None:
+    def _sync_display(self) -> None:
         self.set_class(self._state != "hidden", "-visible")
-        close = self.query_one("#toast-close", _ToastClose)
-        close.display = self._state == "available"
+        self.set_class(self._state == "available", "-available")
         body = self.query_one("#toast-body", _ToastBody)
         body.remove_class("-failed", "-done")
         if self._state == "available":
@@ -192,7 +203,7 @@ class UpdateToast(Container):
     def _tick_spin(self) -> None:
         self._spin_index += 1
         if self._state == "updating":
-            self._render()
+            self._sync_display()
 
     def _stop_spin(self) -> None:
         if self._spin_timer is not None:

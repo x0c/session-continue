@@ -20,12 +20,13 @@ from textual.worker import get_current_worker
 
 import dataclasses
 
-from pickup import i18n
+from pickup import i18n, updater
 from pickup.i18n import t
 from pickup.ui.embed_pane import EmbedPane
 from pickup.ui.modals import ConfirmModal, choose_target_runtime, new_session_flow
 from pickup.ui.nav import NavState
 from pickup.ui.session_list import SessionListView
+from pickup.ui.update_toast import UpdateToast
 
 try:
     from textual.screen import Screen
@@ -104,6 +105,8 @@ class MainScreen(Screen):
         self.nav = NavState(source=source)
         self._host_busy = False
         self._preview_gen = 0
+        self._update_channel: str | None = None
+        self._update_latest: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -112,6 +115,13 @@ class MainScreen(Screen):
                 yield SessionListView(self.store, self.nav, id="session-list")
             if self.embed_ok:
                 yield EmbedPane(id="embed-pane", on_focus_list=self._focus_list, osc_report=self.osc_report)
+        yield UpdateToast(
+            on_update=self._on_update_toast_update,
+            on_restart=self._on_update_toast_restart,
+            on_retry=self._on_update_toast_retry,
+            on_dismiss=self._on_update_toast_dismiss,
+            id="update-toast",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -128,6 +138,7 @@ class MainScreen(Screen):
         else:
             self._await_initial_load()
         self.set_interval(CACHE_POLL_INTERVAL, self._poll_cache)
+        self._check_for_update()
         if self.direct is not None:
             # 直启子命令：焦点最终要落在内嵌面板上（用户就是来操作新会话的）。
             # 不要先调 SessionListView.focus()——它走 call_later，会在托管完成后
@@ -728,6 +739,59 @@ class MainScreen(Screen):
             self.app.bell()
             return
         self.notify(t("notify.screenshot", path=path), title="pickup", timeout=4)
+
+    # ---- 客户端自动更新：右下角浮层 ----
+    # 每次打开 pickup 都后台查一次最新版本；源码/开发安装（无法一键升级）时
+    # 直接跳过，不弹窗打扰。检查/升级全程跑在 worker 线程，任何异常都不能
+    # 拖垮 UI 或阻塞首屏——updater 模块本身已把网络/子进程异常全部吞掉。
+
+    @work(thread=True, group="update-check")
+    def _check_for_update(self) -> None:
+        channel = updater.detect_channel()
+        if not updater.is_updatable(channel):
+            return
+        latest = updater.fetch_latest()
+        if latest is None or not updater.should_prompt(latest):
+            return
+        self._update_channel = channel
+        self._update_latest = latest
+        worker = get_current_worker()
+        if not worker.is_cancelled:
+            self.app.call_from_thread(lambda: self.query_one(UpdateToast).show_available(latest))
+
+    def _on_update_toast_update(self) -> None:
+        toast = self.query_one(UpdateToast)
+        toast.show_updating()
+        self._run_update_worker()
+
+    @work(thread=True, group="update-apply")
+    def _run_update_worker(self) -> None:
+        from pickup import observe
+
+        latest = self._update_latest
+        ok, output = updater.run_update(latest, self._update_channel)
+        observe.event("self_update", ok=ok, latest=latest, channel=self._update_channel)
+        if not ok:
+            observe.debug("self_update_output", output=output)
+        worker = get_current_worker()
+        if worker.is_cancelled:
+            return
+        toast = self.query_one(UpdateToast)
+        if ok:
+            self.app.call_from_thread(lambda: toast.show_done(latest))
+        else:
+            self.app.call_from_thread(toast.show_failed)
+
+    def _on_update_toast_restart(self) -> None:
+        # 交给 cli.main()：用新装好的磁盘代码 re-exec 一个全新 pickup 进程。
+        self.app.exit(result=updater.RestartRequest())
+
+    def _on_update_toast_retry(self) -> None:
+        self._on_update_toast_update()
+
+    def _on_update_toast_dismiss(self, version: str) -> None:
+        updater.mark_dismissed(version)
+        self.query_one(UpdateToast).hide()
 
     def action_quit_app(self) -> None:
         # 搜索框聚焦时 Esc 先清空查询，再交回列表；列表上 Esc 才真正退出

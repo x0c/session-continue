@@ -35,11 +35,12 @@
 | 标题补全 | cli/src/pickup/titles.py · cli/src/pickup/titlegen.py |
 | Agent 只读查询 | cli/src/pickup/agent_api.py |
 | 开源发布与一键安装 | cli/install.sh · cli/.github/workflows/ |
+| 客户端自动更新 | cli/src/pickup/updater.py · cli/src/pickup/ui/update_toast.py |
 | 隐私与本地数据边界 | cli/PRIVACY.md |
 
 ## 待补充知识库（doc-init backlog）
 
-（当前无待补充项；会话保活、标题补全、Agent 只读查询、直启、开源发布仍以组件内维护指南 / SKILL 为主，需要独立知识库时再登记。）
+（当前无待补充项；会话保活、标题补全、Agent 只读查询、直启、开源发布、客户端自动更新仍以组件内维护指南 / SKILL 为主，需要独立知识库时再登记。）
 
 <!-- managed:inherited-agents:end -->
 
@@ -56,7 +57,7 @@
 - `docs/CROSS_RUNTIME_HANDOFF_KNOWLEDGE_BASE.md`：跨助手接力、高级操作、原生恢复、空白新建、启动计划与接力提示词
 - `docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md`：新增一种 AI 助手、补扫描/预览/恢复/接力/空白新建与注册验收
 - `docs/OBSERVABILITY_KNOWLEDGE_BASE.md`：事件日志、诊断、F12 截图观测、界面异常排查
-- `docs/MAINTAINER_GUIDE.md`：标题生成、会话保活、直启、Agent 只读接口、开源发布及上述领域的维护级细节与历史踩坑
+- `docs/MAINTAINER_GUIDE.md`：标题生成、会话保活、直启、Agent 只读接口、开源发布、客户端自动更新及上述领域的维护级细节与历史踩坑
 - `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义（含 `diagnose`）；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里
 - `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界
 - `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求
@@ -162,8 +163,9 @@ python3 -c "import pickup; print(pickup.__version__, pickup.__file__); print(pic
 | 标题补全 | src/pickup/titles.py · src/pickup/titlegen.py |
 | Agent 只读查询 | src/pickup/agent_api.py |
 | 开源发布与一键安装 | install.sh · .github/workflows/ |
+| 客户端自动更新 | src/pickup/updater.py · src/pickup/ui/update_toast.py |
 | 隐私与本地数据边界 | PRIVACY.md |
 
 ## 待补充知识库（doc-init backlog）
 
-（当前无待补充项；会话保活、标题补全、Agent 只读查询、直启、开源发布仍以维护指南 / SKILL 为主，需要独立知识库时再登记。）
+（当前无待补充项；会话保活、标题补全、Agent 只读查询、直启、开源发布、客户端自动更新仍以维护指南 / SKILL 为主，需要独立知识库时再登记。）

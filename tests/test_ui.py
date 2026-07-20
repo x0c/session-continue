@@ -859,6 +859,68 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(cards), 4)
             self.assertIn("claude:s99", [pickup.session_key(c.session) for c in cards])
 
+    async def test_rebuild_keeps_focus_on_same_session_when_new_session_appears(self) -> None:
+        """回归测试：真实反馈——聚焦第三条会话时后台刷出一条新会话，高亮和
+        右栏会跟着「串位」跳到相邻的第二条。根因是 `rebuild()` 曾用
+        `selected_session()`（按刚重算过的 `visible_sessions()` 索引 DOM 下标）
+        推导原选中键；新会话按 mtime 置顶插入后同一下标已指向别的会话。
+        `_displayed_selected_key()` 改按已渲染的 DOM 卡片取键，必须确保新会话
+        置顶插入后，原选中会话仍被选中（只是位置下移），不能串到相邻会话。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            list_view.index = 2  # 选中 s1（第二条，位置 1）
+            await pilot.pause()
+            target_key = pickup.session_key(list_view.selected_session())
+            self.assertEqual(target_key, "claude:s1")
+
+            new_session = {
+                "source": "claude", "id": "s_new", "short_id": "s_new",
+                "mtime": time.time() + 1000, "size_bytes": 1, "size_kb": 1,
+                "native_title": None, "fallback_title": "新会话",
+                "cwd": "/tmp", "live": False,
+            }
+            store.sessions["claude"].append(new_session)
+
+            await list_view.rebuild()
+
+            self.assertEqual(
+                pickup.session_key(list_view.selected_session()), target_key,
+                "新会话置顶插入后，原选中会话应仍被选中（只是位置下移），"
+                "不能串到相邻会话",
+            )
+
+    async def test_rebuild_keeps_embed_pane_following_same_session_when_new_session_appears(
+        self,
+    ) -> None:
+        """同一 bug 的右栏视角：右栏详情预览必须跟着原选中会话一起下移，
+        不能因为高亮串位而展示成相邻会话的内容。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            pane = app.screen.query_one(EmbedPane)
+            list_view.index = 2  # 选中 s1
+            await pilot.pause(delay=0.2)
+            await _wait_until(lambda: "会话1" in pane.render().plain)
+
+            new_session = {
+                "source": "claude", "id": "s_new", "short_id": "s_new",
+                "mtime": time.time() + 1000, "size_bytes": 1, "size_kb": 1,
+                "native_title": None, "fallback_title": "新会话",
+                "cwd": "/tmp", "live": False,
+            }
+            store.sessions["claude"].append(new_session)
+
+            await list_view.rebuild()
+            await pilot.pause(delay=0.2)
+
+            await _wait_until(lambda: "会话1" in pane.render().plain)
+            self.assertNotIn("会话0", pane.render().plain)
+
     async def test_tick_spinner_skips_snapshot_when_nothing_generating(self) -> None:
         """`_tick_spinner` 每 150ms 触发一次；没有会话在生成标题时必须直接
         跳过，连 `store.snapshot()`（拿锁+拷贝 dict/set）都不该调用。"""

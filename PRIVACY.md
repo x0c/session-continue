@@ -20,12 +20,23 @@ The tool reads these files to build a recent-session list, extract a compact pre
 
 - Generated title cache under `~/.cache/pickup/titles.json`.
 - A lock file under `~/.cache/pickup/titles.lock` while title generation is running.
+- Update-check state under `~/.cache/pickup/update.json` (which version you last dismissed, and on
+  which day) — only written when you click "dismiss" on the update notification or run `pickup update`.
 
 It does not write to Claude Code, Codex CLI, OpenCode, or Kimi Code CLI history.
 
 ## Network And Account Usage
 
 The core scanner, TUI, preview screen, and JSON output do not make network requests by themselves.
+
+**Client auto-update.** Each time the TUI starts, it makes one HTTPS request to the public GitHub API
+(`https://api.github.com/repos/x0c/pickup/releases/latest`) to check the latest published version
+number. No session content, file paths, or any other local data is sent — only that one request to
+that one endpoint. If your install can't be auto-upgraded (a source/dev checkout), this check is
+skipped entirely and nothing is requested. If a newer version is found, a small notice appears in the
+bottom-right corner; clicking it runs the same install command your install channel already uses
+(`brew upgrade pickup` or `pip install --upgrade`), then offers to restart `pickup`. You can also
+trigger this manually any time with `pickup update`, or dismiss the notice for the day.
 
 Optional title generation launches one of your locally installed agent CLIs (`claude` or `codex`; auto-detected, or pinned via `PICKUP_TITLE_GENERATOR`, legacy name `SC_TITLE_GENERATOR`). That command sends short session excerpts to the corresponding model provider under your own account and credentials. If the command is missing or fails, the tool keeps using local fallback titles.
 

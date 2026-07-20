@@ -146,5 +146,65 @@ class DismissStateTests(unittest.TestCase):
             self.assertTrue(updater.should_prompt("0.22.0"))
 
 
+class CliUpdateTests(unittest.TestCase):
+    """`pickup update` 终端子命令：三条主路径（dev 无法自动升级 / 已是最新 /
+    有新版本并成功升级），全部走 stdout 断言，不发真实网络请求。"""
+
+    def _capture(self, **patches) -> tuple[int, str]:
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with mock.patch.multiple(updater, **patches), redirect_stdout(buf):
+            code = updater.cli_update()
+        return code, buf.getvalue()
+
+    def test_dev_channel_prints_manual_hint_and_exits_nonzero(self) -> None:
+        code, out = self._capture(detect_channel=lambda: "dev")
+        self.assertEqual(code, 1)
+        self.assertIn("x0c/pickup", out)
+
+    def test_network_failure_prints_check_failed_and_exits_nonzero(self) -> None:
+        code, out = self._capture(
+            detect_channel=lambda: "pip",
+            is_updatable=lambda channel=None: True,
+            fetch_latest=lambda timeout=3.0: None,
+        )
+        self.assertEqual(code, 1)
+
+    def test_already_latest_prints_message_and_exits_zero(self) -> None:
+        code, out = self._capture(
+            detect_channel=lambda: "pip",
+            is_updatable=lambda channel=None: True,
+            fetch_latest=lambda timeout=3.0: "0.1.0",
+            current_version=lambda: (9, 9, 9),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("9.9.9", out)
+
+    def test_newer_version_runs_update_and_reports_success(self) -> None:
+        code, out = self._capture(
+            detect_channel=lambda: "pip",
+            is_updatable=lambda channel=None: True,
+            fetch_latest=lambda timeout=3.0: "9.9.9",
+            current_version=lambda: (0, 1, 0),
+            run_update=lambda latest, channel=None: (True, "install ok"),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("9.9.9", out)
+        self.assertIn("install ok", out)
+
+    def test_newer_version_update_failure_exits_nonzero(self) -> None:
+        code, out = self._capture(
+            detect_channel=lambda: "pip",
+            is_updatable=lambda channel=None: True,
+            fetch_latest=lambda timeout=3.0: "9.9.9",
+            current_version=lambda: (0, 1, 0),
+            run_update=lambda latest, channel=None: (False, "boom"),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("boom", out)
+
+
 if __name__ == "__main__":
     unittest.main()
