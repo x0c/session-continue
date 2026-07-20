@@ -1508,18 +1508,74 @@ class EmbedPaneWheelTests(unittest.TestCase):
         self.assertEqual(pane.history_offset, 7)
 
 
-class EmbedPaneSelectionCjkSpanTests(unittest.IsolatedAsyncioTestCase):
-    """拖选含中文时高亮范围缩水、且选区边界会把宽字符整个吃掉（渲染成空格）。
-    2026-07-20 真机反馈"从第一个字拖到最后一个字，只高亮了两个半、还有个字消失了"。
+class EmbedPaneSelectionSpanTests(unittest.IsolatedAsyncioTestCase):
+    """拖选高亮范围回归：全面覆盖纯英文 / 纯中文 / 中英混排 / 全角+半角 /
+    多样式段 / 多行（end==-1），穷举每一个字符区间，断言两件事——
+    ① 输出文本不丢字（选区边界落在宽字符中间时不能把该字符吃成空格）；
+    ② 被高亮的字符正好等于选中的字符（高亮宽度不缩水、不错位）。
 
-    根因（headless 复现确认）：Textual 的选区坐标系是"字符索引"（`get_span`
-    返回字符下标），但 `_apply_selection` 直接把它交给按"cell 列"裁切的
-    `Strip.crop`。CJK 一个字占 2 列，两套坐标不等——高亮宽度按字符数缩水，且
-    裁切边界落在宽字符中间时该字符被 crop 丢弃、渲染成空格。修复：裁切前先把
-    字符索引换算成 cell 列。（曾错误地改 offset 元数据为 cell 基址，那对单段行是
-    no-op、对多段行还会破坏一致性，已回退成 Textual 自带的 apply_offsets。）"""
+    背景（2026-07-20 一连串真机反馈 + 我自己 headless 复现）：Textual 的选区
+    坐标系是"字符索引"（`get_span` 返回字符下标），但 `_apply_selection` 早期直接
+    把它交给按"cell 列"裁切的 `Strip.crop`。CJK/全角一个字占 2 列，两套坐标不等，
+    导致高亮缩水/错位、宽字符被吃成空格。修复：裁切前用 `cell_len(text[:idx])`
+    把字符索引换算成 cell 列。此前只针对纯中文写过一个窄测试就发版，漏了英文/
+    混排——这个类就是补齐"充分的测试用例设计"。"""
 
-    async def test_cjk_selection_keeps_all_chars_and_exact_span(self):
+    def _spans_ok(self, pane, strip, text):
+        """穷举 [s,e) 字符区间，逐个断言不丢字、高亮精确。strip 已带 offset 元数据。"""
+        from unittest.mock import PropertyMock
+        from textual.selection import Selection
+        from textual.geometry import Offset
+
+        n = len(text)
+        for s in range(n + 1):
+            for e in range(s, n + 1):
+                sel = Selection(Offset(s, 0), Offset(e, 0))
+                with mock.patch.object(
+                    EmbedPane, "text_selection",
+                    new_callable=PropertyMock, return_value=sel,
+                ):
+                    out = pane._apply_selection(strip, 0)
+                self.assertEqual(out.text, strip.text, f"{text!r} 选区[{s}:{e}] 丢字了")
+                highlighted = "".join(
+                    seg.text for seg in out if seg.style and seg.style.bgcolor
+                )
+                self.assertEqual(highlighted, text[s:e], f"{text!r} 选区[{s}:{e}] 高亮错位")
+
+    async def test_selection_spans_across_scripts(self):
+        from rich.segment import Segment
+        from rich.style import Style
+        from textual.strip import Strip
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(120, 30)) as pilot:
+            pane = EmbedPane()
+            await app.screen.mount(pane)
+            await pilot.pause()
+
+            cases = [
+                "hello world",          # 纯英文（半角）
+                "另外提醒一件事",         # 纯中文（全角）
+                "标点bug hello",         # 中前英后
+                "hi 你好 bye",           # 英-中-英
+                "ａｂｃabc你好x",         # 全角字母 + 半角字母 + 中文 + 半角
+            ]
+            for text in cases:
+                # 单段
+                single = Strip([Segment(text, Style(color="#e0e0e0"))]).apply_offsets(0, 0)
+                self._spans_ok(pane, single, text)
+                # 多段（每 3 个字符换一种颜色，模拟真实语法高亮）
+                segs, i, palette = [], 0, ["#ff0000", "#00ff00", "#0088ff"]
+                while i < len(text):
+                    segs.append(Segment(text[i:i + 3], Style(color=palette[(i // 3) % 3])))
+                    i += 3
+                multi = Strip(segs).apply_offsets(0, 0)
+                self._spans_ok(pane, multi, text)
+
+    async def test_selection_to_end_of_line_uses_full_width(self):
+        """多行选区里，非末行的 get_span 返回 (start, -1)（一直选到行尾）；
+        end==-1 必须换算成整行 cell 宽度，且中英文都不能丢字。"""
         from unittest.mock import PropertyMock
         from rich.segment import Segment
         from rich.style import Style
@@ -1533,23 +1589,63 @@ class EmbedPaneSelectionCjkSpanTests(unittest.IsolatedAsyncioTestCase):
             pane = EmbedPane()
             await app.screen.mount(pane)
             await pilot.pause()
+            for text in ["hello world", "另外a提b醒", "ｍｉｘ 混排 end"]:
+                strip = Strip([Segment(text, Style(color="#e0e0e0"))]).apply_offsets(0, 0)
+                for start in range(len(text) + 1):
+                    sel = Selection(Offset(start, 0), None)  # None end -> get_span 给 (start,-1)
+                    with mock.patch.object(
+                        EmbedPane, "text_selection",
+                        new_callable=PropertyMock, return_value=sel,
+                    ):
+                        out = pane._apply_selection(strip, 0)
+                    self.assertEqual(out.text, strip.text, f"{text!r} 选到行尾[{start}:] 丢字了")
+                    highlighted = "".join(
+                        seg.text for seg in out if seg.style and seg.style.bgcolor
+                    )
+                    self.assertEqual(highlighted, text[start:], f"{text!r} 选到行尾[{start}:] 高亮错")
 
-            text = "另外提醒一件事"  # 7 个中文字 = 14 cells
-            for start, end in [(0, 7), (0, 3), (2, 5)]:
-                base = Strip([Segment(text, Style(color="#e0e0e0"))])
-                sel = Selection(Offset(start, 0), Offset(end, 0))
-                with mock.patch.object(
-                    EmbedPane, "text_selection",
-                    new_callable=PropertyMock, return_value=sel,
-                ):
-                    out = pane._apply_selection(base, 0)
-                # 关键一：输出文本不能丢字（宽字符不能被 crop 吃掉变空格）
-                self.assertEqual(out.text, text, f"选区[{start}:{end}]把字符吃掉了")
-                # 关键二：被高亮（套上选区背景）的正好是选中的那几个字符
-                highlighted = "".join(
-                    seg.text for seg in out if seg.style and seg.style.bgcolor
-                )
-                self.assertEqual(highlighted, text[start:end])
+    async def test_selection_through_real_parse_pipeline(self):
+        """走真实解析管线（parse_screen -> _row_to_strip -> adjust_cell_length ->
+        apply_offsets），端到端验证 render_line 的选区渲染，覆盖英文与混排。"""
+        from unittest.mock import PropertyMock
+        from textual.selection import Selection
+        from textual.geometry import Offset
+        from textual.geometry import Size
+        from rich.cells import cell_len
+        from pickup import embed
+        from pickup.ui.embed_pane import _row_to_strip
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        WIDTH = 40
+        async with app.run_test(size=(80, 24)) as pilot:
+            pane = EmbedPane()
+            await app.screen.mount(pane)
+            await pilot.pause()
+            pane.session_name = "pickup-claude-x"
+            pane.dead = False
+            for line in ["the quick brown fox", "标点bug hello", "ｈｅｌｌｏ ab 你好"]:
+                grid = embed.parse_screen(line, width=WIDTH, height=1)
+                pane._grid = grid
+                pane._strips = [_row_to_strip(grid[0])]
+                n = len(line)
+                for s in range(n + 1):
+                    for e in range(s, n + 1):
+                        sel = Selection(Offset(s, 0), Offset(e, 0))
+                        with mock.patch.object(
+                            EmbedPane, "text_selection",
+                            new_callable=PropertyMock, return_value=sel,
+                        ), mock.patch.object(
+                            type(pane), "size",
+                            new_callable=PropertyMock, return_value=Size(WIDTH, 24),
+                        ):
+                            out = pane.render_line(0)
+                        # render_line 会把行补齐到面板宽度，取前 n 个可见字符比对
+                        self.assertTrue(out.text.startswith(line), f"{line!r}[{s}:{e}] 可见文本被破坏")
+                        highlighted = "".join(
+                            seg.text for seg in out if seg.style and seg.style.bgcolor
+                        )
+                        self.assertEqual(highlighted, line[s:e], f"{line!r} 选区[{s}:{e}] 高亮错位")
 
 
 class EmbedPaneSelectionStyleTests(unittest.IsolatedAsyncioTestCase):
