@@ -1508,32 +1508,48 @@ class EmbedPaneWheelTests(unittest.TestCase):
         self.assertEqual(pane.history_offset, 7)
 
 
-class EmbedPaneSelectionOffsetTests(unittest.TestCase):
-    """拖选高亮列坐标回归：2026-07-20 真机反馈"划词高亮跟实际选中位置有偏差，
-    且偏差有时准有时不准"——根因是 Textual 自带的 Strip.apply_offsets 按字符数
-    （而不是 cell 宽度）累加 x 坐标，CJK 等宽字符占两格却只算一个字符，行内
-    宽字符越多、偏移越大，纯 ASCII 行则不受影响（正好对应"有时准有时不准"）。
-    pickup 改用本地的 _apply_cell_aware_offsets 绕过这个上游限制。"""
+class EmbedPaneSelectionCjkSpanTests(unittest.IsolatedAsyncioTestCase):
+    """拖选含中文时高亮范围缩水、且选区边界会把宽字符整个吃掉（渲染成空格）。
+    2026-07-20 真机反馈"从第一个字拖到最后一个字，只高亮了两个半、还有个字消失了"。
 
-    def test_offsets_advance_by_cell_width_not_character_count(self):
+    根因（headless 复现确认）：Textual 的选区坐标系是"字符索引"（`get_span`
+    返回字符下标），但 `_apply_selection` 直接把它交给按"cell 列"裁切的
+    `Strip.crop`。CJK 一个字占 2 列，两套坐标不等——高亮宽度按字符数缩水，且
+    裁切边界落在宽字符中间时该字符被 crop 丢弃、渲染成空格。修复：裁切前先把
+    字符索引换算成 cell 列。（曾错误地改 offset 元数据为 cell 基址，那对单段行是
+    no-op、对多段行还会破坏一致性，已回退成 Textual 自带的 apply_offsets。）"""
+
+    async def test_cjk_selection_keeps_all_chars_and_exact_span(self):
+        from unittest.mock import PropertyMock
         from rich.segment import Segment
+        from rich.style import Style
         from textual.strip import Strip
+        from textual.selection import Selection
+        from textual.geometry import Offset
 
-        from pickup.ui.embed_pane import _apply_cell_aware_offsets
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(120, 30)) as pilot:
+            pane = EmbedPane()
+            await app.screen.mount(pane)
+            await pilot.pause()
 
-        # 10 个中文字符（每个占 2 格，共 20 格）+ 紧跟一段 ASCII。
-        cjk = "已经修复并部署上线了"
-        strip = Strip([Segment(cjk), Segment("ok")])
-
-        offset_strip = _apply_cell_aware_offsets(strip, 3)
-        segments = list(offset_strip)
-
-        first_offset = segments[0].style.meta["offset"]
-        second_offset = segments[1].style.meta["offset"]
-        self.assertEqual(first_offset, (0, 3))
-        # 第二段起始列必须是 20（cell 宽度），不是 10（字符数）——这正是
-        # 之前偏移会随行内 CJK 字符数量累积漂移的根因。
-        self.assertEqual(second_offset, (20, 3))
+            text = "另外提醒一件事"  # 7 个中文字 = 14 cells
+            for start, end in [(0, 7), (0, 3), (2, 5)]:
+                base = Strip([Segment(text, Style(color="#e0e0e0"))])
+                sel = Selection(Offset(start, 0), Offset(end, 0))
+                with mock.patch.object(
+                    EmbedPane, "text_selection",
+                    new_callable=PropertyMock, return_value=sel,
+                ):
+                    out = pane._apply_selection(base, 0)
+                # 关键一：输出文本不能丢字（宽字符不能被 crop 吃掉变空格）
+                self.assertEqual(out.text, text, f"选区[{start}:{end}]把字符吃掉了")
+                # 关键二：被高亮（套上选区背景）的正好是选中的那几个字符
+                highlighted = "".join(
+                    seg.text for seg in out if seg.style and seg.style.bgcolor
+                )
+                self.assertEqual(highlighted, text[start:end])
 
 
 class EmbedPaneSelectionStyleTests(unittest.IsolatedAsyncioTestCase):

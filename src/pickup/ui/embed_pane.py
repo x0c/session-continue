@@ -75,29 +75,6 @@ def _row_to_strip(row: list) -> Strip:
     return Strip([Segment(text[start:end], style) for start, end, style in spans])
 
 
-def _apply_cell_aware_offsets(strip: Strip, y: int) -> Strip:
-    """等价于 `Strip.apply_offsets(0, y)`，但按 cell 宽度（而不是字符数）推进
-    x 坐标去标注每个 Segment 的起始列。
-
-    Textual 自带的 `apply_offsets` 用 `x += len(segment.text)` 累加偏移量——
-    对纯 ASCII 没问题，但 CJK/emoji 等占两格的宽字符只算一个字符，会少算
-    一半。托管画面里一行经常混排中英文，行内每多一个宽字符，后面所有
-    Segment 标注的列坐标就多偏移 1，鼠标拖选映射回文本位置时逐字符累积
-    偏差——这正好解释了真机反馈"划词高亮跟实际选中位置有偏差，且时准时不
-    准"：纯 ASCII 行、或选区落在行首第一个 Segment 内时不受影响，偏差量随
-    选区前面出现的宽字符数量变化。这是 Rich/Textual 上游 `Strip.apply_offsets`
-    的通用限制（用 Rich `Text` 走默认渲染路径的 Textual 部件不会触发，因为
-    它们走的是另一条 `Visual.to_strips` 编译路径），这里在托管面板自己的
-    渲染入口本地绕过，不改 Textual 本身。
-    """
-    segments = []
-    x = 0
-    for text, style, _ in strip:
-        offset_style = Style.from_meta({"offset": (x, y)})
-        segments.append(Segment(text, style + offset_style if style else offset_style))
-        x += cell_len(text)
-    return Strip(segments, strip.cell_length)
-
 # 滚轮一格滚动的行数，与旧版 PREVIEW_MOUSE_SCROLL_LINES 保持一致的手感
 WHEEL_SCROLL_LINES = 3
 # 有控制通道（事件驱动）时的慢速兜底轮询间隔；没有控制通道时的传统轮询间隔
@@ -479,11 +456,11 @@ class EmbedPane(Widget):
         if strip.cell_length != width:
             strip = strip.adjust_cell_length(width)
         # 自定义 Line API 不会像 Textual 默认 Rich 渲染路径那样自动附加文本
-        # 坐标；缺少 offset 元数据时，拖选只能把整个 Widget 识别为全选。改用
-        # 按 cell 宽度推进的 _apply_cell_aware_offsets（而不是 Textual 自带的
-        # Strip.apply_offsets），修复行内含 CJK/emoji 时拖选高亮错位，见该
-        # 函数 docstring。
-        strip = _apply_cell_aware_offsets(strip, y)
+        # 坐标；缺少 offset 元数据时，拖选只能把整个 Widget 识别为全选。用
+        # Textual 自带的 apply_offsets（按字符数推进）——Textual 的选区坐标系
+        # 本身就是"字符索引"（见 _apply_selection 说明），offset 元数据必须和
+        # 它保持同一套坐标，不能自作主张换成 cell 列。
+        strip = strip.apply_offsets(0, y)
         return self._apply_selection(strip, y)
 
     def _apply_selection(self, strip: Strip, y: int) -> Strip:
@@ -500,18 +477,27 @@ class EmbedPane(Widget):
         if span is None:
             return strip
         start, end = span
+        # get_span 返回的是"字符索引"：Textual 的选区坐标系里，段基址是累计字符数、
+        # 段内也按字符累加（见 compositor.get_widget_and_offset_at 用
+        # get_character_cell_size 逐字符推进拿到的仍是字符下标）。但 Strip.crop 按
+        # "cell 列"裁切，CJK/emoji 宽字符一个字占 2 列、两套坐标不相等。直接把字符
+        # 索引当 cell 列裁切会有两个后果（2026-07-20 headless 复现）：① 高亮宽度按
+        # 字符数缩水，中文选区只框住一半；② 裁切边界落在宽字符中间时，该宽字符被
+        # crop 整个丢弃、渲染成空格（真机反馈"提字消失了"）。这里先把字符索引换算成
+        # cell 列再裁切。
+        text = strip.text
         cell_length = strip.cell_length
-        if end == -1:
-            end = cell_length
-        start = max(0, min(start, cell_length))
-        end = max(start, min(end, cell_length))
-        if start == end:
+        cell_start = cell_len(text[:start]) if start > 0 else 0
+        cell_end = cell_length if end == -1 else cell_len(text[:end])
+        cell_start = max(0, min(cell_start, cell_length))
+        cell_end = max(cell_start, min(cell_end, cell_length))
+        if cell_start == cell_end:
             return strip
         selection_style = self._selection_style()
         return Strip.join((
-            strip.crop(0, start),
-            strip.crop(start, end).apply_style(selection_style),
-            strip.crop(end),
+            strip.crop(0, cell_start),
+            strip.crop(cell_start, cell_end).apply_style(selection_style),
+            strip.crop(cell_end),
         ))
 
     def _selection_style(self) -> Style:
