@@ -29,7 +29,7 @@ class _RuntimeChip(Widget):
         content-align: center middle;
     }
     _RuntimeChip:hover {
-        background: $primary-darken-2;
+        background: $boost;
     }
     """
 
@@ -66,7 +66,8 @@ class RuntimeTopBar(Horizontal):
         height: 1;
         width: 1fr;
         padding: 0 1;
-        background: $surface-darken-1;
+        align: right middle;
+        background: $footer-background;
     }
     """
 

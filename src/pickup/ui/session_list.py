@@ -146,7 +146,8 @@ class SessionCard(Widget):
             out.stylize("dim", project_end, content_len)
         out.append(runtime_cell, style=pickup.runtime_label_style(runtime_id))
         out.append("\n")
-        out.append(status_cell, style="green" if is_running else "dim")
+        # 运行中状态用略降饱和的绿，暗底上 ANSI green 过艳会发颤
+        out.append(status_cell, style="#3F9A6A" if is_running else "dim")
         out.append(time_cell, style="dim")
         # 第三行空行：视觉分隔，同时算进本卡命中区（不要用 ListItem margin/padding）
         out.append("\n")

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from textual.app import App, ScreenError
+from textual.theme import Theme
 from textual.timer import Timer
 
 from pickup.ui.main_screen import MainScreen
@@ -16,6 +17,45 @@ from pickup.ui.main_screen import MainScreen
 # 整屏全量重绘（用来清掉终端 reflow 残影）必须另行防抖，等尺寸停稳再做一次，
 # 否则拖动过程中会疯狂全量刷新、卡顿闪烁。
 _RESIZE_FULL_REPAINT_DEBOUNCE = 0.12  # 秒；最后一次尺寸变化后再等这么久才整屏重绘
+
+# 冷静工作台：壳层用深石板分层，主色只做焦点/选中提示，避免大面积高饱和蓝抢戏。
+_PICKUP_DARK = Theme(
+    name="pickup-dark",
+    primary="#3B7EB8",
+    secondary="#6B8FA3",
+    accent="#5B9FD4",
+    foreground="#C9D1D9",
+    background="#0D1117",
+    surface="#161B22",
+    panel="#1C2430",
+    warning="#D4A017",
+    error="#E5534B",
+    success="#3F9A6A",
+    dark=True,
+    variables={
+        # 选中抬一层冷灰蓝，不用高饱和 primary 铺满
+        "block-cursor-background": "#243447",
+        "block-cursor-blurred-background": "#24344766",
+    },
+)
+_PICKUP_LIGHT = Theme(
+    name="pickup-light",
+    primary="#2F6F9F",
+    secondary="#5A7A8C",
+    accent="#3D7EB8",
+    foreground="#1F2328",
+    background="#F0F3F6",
+    surface="#E6EBF0",
+    panel="#DCE3EA",
+    warning="#B8860B",
+    error="#CF222E",
+    success="#1A7F4B",
+    dark=False,
+    variables={
+        "block-cursor-background": "#C5D6E8",
+        "block-cursor-blurred-background": "#C5D6E880",
+    },
+)
 
 
 class PickupApp(App):
@@ -36,12 +76,14 @@ class PickupApp(App):
         margin: 0;
         border: none;
         padding: 0 1 1 1;
-        color: white;
-        background: $primary-darken-2;
+        /* 筛选是辅助入口：表面层，不要主色大色块抢层级 */
+        color: $text-muted;
+        background: $panel;
     }
 
     #project-search:focus {
-        background: $primary-darken-1;
+        color: $foreground;
+        background: $primary-muted;
     }
     """
 
@@ -129,10 +171,13 @@ class PickupApp(App):
         # 那一份——两者是分开的：这里管 pickup 自身列表/页头/弹窗的配色，
         # embed_pane.py 的 report_theme 管托管会话自己的深浅色检测。此前完全
         # 没接这一段，Textual 默认主题在浅色终端下会显得配色不对（真机实测发现）。
+        # 深/浅都用 pickup 自有「冷静工作台」主题，不用 Textual 默认高饱和主色。
         import pickup
+
+        self.register_theme(_PICKUP_DARK)
+        self.register_theme(_PICKUP_LIGHT)
         is_light = pickup._background_is_light(self._osc_report)
-        if is_light is not None:
-            self.theme = "textual-light" if is_light else "textual-dark"
+        self.theme = "pickup-light" if is_light is True else "pickup-dark"
         self.push_screen(MainScreen(self._store, self._embed_ok, self._direct, self._osc_report))
 
 

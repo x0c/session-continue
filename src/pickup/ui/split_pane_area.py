@@ -59,13 +59,25 @@ class _PaneHeader(Horizontal):
     _PaneHeader {
         height: 1;
         width: 1fr;
-        background: $surface-darken-1;
+        margin: 0;
+        padding: 0;
+        color: auto 90%;
+        background: $surface;
+    }
+    _PaneHeader.-active {
+        color: auto 90%;
+        /* 活跃格用主色弱化底，避免整条高饱和蓝条抢过内嵌内容 */
+        background: $primary-muted;
+    }
+    _PaneHeader.-active _PaneClose {
+        color: auto 90%;
     }
     _PaneHeader Static.title {
         width: 1fr;
         height: 1;
         content-align: left middle;
-        padding: 0 1;
+        margin: 0;
+        padding: 0;
         text-overflow: ellipsis;
     }
     """
@@ -88,6 +100,9 @@ class _PaneHeader(Horizontal):
         self._title = title
         self.query_one(".title", Static).update(title)
 
+    def set_active(self, active: bool) -> None:
+        self.set_class(active, "-active")
+
 
 class PaneCell(Vertical):
     """单格：标题栏 + EmbedPane。"""
@@ -98,13 +113,17 @@ class PaneCell(Vertical):
     PaneCell {
         width: 1fr;
         height: 1fr;
-        border: solid $primary-darken-2;
+        border: none;
+        margin: 0 0 0 1;
+        padding: 0;
     }
-    PaneCell:focus-within {
-        border: solid $accent;
+    PaneCell:first-child {
+        margin-left: 0;
     }
     PaneCell EmbedPane {
         height: 1fr;
+        margin: 0;
+        padding: 0;
     }
     """
 
@@ -165,6 +184,15 @@ class PaneCell(Vertical):
         if pane is not None:
             pane.focus()
 
+    def _on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        self.call_after_refresh(self._sync_active_marker)
+
+    def _on_descendant_blur(self, event: events.DescendantBlur) -> None:
+        self.call_after_refresh(self._sync_active_marker)
+
+    def _sync_active_marker(self) -> None:
+        self.query_one(_PaneHeader).set_active(self.has_focus_within)
+
 
 class SplitPaneArea(Vertical):
     """右侧：顶栏 + 动态 1~3 格。"""
@@ -173,6 +201,7 @@ class SplitPaneArea(Vertical):
     SplitPaneArea {
         width: 1fr;
         height: 1fr;
+        margin: 0 0 0 1;
     }
     SplitPaneArea #pane-row {
         width: 1fr;

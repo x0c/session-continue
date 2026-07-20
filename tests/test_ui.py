@@ -32,7 +32,7 @@ from pickup.models import LaunchPlan
 from textual import events
 from textual.color import Color
 from textual.geometry import Offset, Size
-from textual.widgets import Input, ListItem
+from textual.widgets import Footer, Input, ListItem
 from pickup.ui.app import PickupApp
 from pickup.ui.embed_pane import EmbedPane
 from pickup.ui.split_pane_area import SplitPaneArea
@@ -158,21 +158,53 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
         app = PickupApp(store, embed_ok=False, osc_report=b"\x1b]11;rgb:ffff/ffff/ffff\x07")
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.2)
-            self.assertEqual(app.theme, "textual-light")
+            self.assertEqual(app.theme, "pickup-light")
 
     async def test_dark_background_uses_dark_theme(self) -> None:
         store, _ = _make_store()
         app = PickupApp(store, embed_ok=False, osc_report=b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07")
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.2)
-            self.assertEqual(app.theme, "textual-dark")
+            self.assertEqual(app.theme, "pickup-dark")
 
     async def test_missing_report_falls_back_to_default_dark(self) -> None:
         store, _ = _make_store()
         app = PickupApp(store, embed_ok=False, osc_report=None)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause(delay=0.2)
-            self.assertEqual(app.theme, "textual-dark")
+            self.assertEqual(app.theme, "pickup-dark")
+
+    async def test_runtime_top_bar_matches_footer_and_aligns_right(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            top_bar = app.screen.query_one("#runtime-top-bar")
+            footer = app.screen.query_one(Footer)
+            self.assertEqual(top_bar.styles.align_horizontal, "right")
+            self.assertEqual(top_bar.styles.background, footer.styles.background)
+
+    async def test_sidebar_and_split_panes_use_one_cell_blank_gaps(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            area = app.screen.query_one(SplitPaneArea)
+            self.assertEqual(area.styles.margin.left, 1)
+            sessions = store.all_sessions()[:2]
+            area.show_hosted_group(
+                "/tmp",
+                [(session, None, lambda: "") for session in sessions],
+            )
+            await _wait_until(lambda: len(area._cells()) == 2)  # noqa: SLF001
+            first, second = area._cells()  # noqa: SLF001
+            self.assertEqual(first.styles.margin.left, 0)
+            self.assertEqual(second.styles.margin.left, 1)
+            self.assertEqual(first.styles.border_left[0], "")
+            self.assertEqual(second.styles.border_left[0], "")
+            self.assertEqual(second.styles.border_top[0], "")
+            self.assertEqual(second.styles.border_right[0], "")
+            self.assertEqual(second.styles.border_bottom[0], "")
 
     async def test_resize_full_repaint_is_debounced(self) -> None:
         """连续缩放手势只在停稳后触发一次整屏全量重绘，不能每次尺寸变化都狂刷。"""
@@ -597,9 +629,10 @@ class SessionCardVisualTests(unittest.TestCase):
 
             status_start = rendered.plain.index("\n") + 1
             status_end = status_start + len(status_text)
+            # 运行中用略降饱和的成功绿，不用 ANSI green
             green_spans = [
                 span for span in rendered.spans
-                if "green" in str(span.style)
+                if "#3f9a6a" in str(span.style).lower()
                 and span.start <= status_start
                 and span.end >= status_end
             ]
@@ -617,7 +650,9 @@ class SidebarVisualLayoutTests(unittest.IsolatedAsyncioTestCase):
             items = list(list_view.children)
             cards = list(app.screen.query(SessionCard))
 
-            self.assertEqual(search.styles.color, Color.parse("white"))
+            # 筛选条用表面层弱化文字，不再白字铺高饱和主色底
+            self.assertEqual(search.styles.background, Color.parse("#1C2430"))
+            self.assertLess(search.styles.color.a, 1.0)
             self.assertEqual(search.region.height, 2)  # 正文 1 + 末行间隔 1
             self.assertGreaterEqual(len(items), 3)
             # 分隔空行画在卡片自身内，两项 region 紧挨、无外边距空隙
@@ -1221,13 +1256,21 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             list_view = app.screen.query_one(SessionListView)
             self.assertTrue(list_view.has_focus)
             self.assertFalse(pane.has_focus)
+            cell = app.screen.query_one(SplitPaneArea)._cells()[0]  # noqa: SLF001
+            title = cell.query_one(".title")
+            header = cell.query_one(".header")
+            self.assertFalse(header.has_class("-active"))
+            self.assertFalse(title.render().plain.startswith("● "))
 
             # 点右栏后才聚焦内嵌会话；ctrl+backslash 回列表，'c' 关闭分栏
             await pilot.click(pane)
             await pilot.pause()
             self.assertTrue(pane.has_focus)
+            self.assertTrue(header.has_class("-active"))
+            self.assertFalse(title.render().plain.startswith("● "))
             await pilot.press("ctrl+backslash")
             await pilot.pause()
+            self.assertFalse(header.has_class("-active"))
             await pilot.press("c")
             await pilot.pause()
             area = app.screen.query_one(SplitPaneArea)
