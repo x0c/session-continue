@@ -455,13 +455,20 @@ class EmbedPane(Widget):
         # 宽度裁切或补空白，避免右缘残留旧画面字符（与整屏重绘防抖配合）。
         if strip.cell_length != width:
             strip = strip.adjust_cell_length(width)
-        # 自定义 Line API 不会像 Textual 默认 Rich 渲染路径那样自动附加文本
-        # 坐标；缺少 offset 元数据时，拖选只能把整个 Widget 识别为全选。用
-        # Textual 自带的 apply_offsets（按字符数推进）——Textual 的选区坐标系
-        # 本身就是"字符索引"（见 _apply_selection 说明），offset 元数据必须和
-        # 它保持同一套坐标，不能自作主张换成 cell 列。
-        strip = strip.apply_offsets(0, y)
-        return self._apply_selection(strip, y)
+        # 顺序很关键：必须**先**叠加选区高亮、**再** apply_offsets。
+        # _apply_selection 会把行 crop 成「选区前 / 选区 / 选区后」三段，而
+        # Strip.crop 拆分 Segment 时只是照抄原 Segment 的 offset 元数据、不重算
+        # ——如果先 apply_offsets 再 crop，拆出来的三段会全部带着原整段的
+        # offset（比如原本单段行 offset=(0,0)，拆完三段仍都是 (0,0)）。
+        # Textual 在拖选过程中会反复回读 render_line 来把屏幕列换算成字符位置，
+        # 读到这种被污染的 offset 就会把落点算到行首附近——真机表现为"从中间
+        # 往右拖，起点左边的文字反而被高亮"（中英文都中招）。改成先 crop、后
+        # apply_offsets：apply_offsets 按最终分段逐段累计字符数，三段拿到的
+        # offset 分别是各自真实的起始字符下标，换算就正确了。
+        # 自定义 Line API 不会像 Textual 默认 Rich 渲染路径那样自动附加坐标，
+        # 缺少 offset 元数据时拖选只能把整个 Widget 识别为全选，所以必须补上。
+        strip = self._apply_selection(strip, y)
+        return strip.apply_offsets(0, y)
 
     def _apply_selection(self, strip: Strip, y: int) -> Strip:
         """在基础 Strip 上动态叠加当前 Textual 文本选区，不污染行缓存。"""

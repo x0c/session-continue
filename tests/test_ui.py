@@ -1647,6 +1647,65 @@ class EmbedPaneSelectionSpanTests(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertEqual(highlighted, line[s:e], f"{line!r} 选区[{s}:{e}] 高亮错位")
 
+    async def test_active_selection_does_not_corrupt_offset_metadata(self):
+        """拖选进行中不能污染 offset 元数据——这是"从中间往右拖、起点左边反而
+        被高亮"的真正根因（2026-07-20 真机反馈，中英文都中招）。
+
+        Textual 在拖选过程中会反复回读 render_line 把屏幕列换算成字符位置。若
+        render_line 先 apply_offsets 再 crop 出选区三段，`Strip.crop` 拆 Segment
+        时只照抄原 offset 不重算，三段会全带原整段的 offset（单段行拆完三段都
+        是 (0,0)），换算就崩到行首——选区反向。正确顺序是先 crop 再 apply_offsets。
+
+        不变量：不论当前有没有选区，render_line 出来的每个 Segment 的 offset 起
+        始下标都必须等于它前面所有 Segment 文本的累计字符数（即与"对同一文本重新
+        apply_offsets"完全一致）。"""
+        from unittest.mock import PropertyMock
+        from rich.segment import Segment
+        from rich.style import Style
+        from textual.strip import Strip
+        from textual.selection import Selection
+        from textual.geometry import Offset, Size
+
+        def offsets_consistent(strip):
+            expect = 0
+            for seg in strip:
+                meta = seg.style.meta.get("offset") if (seg.style and seg.style._meta) else None
+                if meta is None or meta[0] != expect:
+                    return False, expect, meta
+                expect += len(seg.text)
+            return True, None, None
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(60, 8)) as pilot:
+            pane = EmbedPane()
+            await app.screen.mount(pane)
+            await pilot.pause()
+            pane.session_name = "x"
+            pane.dead = False
+            for text in ["the quick brown fox", "另外提醒一件事abc", "标点bug hello"]:
+                W = max(1, len(text))
+                pane._grid = [[object()] * len(text)]
+                pane._strips = [Strip([Segment(text, Style(color="#e0e0e0"))])]
+                n = len(text)
+                # 模拟拖选进行中：从每个可能的起点选出一小段
+                for anchor in range(n + 1):
+                    sel = Selection(Offset(anchor, 0), Offset(min(anchor + 1, n), 0))
+                    with mock.patch.object(
+                        EmbedPane, "text_selection",
+                        new_callable=PropertyMock, return_value=sel,
+                    ), mock.patch.object(
+                        type(pane), "size",
+                        new_callable=PropertyMock, return_value=Size(W, 8),
+                    ):
+                        out = pane.render_line(0)
+                    ok, expect, meta = offsets_consistent(out)
+                    self.assertTrue(
+                        ok,
+                        f"{text!r} anchor={anchor}: 选区把 offset 元数据搞乱了，"
+                        f"某段应起于字符 {expect} 实际 offset={meta}",
+                    )
+
 
 class EmbedPaneSelectionStyleTests(unittest.IsolatedAsyncioTestCase):
     """拖选高亮不能盖住文字：2026-07-20 真机反馈"高亮把选中的文字整个遮住看
