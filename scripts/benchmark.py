@@ -44,9 +44,13 @@ def main() -> None:
         result = registry.scan_all(args.limit)
         last_count = sum(len(bucket) for bucket in result.values())
 
+    started = time.perf_counter()
+    scan()
+    first_process_scan_ms = round((time.perf_counter() - started) * 1000, 3)
     output = {
         "native": available(),
-        "scan_all": _measure(scan, max(3, args.rounds // 4)),
+        "scan_first_process_ms": first_process_scan_ms,
+        "scan_warm": _measure(scan, max(3, args.rounds // 4)),
         "session_count": last_count,
         "ansi_frame_174x61": _measure(
             lambda: embed.parse_screen_rows(frame, 174, 61), args.rounds,

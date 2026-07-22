@@ -57,7 +57,13 @@ case "$SYSTEM" in
     else
       PLATFORM="manylinux_2_17"
     fi
-    WHEEL_PATTERN="^pickup-${VERSION_NUMBER}-cp310-abi3-${PLATFORM}_${ARCH}\\.whl$"
+    if [ "$PLATFORM" = "manylinux_2_17" ]; then
+      # auditwheel 同时附加新旧兼容标签，例如
+      # manylinux_2_17_x86_64.manylinux2014_x86_64。
+      WHEEL_PATTERN="^pickup-${VERSION_NUMBER}-cp310-abi3-${PLATFORM}_${ARCH}(\\.manylinux2014_${ARCH})?\\.whl$"
+    else
+      WHEEL_PATTERN="^pickup-${VERSION_NUMBER}-cp310-abi3-${PLATFORM}_${ARCH}\\.whl$"
+    fi
     ;;
   *)
     echo "错误：pickup 当前只支持 macOS 与 Linux" >&2

@@ -45,7 +45,8 @@ fn value_to_python(py: Python<'_>, value: Value) -> PyResult<PyObject> {
 
 #[pyfunction]
 fn loads(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
-    let value: Value = serde_json::from_slice(data)
+    let value: Value = py
+        .allow_threads(|| serde_json::from_slice(data))
         .map_err(|error| PyValueError::new_err(format!("JSON 解析失败：{error}")))?;
     value_to_python(py, value)
 }

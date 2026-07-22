@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的版本标签（如 v0.24.0）"
+        description: "要发布的版本标签（如 v0.24.1）"
         required: true
 
 permissions:
