@@ -308,13 +308,29 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=50, help="每个来源最多列出多少条")
     parser.add_argument("--json", action="store_true", dest="json_mode",
                         help="以 JSON 格式输出会话列表后退出，不启动 TUI")
+    parser.add_argument("--no-input", action="store_true", dest="no_input",
+                        help="禁用交互并输出 JSON 会话列表，适合脚本和 Agent 调用")
     parser.add_argument("--no-keepalive", action="store_true", dest="no_keepalive",
                         help="本次启动不把会话包进后台保活（tmux），SSH 断开会话会跟着中断")
-    parser.add_argument("--version", "-V", action="store_true", dest="show_version",
+    parser.add_argument("--no-color", action="store_true", dest="no_color",
+                        help="关闭彩色输出，也可设置 NO_COLOR 环境变量")
+    parser.add_argument("-d", "--debug", "--verbose", action="store_true", dest="debug",
+                        help="启用详细诊断日志，也可设置 PICKUP_DEBUG=1")
+    parser.add_argument("-q", "--quiet", action="store_true", dest="quiet",
+                        help="隐藏非必要的启动提示和诊断输出")
+    parser.add_argument("--version", "-V", "-v", action="store_true", dest="show_version",
                         help="显示版本、安装路径与渠道后退出")
     parser.add_argument("--generate-titles", action="store_true", dest="generate_titles",
                         help=argparse.SUPPRESS)  # 内部用途：TUI 拉起的后台标题生成进程
     args = parser.parse_args()
+
+    # 通用 CLI 开关先于任何输出和 TUI 导入生效；quiet 与 debug 同时出现时以 quiet 为准。
+    if args.no_color:
+        os.environ["NO_COLOR"] = "1"
+    if args.quiet:
+        os.environ.pop("PICKUP_DEBUG", None)
+    elif args.debug:
+        os.environ["PICKUP_DEBUG"] = "1"
 
     registry = default_registry()
 
@@ -335,7 +351,7 @@ def main() -> None:
         _run_title_daemon(registry, args.limit)
         return
 
-    if args.json_mode:
+    if args.json_mode or args.no_input:
         _output_json(registry, args.limit)
         return
 
@@ -375,7 +391,7 @@ def main() -> None:
     # 在源码树里开发却加载了 pipx/site-packages 副本时，启动前打一次 stderr 告警
     # （普通发行版用户 cwd 不在仓库内，不会触发）。
     stale = updater.stale_source_warning()
-    if stale and sys.stderr.isatty():
+    if stale and sys.stderr.isatty() and not args.quiet:
         print(f"[pickup] {stale}", file=sys.stderr)
     if os.environ.get("PICKUP_DEBUG"):
         observe.debug(

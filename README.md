@@ -93,8 +93,16 @@ pickup                  # open the interactive TUI
 pickup --limit 30       # show up to 30 sessions per runtime
 pickup --json           # print sessions as JSON and exit
 pickup --json --limit 5 # script-friendly small result set
+pickup --no-input       # force non-interactive JSON output
+pickup -v               # show version, install path, and install channel
+pickup -d               # enable detailed diagnostic logging
+pickup -q               # suppress non-essential startup messages
+pickup --no-color       # disable colors (also respects NO_COLOR)
 pickup update           # manually check for and install the latest version
 ```
+
+Common aliases are supported: `-h` / `--help`, `-v` / `-V` / `--version`,
+and `-d` / `--debug` / `--verbose`.
 
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
 
