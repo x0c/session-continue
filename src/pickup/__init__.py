@@ -6,7 +6,7 @@ from datetime import datetime as datetime  # 供测试用 pickup.datetime.fromti
 import shutil as shutil
 import sys as sys
 
-__version__ = "0.23.5"
+__version__ = "0.23.6"
 
 from pickup import embed as embed  # noqa: F401
 from pickup import keepalive as keepalive  # noqa: F401

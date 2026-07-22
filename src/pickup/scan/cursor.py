@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
 from pickup.scan.common import (
+    is_ephemeral_agent_cwd,
     live_processes,
     process_command_line,
     process_environ,
@@ -250,6 +251,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         info = _build_session_info(chat_dir, chat_id)
         if info is None:
             continue
+        if is_ephemeral_agent_cwd(info["cwd"]):
+            continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
         if info["cwd"] and not cached_isdir(info["cwd"]):
             continue
         if cwd_filter and not info["cwd"].startswith(cwd_filter):

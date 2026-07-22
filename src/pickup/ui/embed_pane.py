@@ -89,7 +89,12 @@ MIN_CAPTURE_INTERVAL = 0.04  # 事件驱动下的最小抓帧间隔，避免 %ou
 STATE_POLL_INTERVAL = 0.2
 # 窗口拖动时 Resize 会连续到达；tmux resize-window + 唤醒抓帧必须防抖，
 # 等尺寸停稳再做一次（与 PickupApp 整屏重绘防抖同量级，避免拖动期狂刷）。
-_RESIZE_TMUX_DEBOUNCE = 0.12
+_RESIZE_TMUX_DEBOUNCE = 0.2
+# resize-window 后 Cursor/Claude 等会整屏重排数秒（观感像「疯狂滚动」）。
+# 冻结上一帧画面，直到连续稳定帧或超时，再一次性跳到最新，不镜像中间态。
+_RESIZE_CAPTURE_HOLD_MIN = 0.35
+_RESIZE_CAPTURE_HOLD_MAX = 3.0
+_RESIZE_CAPTURE_STABLE_FRAMES = 2
 
 
 class EmbedPane(Widget):
@@ -171,6 +176,12 @@ class EmbedPane(Widget):
         self._real_cursor_shown = False  # 外层真实硬件光标当前是否被我们显式打开（见 _set_real_cursor）
         self._resize_tmux_timer = None  # 防抖：拖动停稳后再 resize-window + 抓帧
         self._pending_tmux_size: tuple[int, int] | None = None
+        # resize 后抓帧冻结：主线程开启；抓帧线程判定稳定后解除并放行一帧。
+        self._resize_hold_active = False
+        self._resize_hold_until_min = 0.0
+        self._resize_hold_deadline = 0.0
+        self._resize_hold_last_text: str | None = None
+        self._resize_hold_stable = 0
 
     # ---- 生命周期 ----
 
@@ -211,6 +222,7 @@ class EmbedPane(Widget):
             self._grid = None
             self._strips = None
             self._cursor = None
+            self._clear_resize_capture_hold()
         self.session_name = name
         self._detail_renderer = fallback_renderer
         self.dead = False
@@ -244,6 +256,7 @@ class EmbedPane(Widget):
         self._grid = None
         self._strips = None
         self._cursor = None
+        self._clear_resize_capture_hold()
         self._detail_renderer = renderer
         self.dead = False
         self._detail_stick_bottom = True
@@ -258,6 +271,7 @@ class EmbedPane(Widget):
         self._grid = None
         self._strips = None
         self._cursor = None
+        self._clear_resize_capture_hold()
         self.dead = False
         self._detail_stick_bottom = False
         self.detail_offset = 0
@@ -352,6 +366,13 @@ class EmbedPane(Widget):
                         self.app.call_from_thread(self._apply_dead, generation, name)
                 else:
                     misses = 0
+                    # resize 后冻结：镜像 Cursor 重排中间帧会像「疯狂滚动」；
+                    # 等连续稳定或超时后再放行一帧。
+                    if not self._resize_hold_allows_display(text):
+                        interval = MIN_CAPTURE_INTERVAL
+                        self._poke.wait(interval)
+                        self._poke.clear()
+                        continue
                     now = time.monotonic()
                     polled_state = False
                     if now - last_state_at >= STATE_POLL_INTERVAL:
@@ -1000,4 +1021,45 @@ class EmbedPane(Widget):
         if not embed.should_resize_host(size[0], size[1]):
             return
         embed.resize(name, size[0], size[1])
+        # 已有直播画面时冻结抓帧显示：Cursor 等重排中间态不刷到右栏。
+        if self._grid is not None:
+            self._begin_resize_capture_hold()
         self._poke.set()
+
+    def _begin_resize_capture_hold(self) -> None:
+        """开始 resize 后的抓帧冻结窗口（主线程调用）。"""
+        now = time.monotonic()
+        self._resize_hold_active = True
+        self._resize_hold_until_min = now + _RESIZE_CAPTURE_HOLD_MIN
+        self._resize_hold_deadline = now + _RESIZE_CAPTURE_HOLD_MAX
+        self._resize_hold_last_text = None
+        self._resize_hold_stable = 0
+
+    def _clear_resize_capture_hold(self) -> None:
+        self._resize_hold_active = False
+        self._resize_hold_last_text = None
+        self._resize_hold_stable = 0
+
+    def _resize_hold_allows_display(self, text: str) -> bool:
+        """抓帧线程：hold 中返回 False 以保持旧画面；解除时返回 True。
+
+        `_RESIZE_CAPTURE_STABLE_FRAMES` 表示需要连续多少次抓到相同画面
+        （含首次建立）：2 = 同一内容连抓两次即认为 Cursor 重排结束。
+        """
+        if not self._resize_hold_active:
+            return True
+        now = time.monotonic()
+        if self._resize_hold_last_text is not None and text == self._resize_hold_last_text:
+            self._resize_hold_stable += 1
+        else:
+            self._resize_hold_stable = 1
+            self._resize_hold_last_text = text
+        if now < self._resize_hold_until_min:
+            return False
+        if (
+            self._resize_hold_stable >= _RESIZE_CAPTURE_STABLE_FRAMES
+            or now >= self._resize_hold_deadline
+        ):
+            self._clear_resize_capture_hold()
+            return True
+        return False

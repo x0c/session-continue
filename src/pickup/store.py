@@ -16,6 +16,11 @@ from pickup.display import (
 from pickup.models import ConversationMessage, session_key
 from pickup.runtime import RuntimeRegistry, default_registry
 
+# 新扫到的会话：mtime 在此窗口内才插到列表最前；更旧的（常为临时 cwd 复活）
+# 追加到末尾，避免几天前的会话整批顶到侧边栏。
+_FRESH_PREPEND_MAX_AGE = 2 * 86400
+
+
 class SessionStore:
     """持有所有已注册运行时的会话列表与标题缓存。
 
@@ -209,14 +214,27 @@ class SessionStore:
             for bucket in self.sessions.values():
                 for session in bucket:
                     by_key[session_key(session)] = session
-            # 稳定顺序：已展示的会话保持原位（只更新内容，不移动），
-            # 新出现的会话按 mtime 倒序插到列表最前。
+            # 稳定顺序：已展示的会话保持原位（只更新内容，不移动）。
+            # 新出现的会话：最近活跃的插到最前；「目录复活」等重新扫到的旧会话
+            # 追加到末尾——避免 /tmp 临时 cwd 重建时几天前的会话整批顶到侧边栏。
             known = set(self._order)
             fresh = [session for key, session in by_key.items() if key not in known]
-            fresh.sort(key=lambda session: float(session.get("mtime") or 0), reverse=True)
-            self._order = [session_key(session) for session in fresh] + [
-                key for key in self._order if key in by_key
+            now = time.time()
+            fresh_hot = [
+                session for session in fresh
+                if now - float(session.get("mtime") or 0) <= _FRESH_PREPEND_MAX_AGE
             ]
+            fresh_cold = [
+                session for session in fresh
+                if now - float(session.get("mtime") or 0) > _FRESH_PREPEND_MAX_AGE
+            ]
+            fresh_hot.sort(key=lambda session: float(session.get("mtime") or 0), reverse=True)
+            fresh_cold.sort(key=lambda session: float(session.get("mtime") or 0), reverse=True)
+            self._order = (
+                [session_key(session) for session in fresh_hot]
+                + [key for key in self._order if key in by_key]
+                + [session_key(session) for session in fresh_cold]
+            )
             # 已从扫描结果消失的会话不能继续占着生成状态，否则 has_generating()
             # 会永久为真，列表仍会空转刷新不存在的卡片。
             self.generating.intersection_update(by_key)
@@ -258,7 +276,7 @@ class SessionStore:
             return self._projects
 
     def all_sessions(self) -> list[dict]:
-        """返回稳定展示顺序的会话快照：已有会话位置固定不变，新出现的会话排在最前。"""
+        """返回稳定展示顺序的会话快照：已有位置固定；近 2 天的新会话在前，更旧的复活会话在后。"""
         with self.lock:
             by_key = {
                 session_key(session): session

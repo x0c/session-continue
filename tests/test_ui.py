@@ -1407,12 +1407,14 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await _wait_until(lambda: app.screen._host_pending == 0)
                 pane = await _wait_for_embed_pane(app.screen)
-                await _wait_until(lambda: pane.session_name == "pickup-claude-new")
+                # 共享机/全量套件负载下 2s 偶发不够：host worker 已完成但 focus 回调排队稍晚。
+                await _wait_until(lambda: pane.session_name == "pickup-claude-new", tries=500)
                 await _wait_until(
                     lambda: any(
                         s.get("keepalive_name") == "pickup-claude-new"
                         for s in app.screen.query_one(SessionListView).visible_sessions()
-                    )
+                    ),
+                    tries=500,
                 )
 
     async def test_cross_runtime_handoff_shows_hosted_card_and_keeps_embed(self) -> None:
@@ -2207,6 +2209,47 @@ class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(delay=embed_pane_mod._RESIZE_TMUX_DEBOUNCE + 0.05)
                 self.assertEqual(resize_calls, [("pickup-claude-debounce", 40, 18)])
                 self.assertEqual(len(poke_calls), 1)
+
+    async def test_resize_with_live_grid_starts_capture_hold(self) -> None:
+        """已有直播画面时，防抖 resize 后必须冻结抓帧显示，避免镜像 Cursor 重排滚动。"""
+        import pickup.ui.embed_pane as embed_pane_mod
+        from pickup.embed import Cell
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            pane = _primary_embed_pane(app.screen)
+            pane.session_name = "pickup-cursor-hold"
+            pane.dead = False
+            pane._grid = [[Cell("x")]]  # noqa: SLF001
+            with (
+                mock.patch("pickup.embed.resize"),
+                mock.patch("pickup.embed.capture", return_value=None),
+            ):
+                pane._on_resize(events.Resize(Size(60, 22), Size(60, 22)))
+                await pilot.pause(delay=embed_pane_mod._RESIZE_TMUX_DEBOUNCE + 0.05)
+            self.assertTrue(pane._resize_hold_active)  # noqa: SLF001
+            # 停掉抓帧线程对 hold 状态的并发改写，再单测放行条件
+            pane.session_name = None
+            pane._stop.set()  # noqa: SLF001
+            # 重排中的变化帧不得放行
+            self.assertFalse(pane._resize_hold_allows_display("frame-a"))  # noqa: SLF001
+            self.assertFalse(pane._resize_hold_allows_display("frame-b"))  # noqa: SLF001
+            # 等到最小 hold 之后，连续两帧相同才放行
+            pane._resize_hold_until_min = time.monotonic() - 0.01  # noqa: SLF001
+            self.assertFalse(pane._resize_hold_allows_display("stable"))  # noqa: SLF001
+            self.assertTrue(pane._resize_hold_allows_display("stable"))  # noqa: SLF001
+            self.assertFalse(pane._resize_hold_active)  # noqa: SLF001
+
+    def test_resize_hold_deadline_forces_release(self) -> None:
+        """超时后即使画面仍在变也必须放行，避免永久冻结。"""
+        pane = EmbedPane()
+        pane._begin_resize_capture_hold()  # noqa: SLF001
+        pane._resize_hold_until_min = time.monotonic() - 1  # noqa: SLF001
+        pane._resize_hold_deadline = time.monotonic() - 0.01  # noqa: SLF001
+        self.assertTrue(pane._resize_hold_allows_display("still-changing"))  # noqa: SLF001
+        self.assertFalse(pane._resize_hold_active)  # noqa: SLF001
 
     async def test_tmux_resize_skips_when_pane_too_narrow(self) -> None:
         """右栏短时缩到下限以下时不得 resize-window，避免窄折行烧进历史。"""

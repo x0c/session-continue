@@ -22,6 +22,21 @@ def shorten_cwd(cwd: str) -> str:
     return cwd
 
 
+def is_ephemeral_agent_cwd(cwd: str) -> bool:
+    """OpenConductor 管家等自动任务写在 /tmp/oc-manager-* 下的临时 cwd。
+
+    这类目录会随任务创建/删除反复出现：曾经因「cwd 不存在」被滤掉的旧会话，
+    在目录复活后会整批重新进入扫描结果，被 SessionStore 当成「新会话」插到
+    列表最前，造成侧边栏被几天前的管家会话刷屏。扫描阶段直接丢弃。
+    """
+    if not cwd:
+        return False
+    normalized = cwd.replace("\\", "/").rstrip("/")
+    # /tmp/oc-manager-codex/... 、/tmp/oc-manager-claude/... 、以及嵌套变体
+    parts = [p for p in normalized.split("/") if p]
+    return any(p.startswith("oc-manager-") for p in parts)
+
+
 def parse_timestamp(value) -> float | None:
     """解析 ISO8601 时间戳字符串（含尾部 Z）为 epoch 秒；非字符串或格式错误返回 None。"""
     if not isinstance(value, str):

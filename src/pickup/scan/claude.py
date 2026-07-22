@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.scan.common import is_ephemeral_agent_cwd
 from pickup.scan.common import parse_timestamp as _parse_timestamp
 from pickup.scan.common import shorten_cwd as _shorten_cwd
 
@@ -470,6 +471,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         peek_cwd, peek_first_user = _peek_head_meta(fpath)
         if peek_first_user is not None and peek_first_user.startswith(titles.PROMPT_MARKER):
             continue  # 廉价探测已确认是自产噪音会话，跳过整文件解析
+        if peek_cwd and is_ephemeral_agent_cwd(peek_cwd):
+            continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
         if peek_cwd and not cached_isdir(peek_cwd):
             continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
 
@@ -481,6 +484,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue  # 无用户消息的空会话
         if info["first_user_msg"].startswith(titles.PROMPT_MARKER):
             continue  # sc 自己生成标题留下的噪音会话，跳过（廉价探测失手时的兜底）
+        if is_ephemeral_agent_cwd(info["cwd"]):
+            continue
         if info["cwd"] and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):

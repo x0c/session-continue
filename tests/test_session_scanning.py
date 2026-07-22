@@ -1223,6 +1223,59 @@ class CodexScanTests(TimezoneMixin, unittest.TestCase):
 
         self.assertEqual([s["first_user_msg"] for s in sessions], ["真实的用户问题"])
 
+    def test_is_ephemeral_agent_cwd(self) -> None:
+        from pickup.scan.common import is_ephemeral_agent_cwd
+
+        self.assertTrue(is_ephemeral_agent_cwd("/tmp/oc-manager-codex/run-1"))
+        self.assertTrue(is_ephemeral_agent_cwd("/var/folders/xx/oc-manager-claude/work"))
+        self.assertFalse(is_ephemeral_agent_cwd("/Users/me/Codes/pickup"))
+        self.assertFalse(is_ephemeral_agent_cwd(""))
+        self.assertFalse(is_ephemeral_agent_cwd("/tmp/other-project"))
+
+    def test_scan_filters_ephemeral_oc_manager_cwd(self) -> None:
+        """OpenConductor 管家 /tmp/oc-manager-* 会话不进列表（目录复活也不刷屏）。"""
+        old_sessions_dir = scan_codex.SESSIONS_DIR
+        old_session_index = scan_codex.SESSION_INDEX
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                scan_codex.SESSIONS_DIR = td
+                scan_codex.SESSION_INDEX = os.path.join(td, "session_index.jsonl")
+                real_cwd = Path(td) / "real_cwd"
+                real_cwd.mkdir()
+                oc_cwd = Path(td) / "oc-manager-codex" / "job"
+                oc_cwd.mkdir(parents=True)
+
+                specs = [
+                    ("019efe42-6d51-7fb3-ad48-112a8eefaa01", str(real_cwd), "真实用户问题"),
+                    ("019efe42-6d51-7fb3-ad48-112a8eefaa02", str(oc_cwd), "管家自动任务"),
+                ]
+                for i, (uuid, cwd, first_msg) in enumerate(specs):
+                    path = Path(td) / f"rollout-2026-07-16T10-0{i}-00-{uuid}.jsonl"
+                    _write_jsonl(
+                        path,
+                        [
+                            {
+                                "timestamp": "2026-07-16T02:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": uuid, "cwd": cwd},
+                            },
+                            {
+                                "timestamp": "2026-07-16T02:00:10.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "user_message", "message": first_msg},
+                            },
+                        ],
+                    )
+                    mtime = 1_800_000_000 + i * 60
+                    os.utime(path, (mtime, mtime))
+
+                sessions = scan_codex.scan_sessions(limit=10)
+        finally:
+            scan_codex.SESSIONS_DIR = old_sessions_dir
+            scan_codex.SESSION_INDEX = old_session_index
+
+        self.assertEqual([s["first_user_msg"] for s in sessions], ["真实用户问题"])
+
 
 class OpenCodeScanTests(TimezoneMixin, unittest.TestCase):
     """OpenCode 历史存 SQLite（session/message/part 三表），扫描用只读连接直接查询。"""
@@ -2224,7 +2277,10 @@ class TuiLayoutTests(unittest.TestCase):
 
     def test_all_sessions_keep_stable_order_and_prepend_new_on_refresh(self) -> None:
         """列表展示出来后已有会话位置固定：内容更新（mtime 变新）不再跳到顶上；
-        后台重扫只把新出现的会话按 mtime 倒序插到最前。"""
+        后台重扫只把「最近」新出现的会话按 mtime 倒序插到最前；更旧的 fresh
+        （如临时 cwd 复活扫回的几天前会话）追加到末尾。"""
+        now = time.time()
+
         def make_session(session_id: str, mtime: float) -> dict:
             return {
                 "source": "claude",
@@ -2237,9 +2293,18 @@ class TuiLayoutTests(unittest.TestCase):
                 "fallback_title": f"会话{session_id}",
             }
 
-        first = [make_session("a", 3), make_session("b", 2), make_session("c", 1)]
-        # 第二轮：b 有了新消息（mtime 顶到最新），d 是全新会话
-        second = [make_session("b", 100), make_session("d", 50), make_session("a", 3), make_session("c", 1)]
+        first = [
+            make_session("a", now - 30),
+            make_session("b", now - 60),
+            make_session("c", now - 90),
+        ]
+        # 第二轮：b 有了新消息（mtime 顶到最新），d 是全新且最近的会话
+        second = [
+            make_session("b", now),
+            make_session("d", now - 10),
+            make_session("a", now - 30),
+            make_session("c", now - 90),
+        ]
         claude_runtime = mock.Mock()
         claude_runtime.id = "claude"
         claude_runtime.display_name = "Claude"
@@ -2256,7 +2321,49 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertTrue(changed)  # 新会话 d 出现，集合确实变了
         # d 插到最前；a/b/c 保持首次展示时的相对位置，b 内容更新但不移动
         self.assertEqual([s["id"] for s in store.all_sessions()], ["d", "a", "b", "c"])
-        self.assertEqual(store.all_sessions()[2]["mtime"], 100)
+        self.assertEqual(store.all_sessions()[2]["mtime"], now)
+
+    def test_all_sessions_append_resurrected_old_sessions_on_refresh(self) -> None:
+        """临时 cwd 复活时扫回的几天前会话不能整批顶到侧边栏最前。"""
+        now = time.time()
+
+        def make_session(session_id: str, mtime: float) -> dict:
+            return {
+                "source": "codex",
+                "id": session_id,
+                "short_id": session_id,
+                "mtime": mtime,
+                "size_bytes": 1,
+                "size_kb": 1,
+                "native_title": None,
+                "fallback_title": f"会话{session_id}",
+            }
+
+        first = [make_session("keep", now - 60)]
+        # old_a / old_b：mtime 远超 _FRESH_PREPEND_MAX_AGE；hot：刚活跃的真新会话
+        second = [
+            make_session("hot", now - 10),
+            make_session("old_a", now - 5 * 86400),
+            make_session("old_b", now - 4 * 86400),
+            make_session("keep", now - 60),
+        ]
+        runtime = mock.Mock()
+        runtime.id = "codex"
+        runtime.display_name = "Codex"
+        runtime.scan_signature.return_value = None
+        runtime.scan_sessions.side_effect = [first, second]
+        registry = pickup.RuntimeRegistry((runtime,))
+        with mock.patch.object(pickup.titles, "load_cache", return_value={}):
+            store = pickup.SessionStore(limit=20, registry=registry)
+            store.load()
+            self.assertEqual([s["id"] for s in store.all_sessions()], ["keep"])
+            changed = store.refresh()
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [s["id"] for s in store.all_sessions()],
+            ["hot", "keep", "old_b", "old_a"],
+        )
 
     def test_mark_hosted_clear_forces_ended_until_scan_confirms_dead(self) -> None:
         """按 q 结束托管后不能闪「运行中」：立刻清 live，重扫仍报 live 时继续压住。"""

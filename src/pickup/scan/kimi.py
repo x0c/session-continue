@@ -28,6 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.scan.common import is_ephemeral_agent_cwd
 from pickup.scan.common import live_pids_by_process_name
 from pickup.scan.common import parse_timestamp as _parse_iso
 from pickup.scan.common import shorten_cwd as _shorten_cwd
@@ -285,6 +286,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         info = _build_session_info(session_dir, session_id)
         if info is None:
             continue
+        if is_ephemeral_agent_cwd(info["cwd"]):
+            continue  # OpenConductor 管家临时 cwd，目录复活会刷屏
         if info["cwd"] and not cached_isdir(info["cwd"]):
             continue  # 工作目录已删除，无法原生恢复
         if cwd_filter and not info["cwd"].startswith(cwd_filter):

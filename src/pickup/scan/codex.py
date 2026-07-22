@@ -17,6 +17,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.scan.common import is_ephemeral_agent_cwd
 from pickup.scan.common import parse_timestamp as _parse_timestamp
 from pickup.scan.common import shorten_cwd as _shorten_cwd
 
@@ -391,6 +392,8 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
             continue  # 无用户消息的空会话
         if info["first_user_msg"].startswith(titles.PROMPT_MARKER):
             continue  # 后台标题生成自产的噪音会话,和 Claude 侧同一套 PROMPT_MARKER 过滤
+        if is_ephemeral_agent_cwd(info["cwd"]):
+            continue  # OpenConductor 管家等 /tmp/oc-manager-* 自动任务，目录复活会刷屏
         if info["cwd"] and not cached_isdir(info["cwd"]):
             continue  # cwd 已不存在（如子 agent 的临时 scratchpad 目录已被清理），无法 resume
         if cwd_filter and not info["cwd"].startswith(cwd_filter):
