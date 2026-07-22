@@ -48,6 +48,16 @@ class SplitLayoutStoreTests(unittest.TestCase):
         assert group is not None
         self.assertEqual(group.session_keys, ["claude:a"])
 
+    def test_migrate_session_key(self) -> None:
+        store = split_layout.SplitLayoutStore()
+        store.set_group("/p", ["cursor:short", "claude:a"], focus_key="cursor:short")
+        store.migrate_session_key("cursor:short", "cursor:full-uuid")
+        group = store.get_group("cursor:full-uuid")
+        assert group is not None
+        self.assertEqual(group.session_keys, ["cursor:full-uuid", "claude:a"])
+        self.assertEqual(group.focus_key, "cursor:full-uuid")
+        self.assertIsNone(store.get_group("cursor:short"))
+
     def test_resolve_active_group_degrades_dead_mates(self) -> None:
         store = split_layout.SplitLayoutStore()
         store.set_group("/p", ["claude:a", "codex:b"])
@@ -81,6 +91,32 @@ class SplitLayoutStoreTests(unittest.TestCase):
                     assert group is not None
                     self.assertEqual(group.session_keys, ["claude:x", "codex:y"])
                     self.assertEqual(loaded.last_project, "/proj")
+
+    def test_load_rebuilds_index_from_groups_only(self) -> None:
+        """磁盘里陈旧/矛盾的 session_to_group 不得覆盖 groups 真相。"""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "split-layout.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "version": 1,
+                        "last_project": "/p",
+                        "last_focus_key": "claude:a",
+                        "groups": {
+                            "g1": {
+                                "project_cwd": "/p",
+                                "session_keys": ["claude:a"],
+                                "focus_key": "claude:a",
+                            }
+                        },
+                        "session_to_group": {"claude:ghost": "g1", "claude:a": "wrong"},
+                    },
+                    f,
+                )
+            with mock.patch.object(split_layout, "LAYOUT_FILE", path):
+                loaded = split_layout.load_layout()
+            self.assertEqual(loaded.session_to_group, {"claude:a": "g1"})
+            self.assertIsNone(loaded.get_group("claude:ghost"))
 
 
 if __name__ == "__main__":

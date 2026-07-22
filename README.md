@@ -15,7 +15,7 @@ Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manage
 
 - Browse recent Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and Cursor Agent CLI sessions from one terminal screen.
 - Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, `opencode -s <id>`, and `kimi -S <id>`, and `agent --resume`.
-- Select a finished session to preview the full conversation in the right pane (live/hosted sessions show the embedded terminal instead); message timestamps appear when the history format has them.
+- Select a finished session to preview the full conversation in the right pane (live/hosted sessions show embedded terminals instead), or keep up to three active sessions side by side.
 - Hand off unfinished work between runtimes without rewriting or faking session files.
 - Keep generated titles in a local cache so repeat launches stay fast.
 - Use JSON output for scripts and launchers.
@@ -37,7 +37,7 @@ See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 - Python 3.10 or newer.
 - `tmux` 3.2 or newer (hard requirement — session hosting, embedded panes, and SSH keep-alive are all built on it; `pickup` checks the version at startup and refuses to run on older tmux, since `new-session -e` environment injection requires 3.2+).
 - macOS or Linux terminal (any modern ANSI-capable terminal works; the UI is built with Textual, not curses).
-- Claude Code, Codex CLI, OpenCode, and/or Kimi Code CLI installed if you want to resume those sessions.
+- Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and/or Cursor Agent CLI installed if you want to resume those sessions.
 
 ## Install
 
@@ -102,19 +102,20 @@ The TUI defaults to English. If your system locale is Chinese (`zh*`), the inter
 
 ## Embedded Panes (work on multiple sessions at once)
 
-`pickup` is a unified, time-ordered session timeline: Claude Code, Codex CLI, OpenCode, and Kimi
-Code sessions appear in one list rather than separate runtime tabs. Each card shows `project: title`
-with the runtime aligned right on the first row, then a green running state (or ended state) with the
-update time aligned right on the second row. A blank row separates cards. Title generation uses a
-spinner without changing the title's weight. The right half always follows the selection: hosted
-sessions render their live terminal, while history that is not currently hosted shows an instant
-summary without starting a process. Once the list is shown its order is stable — cards never jump
+`pickup` is a unified, time-ordered session timeline: Claude Code, Codex CLI, OpenCode, Kimi Code,
+and Cursor Agent sessions appear in one list rather than separate runtime tabs. Each card uses three
+rows for `project: title`, state plus runtime, and update time. Title generation uses a spinner without
+changing the title's weight. The right side follows the selection: finished sessions show their full
+conversation pinned to the newest message, while hosted sessions render live terminals. The runtime
+buttons above the right side can add another agent in the same project, up to three side-by-side panes;
+the active pane combination is remembered. Once the list is shown its order is stable — cards never jump
 around when their content updates; only genuinely new sessions appear, always prepended at the top.
 
 - The first row is a pinned `+ New session` item (Chinese locale: `＋ 新建会话`) that never scrolls away: press
   `Enter` on it to pick a project directory and an agent runtime, and the blank session starts
-  hosted in the right-hand pane. `n` does the same without prompts, using the
-  current project filter (or the selected session's directory) and the current runtime.
+  hosted in the right-hand pane.
+- Click a runtime button above the right side to add that agent as another pane in the current project.
+  Up to three panes may run together; click a pane to focus it and sync the sidebar selection.
 - `Enter` resumes the selected session in the right-hand pane (or reconnects an already-hosted
   live terminal there). Keyboard focus stays on the sidebar so browsing shortcuts keep working;
   click the right pane when you want to type into the agent. Moving the selection alone never
@@ -138,8 +139,8 @@ around when their content updates; only genuinely new sessions appear, always pr
   terminal's background color at startup and feeds it to each hosted pane
   (`refresh-client -r`), so agents that query OSC 11 get the true value. Agents that were
   already running keep their earlier guess — restart them or set their theme manually once.
-- `c` closes the split and returns to the full-width list; hosted sessions keep running in the
-  background and can be reopened with `Enter`.
+- `c` closes the focused pane; its hosted session keeps running in the background and can be reopened
+  with `Enter`.
 - `q` on a backgrounded / in-progress session ends it after a second `q` confirmation;
   quitting `pickup` with `Esc` never kills anything — everything stays alive in tmux.
 
@@ -231,13 +232,13 @@ agent workflows.
 | `/` | Focus the project search box (case-insensitive fuzzy match on project name and session title) |
 | `Enter` | Resume selected session with the native runtime (reattach if it's already running in the background); on the pinned first row `+ New session` (Chinese: `＋ 新建会话`), start the new-session flow instead |
 | `a` | Open advanced handoff actions |
-| `n` | New blank session in the current project with the current runtime (no prompts) |
 | `q` | End a backgrounded / in-progress (keep-alive) session; press `q` again in the confirm dialog |
+| `x` | Permanently delete the selected local session; press `x` again in the confirm dialog |
+| `c` | Close the focused right-side pane without ending its hosted session |
 | `Home` / `End` / `PgUp` / `PgDn` | Scroll the right-pane conversation preview (also mouse wheel over the pane) |
+| `F12` | Save a local diagnostic screenshot under `~/.cache/pickup/screenshots/` |
 | `Esc` | Clear search / close dialog, or quit |
 
-`pickup` waits briefly for an escape sequence to complete, so `Esc` can close the current
-view without breaking arrow keys.
 Click the right pane to type into a hosted agent; `Ctrl-\` returns keyboard focus to the sidebar
 without ending the process. Mouse wheel over either pane works regardless of which side has focus.
 
@@ -296,7 +297,8 @@ pickup update
 | `src/pickup/store.py` | session store / snapshot refresh |
 | `src/pickup/display.py` | width, cards, preview, filtering helpers |
 | `src/pickup/theme.py` | OSC probe and runtime label colors |
-| `src/pickup/ui/` | Textual UI: main screen, modals, session list, embed pane |
+| `src/pickup/ui/` | Textual UI: main screen, modals, session list, split-pane area, runtime top bar, embed pane |
+| `src/pickup/split_layout.py` | remembered active split-pane groups |
 | `src/pickup/embed.py` | embedded-pane host (`capture-pane` / `send-keys`) |
 | `src/pickup/agent_api.py` | read-only `list`/`search`/`show`/`context`/`describe` |
 | `src/pickup/keepalive.py` | tmux-backed keep-alive wrapper |

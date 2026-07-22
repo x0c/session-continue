@@ -1,8 +1,8 @@
 """会话列表：左栏会话卡片 + 顶部新建项，取代旧版 curses 手绘表格。
 
 侧边栏布局硬约定（凡往左栏加控件都必须遵守，见 AGENTS.md / MAINTAINER_GUIDE）：
-每个块的最后一行是间隔空行，画在控件自身高度内并算进命中区；禁止用 margin
-或兄弟空隙做分隔。当前：搜索框高 2、新建项高 2、会话卡高 3。
+搜索框/新建项最后一行是间隔空行，画在控件自身高度内并算进命中区；禁止用 margin
+或兄弟空隙做分隔。当前：搜索框高 2、新建项高 2、会话卡高 3（三行正文，无末行空行）。
 
 业务格式化逻辑（相对时间、宽字符对齐、标题兜底）直接复用 pickup.py 里已测试的
 纯函数，这里只负责「怎么在 Textual 里画卡片、怎么响应选择」。
@@ -27,7 +27,7 @@ NEW_SESSION_ID = "__new_session__"
 
 
 class SessionCard(Widget):
-    """会话卡片：两行正文 + 末行间隔（总高 3）。"""
+    """会话卡片：三行正文（总高 3）——标题 / 状态+运行时 / 时间。"""
 
     # Textual 默认所有 Widget 都允许鼠标拖拽文本选择（ALLOW_SELECT=True）；这类
     # 卡片是"点击=选中该会话"的列表项，不是可选文本内容，必须关掉——否则鼠标
@@ -118,16 +118,16 @@ class SessionCard(Widget):
         runtime = store.registry.get(str(session.get("source") or ""))
         runtime_name = runtime.display_name
         runtime_id = getattr(runtime, "id", None) or str(session.get("source") or "")
+
+        title_cell = pickup._fit_cell(title_prefix + title, width, ellipsis=True)
+
         runtime_width = min(width - 1, max(1, pickup._text_width(runtime_name)))
-        title_width = width - runtime_width
-        title_cell = pickup._fit_cell(title_prefix + title, title_width, ellipsis=True)
+        status_width = width - runtime_width
+        status_cell = pickup._fit_cell(status_text, status_width)
         runtime_cell = pickup._fit_cell_right(runtime_name, runtime_width)
 
         relative_time = pickup._format_relative_time(session.get("mtime") or 0)
-        time_width = min(width - 1, max(1, pickup._text_width(relative_time)))
-        status_width = width - time_width
-        status_cell = pickup._fit_cell(status_text, status_width)
-        time_cell = pickup._fit_cell_right(relative_time, time_width)
+        time_cell = pickup._fit_cell_right(relative_time, width)
 
         # 项目名 bold、其后「: 标题」dim——终端里比单纯 bold 更有对比。
         out = Text(title_cell)
@@ -138,13 +138,11 @@ class SessionCard(Widget):
             out.stylize("bold", project_start, project_end)
         if content_len > project_end:
             out.stylize("dim", project_end, content_len)
+        out.append("\n")
+        out.append(status_cell, style="#3F9A6A" if is_running else "dim")
         out.append(runtime_cell, style=pickup.runtime_label_style(runtime_id))
         out.append("\n")
-        # 运行中状态用略降饱和的绿，暗底上 ANSI green 过艳会发颤
-        out.append(status_cell, style="#3F9A6A" if is_running else "dim")
         out.append(time_cell, style="dim")
-        # 第三行空行：视觉分隔，同时算进本卡命中区（不要用 ListItem margin/padding）
-        out.append("\n")
         return out
 
 
@@ -269,6 +267,25 @@ class SessionListView(ListView):
 
     def is_new_session_selected(self) -> bool:
         return self.index == 0
+
+    def select_session_key(self, session_key: str) -> bool:
+        """按会话键设置列表高亮；找不到对应项时返回 False。
+
+        用于右栏分屏焦点 → 侧边栏同步。`__hint__` 对应顶部「＋ 新建」项。
+        """
+        import pickup
+
+        if session_key == "__hint__":
+            if self.index != 0:
+                self.index = 0
+            return True
+        for i, card in enumerate(self._session_cards()):
+            if pickup.session_key(card.session) == session_key:
+                target = i + 1
+                if self.index != target:
+                    self.index = target
+                return True
+        return False
 
     def _displayed_selected_key(self) -> str | None:
         """按当前已渲染的 DOM 卡片（而非刚重算过的 `visible_sessions()`）取回

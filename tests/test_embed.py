@@ -269,9 +269,21 @@ class ImagePasteTests(unittest.TestCase):
         wrapped = "␞PICKUP_IMG_BEGIN␞***not-base64***␞PICKUP_IMG_END␞"
         self.assertIsNone(embed.extract_pasted_image(wrapped))
 
+    def test_extract_pasted_image_rejects_non_image_payload(self):
+        raw = b"not-an-image"
+        b64 = base64.b64encode(raw).decode()
+        wrapped = f"␞PICKUP_IMG_BEGIN␞{b64}␞PICKUP_IMG_END␞"
+        self.assertIsNone(embed.extract_pasted_image(wrapped))
+
+    def test_extract_pasted_image_rejects_oversized_payload(self):
+        # 只撑大 base64 文本长度，避免真的分配 8MB+ 解码缓冲
+        payload = "A" * (embed._MAX_IMAGE_B64_CHARS + 1)
+        wrapped = f"␞PICKUP_IMG_BEGIN␞{payload}␞PICKUP_IMG_END␞"
+        self.assertIsNone(embed.extract_pasted_image(wrapped))
+
     def test_pane_cwd_parses_display_message(self):
-        with mock.patch.object(embed.subprocess, "check_output", return_value=b"/home/vibecoder/proj\n"):
-            self.assertEqual(embed._pane_cwd("s"), "/home/vibecoder/proj")
+        with mock.patch.object(embed.subprocess, "check_output", return_value=b"/home/demo/proj\n"):
+            self.assertEqual(embed._pane_cwd("s"), "/home/demo/proj")
 
     def test_pane_cwd_none_on_failure(self):
         with mock.patch.object(embed.subprocess, "check_output",
@@ -296,6 +308,7 @@ class ImagePasteTests(unittest.TestCase):
                 path = embed.save_image_and_paste_path("s", b"\xff\xd8\xff-fake")
             self.assertIsNotNone(path)
             self.assertTrue(path.startswith(tmp_root))
+            self.assertTrue(path.endswith(".jpg"))
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), b"\xff\xd8\xff-fake")
             # 落盘后应经 paste() 把路径送进 pane（set-buffer + paste-buffer）
@@ -307,13 +320,77 @@ class ImagePasteTests(unittest.TestCase):
         with mock.patch.object(embed.subprocess, "check_output",
                                side_effect=subprocess.CalledProcessError(1, [])), \
                 mock.patch.object(embed.subprocess, "run", side_effect=_run_completed_ok):
-            path = embed.save_image_and_paste_path("s", b"data")
+            path = embed.save_image_and_paste_path("s", b"\xff\xd8\xffdata")
         try:
             self.assertIsNotNone(path)
             self.assertTrue(path.startswith(tempfile.gettempdir()))
+            self.assertTrue(path.endswith(".jpg"))
         finally:
             if path:
                 os.remove(path)
+
+    def test_save_image_and_paste_path_rejects_unknown_bytes(self):
+        with mock.patch.object(embed.subprocess, "run", side_effect=_run_completed_ok):
+            self.assertIsNone(embed.save_image_and_paste_path("s", b"data"))
+
+
+class ChannelPoolTests(unittest.TestCase):
+    """控制通道按会话名池化：多分屏可同时存活，关一格不影响另一格。"""
+
+    def setUp(self):
+        embed.close_channel()
+
+    def tearDown(self):
+        embed.close_channel()
+
+    @staticmethod
+    def _fake_channel(session_name: str):
+        ch = mock.Mock()
+        ch.dead = False
+        ch.name = session_name
+        return ch
+
+    def test_open_keeps_independent_channels(self):
+        with mock.patch.object(embed, "ControlChannel") as CC:
+            ch_a = self._fake_channel("sess-a")
+            ch_b = self._fake_channel("sess-b")
+            CC.side_effect = [ch_a, ch_b]
+            a = embed.open_channel("sess-a")
+            b = embed.open_channel("sess-b")
+            self.assertIs(a, ch_a)
+            self.assertIs(b, ch_b)
+            self.assertEqual(CC.call_count, 2)
+            # 同名复用，不新建
+            self.assertIs(embed.open_channel("sess-a"), ch_a)
+            self.assertEqual(CC.call_count, 2)
+
+    def test_close_one_leaves_other_alive(self):
+        with mock.patch.object(embed, "ControlChannel") as CC:
+            ch_a = self._fake_channel("sess-a")
+            ch_b = self._fake_channel("sess-b")
+            CC.side_effect = [ch_a, ch_b]
+            embed.open_channel("sess-a")
+            embed.open_channel("sess-b")
+            embed.close_channel("sess-a")
+            ch_a.close.assert_called_once()
+            ch_b.close.assert_not_called()
+            self.assertIs(embed.open_channel("sess-b"), ch_b)
+            self.assertEqual(CC.call_count, 2)
+
+    def test_close_all_clears_pool(self):
+        with mock.patch.object(embed, "ControlChannel") as CC:
+            ch_a = self._fake_channel("sess-a")
+            ch_b = self._fake_channel("sess-b")
+            ch_a2 = self._fake_channel("sess-a")
+            CC.side_effect = [ch_a, ch_b, ch_a2]
+            embed.open_channel("sess-a")
+            embed.open_channel("sess-b")
+            embed.close_channel()
+            ch_a.close.assert_called_once()
+            ch_b.close.assert_called_once()
+            # 池已空，再 open 会新建
+            embed.open_channel("sess-a")
+            self.assertEqual(CC.call_count, 3)
 
 
 class ControlModeTests(unittest.TestCase):

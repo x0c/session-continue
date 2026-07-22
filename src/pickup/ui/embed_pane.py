@@ -122,6 +122,7 @@ class EmbedPane(Widget):
     # 覆盖成整数会让框架的文本拖选计算变成 Offset + int。
     history_offset: reactive[int] = reactive(0)
     # 静态对话预览的纵向偏移（行）；与 history_offset 互不共用，避免实时托管状态串扰。
+    # 语义：0=对话最早（顶），增大=更靠后；默认钉在最新（底），见 `_detail_stick_bottom`。
     detail_offset: reactive[int] = reactive(0)
 
     def __init__(
@@ -150,6 +151,9 @@ class EmbedPane(Widget):
         self._detail_renderer = detail_renderer
         self._on_focus_list = on_focus_list
         self._osc_report = osc_report
+        # 静态预览是否跟随底部（最新消息）。选中/异步加载完成时为 True；
+        # 用户上滚或 Home 后为 False，此后 invalidate 只保当前位置不强制钉回。
+        self._detail_stick_bottom = False
 
         # 下面这些字段只由后台抓帧线程写入、主线程（按键/滚轮处理）只读，
         # 避免任何事件处理路径同步调用 embed.capture/embed.pane_state。
@@ -210,6 +214,9 @@ class EmbedPane(Widget):
         self.session_name = name
         self._detail_renderer = fallback_renderer
         self.dead = False
+        # 首帧前若有对话回退，必须钉底：否则 `_ensure_static_strips` 顶裁一屏会
+        # 闪出最早消息，Cursor 持续输出时 remount 后就像「跳回会话开头再滚回最新」。
+        self._detail_stick_bottom = fallback_renderer is not None
         self.detail_offset = 0
         self.invalidate_detail()
         self.history_offset = 0
@@ -227,7 +234,11 @@ class EmbedPane(Widget):
         return channel  # noqa: RET504（测试里需要断言通道对象，保留返回值）
 
     def show_detail(self, renderer: Callable[[], "Text | str"] | None) -> None:
-        """未托管会话：展示静态详情而非实时画面。"""
+        """未托管会话：展示静态详情而非实时画面。
+
+        默认钉在对话最新（底部）；异步暖加载把正文填进来后仍保持钉底，
+        直到用户主动上滚或按 Home。
+        """
         self._capture_generation += 1
         self.session_name = None
         self._grid = None
@@ -235,6 +246,7 @@ class EmbedPane(Widget):
         self._cursor = None
         self._detail_renderer = renderer
         self.dead = False
+        self._detail_stick_bottom = True
         self.detail_offset = 0
         self.invalidate_detail()
 
@@ -247,6 +259,7 @@ class EmbedPane(Widget):
         self._strips = None
         self._cursor = None
         self.dead = False
+        self._detail_stick_bottom = False
         self.detail_offset = 0
         if old_name:
             embed.close_channel(old_name)
@@ -258,11 +271,37 @@ class EmbedPane(Widget):
         `_detail_renderer` 可能读取会变化的标题缓存、会话状态和摘要；这些变化不
         一定会创建新闭包，因此不能只靠 renderer 身份作为缓存失效条件。主界面
         每次完成列表重建后应调用本方法，使右栏跟同一份最新数据一起刷新。
+
+        若仍处于钉底态，失效后会在下一帧把 `detail_offset` 推到新内容的底部
+        （覆盖异步暖加载「先短后长」）；用户已离开底部则只 clamp，不强制跳转。
         """
         self._static_key = None
         self._static_strips_cache = None
         if self.session_name is None or self.dead or self._grid is None:
             self.refresh()
+            self._schedule_detail_pin()
+
+    def _schedule_detail_pin(self) -> None:
+        """尺寸/内容就绪后把钉底预览滚到最新；未挂到 App 时直接同步执行。"""
+        if not self._detail_stick_bottom or not self._uses_detail_window():
+            return
+        try:
+            self.call_after_refresh(self._pin_detail_to_bottom)
+        except Exception:
+            self._pin_detail_to_bottom()
+
+    def _pin_detail_to_bottom(self) -> None:
+        if not self._detail_stick_bottom or not self._uses_detail_window():
+            return
+        if self.size.height <= 0 or self.size.width <= 0:
+            return
+        max_off = self._detail_max_offset()
+        if self.detail_offset == max_off:
+            return
+        self.detail_offset = max_off
+        self._static_key = None
+        self._static_strips_cache = None
+        self.refresh()
 
     # ---- 抓帧（后台线程，唯一发起 embed.capture/embed.pane_state 调用的地方）----
 
@@ -383,6 +422,8 @@ class EmbedPane(Widget):
         self._sync_strips(grid)
         self._cursor = cursor
         self.dead = False
+        # 直播画面已到，静态钉底回退不再参与渲染。
+        self._detail_stick_bottom = False
         if state is not None:
             self._mouse_any, self._mouse_sgr, self._history_size = state[3], state[4], state[5]
         self._update_app_cursor()
@@ -567,6 +608,19 @@ class EmbedPane(Widget):
         """右栏正在展示静态对话预览（非实时托管画面）。"""
         return self.session_name is None and self._detail_renderer is not None and not self.dead
 
+    def _is_hosted_fallback(self) -> bool:
+        """托管已聚焦但尚无首帧，且带有静态对话回退（不可再顶裁）。"""
+        return (
+            self.session_name is not None
+            and self._grid is None
+            and self._detail_renderer is not None
+            and not self.dead
+        )
+
+    def _uses_detail_window(self) -> bool:
+        """需要整篇排版 + detail_offset 窗口的静态内容（含托管首帧前回退）。"""
+        return self._is_detail_view() or self._is_hosted_fallback()
+
     def _detail_full_strips(self) -> list[Strip]:
         """把详情全文编译成完整 Strip 列表（高度不限），供窗口切片与滚动上限计算。"""
         visual = visualize(self, self._static_renderable())
@@ -583,10 +637,12 @@ class EmbedPane(Widget):
 
     def scroll_detail(self, delta: int) -> bool:
         """滚动静态对话预览；返回是否处于可滚动的详情态（不论偏移是否真的变了）。"""
-        if not self._is_detail_view():
+        if not self._uses_detail_window():
             return False
         max_off = self._detail_max_offset()
         new_offset = max(0, min(self.detail_offset + delta, max_off))
+        # 离开底部即取消钉底；滚回底部则重新钉住（End/下滚到尾同理）
+        self._detail_stick_bottom = new_offset >= max_off
         if new_offset != self.detail_offset:
             self.detail_offset = new_offset
             self._static_key = None
@@ -595,8 +651,9 @@ class EmbedPane(Widget):
         return True
 
     def scroll_detail_home(self) -> bool:
-        if not self._is_detail_view():
+        if not self._uses_detail_window():
             return False
+        self._detail_stick_bottom = False
         if self.detail_offset != 0:
             self.detail_offset = 0
             self._static_key = None
@@ -605,8 +662,9 @@ class EmbedPane(Widget):
         return True
 
     def scroll_detail_end(self) -> bool:
-        if not self._is_detail_view():
+        if not self._uses_detail_window():
             return False
+        self._detail_stick_bottom = True
         max_off = self._detail_max_offset()
         if self.detail_offset != max_off:
             self.detail_offset = max_off
@@ -634,26 +692,36 @@ class EmbedPane(Widget):
         Rich-renderable 渲染路径同一套换行/对齐/宽字符处理），不用自己重新
         实现文本折行和 `content-align: left top` 这条 CSS 的效果。
 
-        静态对话预览：先按无高度上限整篇排版，再按 `detail_offset` 切一屏窗口；
-        这样长对话不会被裁掉，键盘/滚轮可以上下翻看。
+        静态对话预览与托管首帧前回退：先按无高度上限整篇排版，再按
+        `detail_offset` 切一屏窗口；这样长对话不会被顶裁成最早消息。钉底态下
+        窗口始终贴最新（`detail_offset` 由 `_pin_detail_to_bottom` 在 refresh
+        后同步，避免在渲染路径里改 reactive）。
         """
-        key = (
-            self.session_name, self.dead, id(self._detail_renderer),
-            self.size, self.detail_offset,
-        )
-        if self._static_key == key and self._static_strips_cache is not None:
-            return self._static_strips_cache
         pane_h = max(1, self.size.height)
         width = max(1, self.size.width)
-        if self._is_detail_view():
+        if self._uses_detail_window():
             full = self._detail_full_strips()
             max_off = max(0, len(full) - pane_h)
-            offset = max(0, min(self.detail_offset, max_off))
+            offset = max_off if self._detail_stick_bottom else max(
+                0, min(self.detail_offset, max_off),
+            )
+            key = (
+                self.session_name, self.dead, id(self._detail_renderer),
+                self.size, offset, self._detail_stick_bottom,
+            )
+            if self._static_key == key and self._static_strips_cache is not None:
+                return self._static_strips_cache
             window = list(full[offset:offset + pane_h])
             while len(window) < pane_h:
                 window.append(Strip.blank(width))
             strips = window
         else:
+            key = (
+                self.session_name, self.dead, id(self._detail_renderer),
+                self.size, self.detail_offset, False,
+            )
+            if self._static_key == key and self._static_strips_cache is not None:
+                return self._static_strips_cache
             visual = visualize(self, self._static_renderable())
             strips = Visual.to_strips(
                 self, visual, width, pane_h, self.visual_style,
@@ -771,8 +839,9 @@ class EmbedPane(Widget):
     # ---- 输入转发 ----
 
     async def _on_key(self, event: events.Key) -> None:
-        if self._is_detail_view():
+        if self._uses_detail_window():
             # 面板聚焦时方向键/翻页也滚预览（列表聚焦时由 MainScreen 优先级绑定处理）
+            # 含托管首帧前的对话回退：同样钉底窗口，避免顶裁后只能看最早消息。
             handled = False
             if event.key == "up":
                 handled = self.scroll_detail(-1)
@@ -872,10 +941,11 @@ class EmbedPane(Widget):
         `mouse_any`/`mouse_sgr` 读的是后台抓帧线程缓存的字段，这里绝不发起新的
         embed.pane_state 阻塞调用。
         """
-        if self._is_detail_view():
-            # 文档式预览：detail_offset 0=顶部、增大=更靠后的对话。
-            # 传入的 local_delta 沿用 history_offset 约定（Up=+、Down=-，0=直播底），
-            # 与文档滚动符号相反，这里取反才能「下滚看更晚内容」。
+        if self._uses_detail_window():
+            # 文档式预览 / 托管首帧回退：detail_offset 0=顶部、增大=更靠后；默认钉底
+            # （`_detail_stick_bottom`）。传入的 local_delta 沿用 history_offset
+            # 约定（Up=+、Down=-，0=直播底），与文档滚动符号相反，取反才能
+            # 「下滚看更晚内容」。
             self.scroll_detail(-local_delta)
             return
         name = self.session_name

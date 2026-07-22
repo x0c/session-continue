@@ -351,6 +351,10 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn("last_error", data)
         self.assertEqual(data["runtime_label_style_claude"], "bold #D97757")
         self.assertIsInstance(data["hints"], list)
+        self.assertIn("package_file", data)
+        self.assertIn("install_channel", data)
+        self.assertIn("stale_source_warning", data)
+        self.assertIn("version", data)
 
     def test_diagnose_includes_last_error_from_embed_log(self) -> None:
         from pickup import observe

@@ -39,7 +39,8 @@ SQLite 数据库（`~/.local/share/opencode/opencode.db`，只读打开）下的
 | `pickup context <会话>` | 生成接续该会话所需的上下文数据包 |
 | `pickup plan continue <会话> --instruction <文本>` | 生成带新指令的非交互式原生续接计划；只返回数据，不执行 |
 | `pickup describe [command]` | 查看命令 / 参数 / 输出字段说明 |
-| `pickup diagnose` | 只读诊断：events.log / embed-error.log / `last_error`（最近闪退） / 截图目录 / tmux / 配色自检；不启动 TUI |
+| `pickup diagnose` | 只读诊断：events.log / embed-error.log / `last_error` / 截图目录 / tmux / 配色自检 / **安装路径**（`package_file`、`install_channel`、`stale_source_warning`）；不启动 TUI |
+
 
 ### 会话标识（`<会话>` 参数）
 

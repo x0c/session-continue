@@ -3193,7 +3193,7 @@ class CursorScanTests(unittest.TestCase):
             ), mock.patch.object(
                 scan_cursor, "process_command_line", side_effect=fake_cmdline
             ), mock.patch.object(
-                scan_cursor, "open_file_paths", return_value=open_paths
+                scan_cursor, "_cursor_store_paths_for_pids", return_value=open_paths
             ), mock.patch.object(
                 scan_cursor, "process_environ", return_value={}
             ):
@@ -3233,7 +3233,7 @@ class CursorScanTests(unittest.TestCase):
                 "process_command_line",
                 return_value="/Users/x/.local/bin/agent --force",
             ), mock.patch.object(
-                scan_cursor, "open_file_paths", return_value={80250: []}
+                scan_cursor, "_cursor_store_paths_for_pids", return_value={80250: []}
             ), mock.patch.object(
                 scan_cursor,
                 "process_environ",
@@ -3272,7 +3272,7 @@ class CursorScanTests(unittest.TestCase):
                 "process_command_line",
                 return_value="/Users/x/.local/bin/agent --force",
             ), mock.patch.object(
-                scan_cursor, "open_file_paths", return_value={55021: []}
+                scan_cursor, "_cursor_store_paths_for_pids", return_value={55021: []}
             ), mock.patch.object(
                 scan_cursor,
                 "process_environ",

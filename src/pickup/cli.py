@@ -310,11 +310,26 @@ def main() -> None:
                         help="以 JSON 格式输出会话列表后退出，不启动 TUI")
     parser.add_argument("--no-keepalive", action="store_true", dest="no_keepalive",
                         help="本次启动不把会话包进后台保活（tmux），SSH 断开会话会跟着中断")
+    parser.add_argument("--version", "-V", action="store_true", dest="show_version",
+                        help="显示版本、安装路径与渠道后退出")
     parser.add_argument("--generate-titles", action="store_true", dest="generate_titles",
                         help=argparse.SUPPRESS)  # 内部用途：TUI 拉起的后台标题生成进程
     args = parser.parse_args()
 
     registry = default_registry()
+
+    if args.show_version:
+        report = updater.install_report()
+        print(f"pickup {report['version']}")
+        print(f"  package_file: {report['package_file']}")
+        print(f"  python:       {report['python']}")
+        print(f"  channel:      {report['channel']}")
+        if report["checkout_root"]:
+            print(f"  checkout:     {report['checkout_root']}")
+            print(f"  from_checkout:{report['loaded_from_checkout']}")
+        if report["stale_source_warning"]:
+            print(f"  WARNING:      {report['stale_source_warning']}", file=sys.stderr)
+        return
 
     if args.generate_titles:
         _run_title_daemon(registry, args.limit)
@@ -357,6 +372,11 @@ def main() -> None:
     # 依赖它），但现在跟上面的后台扫描线程是并行的，不再是"扫描 + 探测"首尾相加。
     theme_mod._OSC_REPORT = _probe_osc_colours()
     observe.init(debug=bool(os.environ.get("PICKUP_DEBUG")))
+    # 在源码树里开发却加载了 pipx/site-packages 副本时，启动前打一次 stderr 告警
+    # （普通发行版用户 cwd 不在仓库内，不会触发）。
+    stale = updater.stale_source_warning()
+    if stale and sys.stderr.isatty():
+        print(f"[pickup] {stale}", file=sys.stderr)
     if os.environ.get("PICKUP_DEBUG"):
         observe.debug(
             "osc_probe",

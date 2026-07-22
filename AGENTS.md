@@ -51,13 +51,13 @@
 > 以下文档在涉及对应领域的开发、评审或排查时先读取。
 
 - `README.md`：使用、修改、评审或扩展会话扫描、终端界面、标题生成、运行时适配和跨运行时接力
-- `docs/TERMINAL_UI_KNOWLEDGE_BASE.md`：终端界面、侧边栏筛选/新建会话、对话预览、右侧多分屏顶栏、分屏组合记忆、高级操作弹窗、Footer 按键、多语言文案、截图验收
+- `docs/TERMINAL_UI_KNOWLEDGE_BASE.md`：终端界面、侧边栏筛选/新建会话、对话预览（含默认钉底滚动）、右侧多分屏顶栏、分屏组合记忆、高级操作弹窗、Footer 按键、多语言文案、截图验收；排查 SSH 下 TUI 颜色失真 / 真彩降级时也读
 - `docs/EMBEDDED_TERMINAL_KNOWLEDGE_BASE.md`：内嵌实时终端、右栏托管画面（最多三格）、控制通道池、抓帧与按键转发、焦点边界/结束会话、连接中卡死
 - `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md`：会话扫描、对话预览数据、判活、扫描性能、各助手历史格式
 - `docs/CROSS_RUNTIME_HANDOFF_KNOWLEDGE_BASE.md`：跨助手接力、高级操作、原生恢复、空白新建、启动计划与接力提示词
 - `docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md`：新增一种 AI 助手、补扫描/预览/恢复/接力/空白新建与注册验收
 - `docs/OBSERVABILITY_KNOWLEDGE_BASE.md`：事件日志、诊断、F12 截图观测、界面异常排查
-- `docs/MAINTAINER_GUIDE.md`：标题生成、会话保活、直启、Agent 只读接口、开源发布、客户端自动更新及上述领域的维护级细节与历史踩坑
+- `docs/MAINTAINER_GUIDE.md`：标题生成、会话保活、直启、Agent 只读接口、开源发布、客户端自动更新及上述领域的维护级细节与历史踩坑（含 pipx/安装副本与源码分叉、SSH `COLORTERM` 真彩降级）
 - `docs/SKILL.md`：修改、评审 `agent_api.py` 面向 Agent 的子命令、字段或退出码语义（含 `diagnose`）；这是 Agent 侧唯一的使用文档，改命令行为必须同步这里
 - `PRIVACY.md`：修改、评审或排查历史文件读取、缓存写入、标题生成、跨运行时接力和开源隐私边界
 - `CONTRIBUTING.md`：修改开源贡献流程、验证命令、设计边界或 PR 要求
@@ -69,8 +69,8 @@
 - 跨运行时接力统一走“源适配器导出 `Handoff` → 目标适配器生成 `LaunchPlan`”，禁止增加 Claude→Gemini、Codex→Gemini 等两两转换分支。
 - 同运行时使用原生恢复；跨运行时必须新建目标会话、让目标 Agent 按需读取原始 JSONL，不能改写或伪造原会话。
 - 标题生成是独立服务，不属于任何运行时适配器。生成后端统一走 `titlegen.py` 的 `TitleGenerator` 抽象，`titles.py` 不得直接拼接任何 CLI 命令；`titlegen.py` 与 `runtime/` 互不 import——运行时适配器管「怎么恢复/接力会话」，标题生成器管「怎么无头问一次模型」，两者后端恰好重名但职责不同，不要合并。标题和界面状态使用“运行时 + 会话 ID”作为唯一键，新增运行时不得退回纯会话 ID。新增标题生成后端时，若该 CLI 会把生成调用落盘成会话历史，对应扫描器必须加 `titles.PROMPT_MARKER` 前缀过滤。
-- 会话预览：选中非进行中会话时，右栏直接展示完整对话；进行中/已托管会话右栏展示内嵌实时终端。唯一界面是左栏会话列表 + 右栏（可最多三格均分内嵌终端），禁止再加回全屏预览或纯列表第二套入口。右侧顶栏可点选已安装助手在当前项目下加格；活跃会话的分屏组合记忆见 `split_layout.py`（`~/.cache/pickup/split-layout.json`）。
-- **侧边栏末行间隔（硬约定）**：凡往左栏加控件（搜索框、新建项、会话卡、未来任何块），**最后一行必须是间隔空行**，画在该控件自身高度内并算进命中区与选中高亮；禁止用 `margin`、兄弟空隙或 `ListItem` padding 做分隔（点在空隙上不会落到本项）。当前基准：搜索框高 2、新建项高 2、会话卡高 3。细则见 `docs/MAINTAINER_GUIDE.md`「界面」节。
+- 会话预览：选中非进行中会话时，右栏直接展示完整对话（**默认钉在最新消息**，上滚看更早；用户离开底部后列表刷新不得强行钉回）；进行中/已托管会话右栏展示内嵌实时终端。唯一界面是左栏会话列表 + 右栏（可最多三格均分内嵌终端），禁止再加回全屏预览或纯列表第二套入口。右侧顶栏可点选已安装助手在当前项目下加格；活跃会话的分屏组合记忆见 `split_layout.py`（`~/.cache/pickup/split-layout.json`）。细则与 `_detail_stick_bottom` 见 `docs/TERMINAL_UI_KNOWLEDGE_BASE.md` / `docs/MAINTAINER_GUIDE.md`。
+- **侧边栏末行间隔（硬约定）**：凡往左栏加控件（搜索框、新建项、未来任何块），**最后一行必须是间隔空行**，画在该控件自身高度内并算进命中区与选中高亮；禁止用 `margin`、兄弟空隙或 `ListItem` padding 做分隔（点在空隙上不会落到本项）。会话卡例外：三行正文（标题 / 状态+运行时 / 时间），高度 3，不再另加末行空行。当前基准：搜索框高 2、新建项高 2、会话卡高 3。细则见 `docs/MAINTAINER_GUIDE.md`「界面」节。
 - `agent_api.py`（`pickup list`/`search`/`show`/`context`/`describe`）是只读数据接口，禁止新增任何执行/拉起副作用命令——pickup 只负责把会话数据交出来，怎么用是调用方的事。暴露更多可见性字段（如运行中会话的 `live`/`pid`）不违反这条约束，只要新字段本身来自扫描/只读探测、不触发任何拉起或写操作；真正"接管/下发指令给运行中会话"的能力不属于 pickup，留给调用方基于这些数据自行实现。命令参数与 `pickup describe` 的输出必须共用同一份 `COMMANDS` 定义，不能各写一份导致漂移。新增或修改子命令时同步 `docs/SKILL.md`。
 - Agent 接口里 `list`/`search` 的 `--limit` 固定表示每个运行时的扫描深度，`--top` 才表示最终返回条数；`--compact` 必须同时做到紧凑 JSON 和精简默认字段。改这三个参数或 `show --out` 大结果落盘行为时，同步 `pickup describe`、`docs/SKILL.md` 和 `docs/MAINTAINER_GUIDE.md`。
 - 会话保活（`keepalive.py`）是运行时无关的启动包装层，只在 `registry` 生成 `LaunchPlan` 之后、`execute_launch` 之前介入，禁止塞进 `runtime/` 某个具体适配器，也禁止让适配器感知 tmux 的存在。改保活匹配/回收逻辑前先读 `docs/MAINTAINER_GUIDE.md`「会话保活」节。`pickup claude`/`pickup codex` 直启子命令默认带 `_DirectLaunch` 进 TUI、经 `embed.host_session` 托管（与界面内「新建会话」同一路径），仅非真实终端 / `--no-keepalive` / 内嵌不可用时退回 `keepalive.enabled`/`wrap_plan` + `execute_launch` 旧路径（保活的第三个调用点，与 TUI 的 `_launch()` 复用同一套开关语义）。
@@ -127,24 +127,38 @@ python3 docs/screenshots/capture.py   # → docs/screenshots/list.png
 
 ## 本机入口
 
-产品代码在 `src/pickup/`（标准 src-layout）。不要再直接跑已删除的根目录 `pickup.py`。开发验证优先：
+产品代码在 `src/pickup/`（标准 src-layout）。不要再直接跑已删除的根目录 `pickup.py`。
+
+**开发机一次性装好（推荐，彻底避免 pipx 旧副本）：**
+
+```bash
+cd cli
+bash scripts/dev-install.sh
+# 把本仓库 editable 装进「pickup 命令实际用的解释器」（含 pipx venv）
+pickup --version   # 应看到 package_file 落在本仓库 …/cli/src/pickup/
+pickup --limit 5
+```
+
+之后改 `src/` 立刻生效，无需反复 `force-reinstall`；**仍须重启**已打开的 TUI。
+
+备选（无 pipx / 只想装到当前 python3）：
 
 ```bash
 cd cli
 python3 -m pip install --user --force-reinstall --no-deps -e .
-# 或非 editable：去掉 -e 的 force-reinstall
 pickup --limit 5
 # 等价：python3 -m pickup --limit 5
 ```
 
-核对入口落在当前树：
+**验收必须核对「`pickup` 命令实际加载的包」，不能只信系统 `python3 -c "import pickup"`。** 本机常见：`~/.local/bin/pickup` shebang 指向 **pipx venv**，而 Cursor / 普通 `python3` 可能 import 到仓库源码——单测已绿、敲 `pickup` 仍是旧包。核对：
 
 ```bash
-python3 -c "import pickup; print(pickup.__version__, pickup.__file__); print(pickup.runtime_label_style('claude'))"
-# 期望：0.19.x；路径在 site-packages 或本仓库 cli/src/pickup/；样式 bold #D97757
+pickup --version                 # 或 pickup diagnose → data.package_file / stale_source_warning
+command -v pickup
+head -1 "$(command -v pickup)"   # 若 #!.../pipx/venvs/pickup/bin/python → 用该解释器验
 ```
 
-确认没有运行另一台机器或旧目录中的副本；改完配色/布局后必须**重启**已打开的 TUI，旧进程不会热加载。
+在仓库目录内启动 TUI 若加载了别处的副本，stderr 会打 `[pickup] …改源码不会生效` 告警。期望 `package_file` 落在本仓库 `cli/src/pickup/`（editable）或你有意使用的 site-packages。样式自检：`pickup diagnose` 的 `runtime_label_style_claude` 应为 `bold #D97757`。
 
 ## 领域地图（doc-init）
 

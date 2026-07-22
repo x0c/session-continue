@@ -244,22 +244,24 @@ for _ in {1..40}; do
   outer_cursor="$(tmux -L "$OUTER" display-message -p -t cursor '#{cursor_x},#{cursor_y}')"
   outer_x="${outer_cursor%,*}"; outer_y="${outer_cursor#*,}"
   inner_x="${inner_cursor%,*}"; inner_y="${inner_cursor#*,}"
-  # 左栏固定宽度 39（ui/main_screen.py 的 LIST_PANE_WIDTH），面板起点在第 39 列；
-  # 真实外层光标列 = 39 + pane 内真实光标列，行 = pane 内真实光标行（面板顶部无
-  # 额外偏移）。算错了说明 EmbedPane._update_app_cursor 的坐标换算或时机有问题。
-  expected_x=$((39 + inner_x))
-  if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$inner_y" ]]; then
+  # 左栏固定宽度 39，右栏前保留 1 列空隙，因此面板起点在第 40 列；
+  # 真实外层光标列 = 40 + pane 内真实光标列；顶栏与格标题各占 1 行，因此外层行
+  # = 2 + pane 内真实光标行。算错了说明光标坐标换算或时机有问题。
+  expected_x=$((40 + inner_x))
+  expected_y=$((2 + inner_y))
+  if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$expected_y" ]]; then
     break
   fi
   sleep 0.15
 done
 outer_x="${outer_cursor%,*}"; outer_y="${outer_cursor#*,}"
 inner_x="${inner_cursor%,*}"; inner_y="${inner_cursor#*,}"
-expected_x=$((39 + inner_x))
-if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$inner_y" ]]; then
+expected_x=$((40 + inner_x))
+expected_y=$((2 + inner_y))
+if [[ "$outer_x" == "$expected_x" && "$outer_y" == "$expected_y" ]]; then
   ok "外层终端真实光标精确落在托管 pane 内的真实光标位置（内 ${inner_cursor} -> 外 ${outer_cursor}，IME 候选框定位依据的机制验证通过）"
 else
-  echo "光标锚定坐标不匹配：inner=${inner_cursor} outer=${outer_cursor} expected_x=${expected_x}" >&2
+  echo "光标锚定坐标不匹配：inner=${inner_cursor} outer=${outer_cursor} expected=${expected_x},${expected_y}" >&2
   exit 1
 fi
 
@@ -277,11 +279,11 @@ else
 fi
 
 # ---- 划词选中 + Ctrl+C 复制：验证真实 OSC 52 写入到达外层终端（tmux 充当） ----
-tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<0;39;1M')"
+tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<0;40;3M')"
 sleep 0.05
-tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<32;70;1M')"
+tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<32;70;3M')"
 sleep 0.05
-tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<0;70;1m')"
+tmux -L "$OUTER" send-keys -t cursor -l "$(printf '\033[<0;70;3m')"
 sleep 0.3
 tmux -L "$OUTER" set-option -t cursor set-clipboard on
 tmux -L "$OUTER" send-keys -t cursor C-c

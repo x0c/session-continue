@@ -90,15 +90,16 @@ class _PaneHeader(Horizontal):
     ) -> None:
         super().__init__(**kwargs)
         self._title = title
+        self._title_widget = Static(title, classes="title")
         self._on_close = on_close
 
     def compose(self):
-        yield Static(self._title, classes="title")
+        yield self._title_widget
         yield _PaneClose(self._on_close)
 
     def set_title(self, title: str) -> None:
         self._title = title
-        self.query_one(".title", Static).update(title)
+        self._title_widget.update(title)
 
     def set_active(self, active: bool) -> None:
         self.set_class(active, "-active")
@@ -136,12 +137,14 @@ class PaneCell(Vertical):
         on_focus_list: Callable[[], None],
         osc_report: bytes | None,
         detail_renderer: Callable[[], Text | str] | None = None,
+        on_pane_focused: Callable[[str], None] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.spec = spec
         self._on_close = on_close
         self._on_focus_list = on_focus_list
+        self._on_pane_focused = on_pane_focused
         self._osc_report = osc_report
         self._title = title
         self._detail_renderer = detail_renderer
@@ -195,9 +198,15 @@ class PaneCell(Vertical):
 
     def _on_descendant_focus(self, event: events.DescendantFocus) -> None:
         self.call_after_refresh(self._sync_active_marker)
+        self.call_after_refresh(self._notify_pane_focused)
 
     def _on_descendant_blur(self, event: events.DescendantBlur) -> None:
         self.call_after_refresh(self._sync_active_marker)
+
+    def _notify_pane_focused(self) -> None:
+        if not self.has_focus_within or self._on_pane_focused is None:
+            return
+        self._on_pane_focused(self.spec.session_key)
 
     def _sync_active_marker(self) -> None:
         # 双击顶栏助手、快速增删分栏时，焦点回调可能落在「标题栏尚未 compose
@@ -237,6 +246,7 @@ class SplitPaneArea(Vertical):
         on_runtime_pick: Callable[[str], None],
         on_pane_close: Callable[[str], None],
         on_focus_list: Callable[[], None],
+        on_pane_focused: Callable[[str], None] | None = None,
         osc_report: bytes | None = None,
         render_detail: Callable[[dict], Text] | None = None,
         **kwargs,
@@ -246,6 +256,7 @@ class SplitPaneArea(Vertical):
         self._on_runtime_pick = on_runtime_pick
         self._on_pane_close = on_pane_close
         self._on_focus_list = on_focus_list
+        self._on_pane_focused = on_pane_focused
         self._osc_report = osc_report
         self._render_detail = render_detail
         self.current_project: str = ""
@@ -267,6 +278,16 @@ class SplitPaneArea(Vertical):
     def can_add_pane(self) -> bool:
         return len(self._panes) < MAX_PANES
 
+    @property
+    def focus_key(self) -> str | None:
+        return self._focus_key
+
+    def pane_specs(self) -> list[PaneSpec]:
+        return list(self._panes)
+
+    def cells(self) -> list[PaneCell]:
+        return self._cells()
+
     def any_embed_focused(self) -> bool:
         for cell in self._cells():
             pane = cell.embed_pane()
@@ -286,6 +307,15 @@ class SplitPaneArea(Vertical):
 
     def invalidate_all_details(self) -> None:
         for cell in self._cells():
+            pane = cell.embed_pane()
+            if pane is not None:
+                pane.invalidate_detail()
+
+    def invalidate_visible_previews(self) -> None:
+        """只失效非托管预览格，内嵌终端不被重扫连带刷新。"""
+        for cell in self._cells():
+            if cell.spec.keepalive_name:
+                continue
             pane = cell.embed_pane()
             if pane is not None:
                 pane.invalidate_detail()
@@ -345,6 +375,13 @@ class SplitPaneArea(Vertical):
             focus_key=key,
         )
 
+    def ordered_session_keys(self) -> list[str]:
+        return [p.session_key for p in self._panes]
+
+    def hosted_identity(self) -> list[tuple[str, str | None]]:
+        """当前挂载的有序 (session_key, keepalive_name)，用于判断是否可跳过 remount。"""
+        return [(p.session_key, p.keepalive_name) for p in self._panes]
+
     def show_hosted_group(
         self,
         project: str,
@@ -352,8 +389,23 @@ class SplitPaneArea(Vertical):
         *,
         focus_key: str | None = None,
     ) -> None:
-        """entries: (session, keepalive_name, detail_renderer)"""
+        """entries: (session, keepalive_name, detail_renderer)
+
+        若 (session_key, keepalive_name) 有序身份与当前一致，只就地更新标题/
+        回退 renderer，禁止整排 remount（否则会清掉 live `_grid`，首帧前
+        静态回退会闪回对话开头）。
+        """
         self.current_project = project
+        target_identity = [
+            (make_session_key(session), kname) for session, kname, _ in entries
+        ]
+        if (
+            entries
+            and self._cells()
+            and self.hosted_identity() == target_identity
+        ):
+            self._update_hosted_group_inplace(entries, focus_key=focus_key)
+            return
         specs: list[tuple[PaneSpec, dict, Callable[[], Text | str] | None]] = []
         for session, kname, renderer in entries:
             key = make_session_key(session)
@@ -365,6 +417,28 @@ class SplitPaneArea(Vertical):
             [(s, sess, r) for s, sess, r in specs],
             focus_key=self._focus_key,
         )
+
+    def _update_hosted_group_inplace(
+        self,
+        entries: list[tuple[dict, str | None, Callable[[], Text | str] | None]],
+        *,
+        focus_key: str | None = None,
+    ) -> None:
+        """同身份：更新 title / detail_renderer，保留 EmbedPane 的 live 画面。"""
+        cells = self._cells()
+        for cell, (session, _kname, renderer) in zip(cells, entries):
+            cell.set_title(self._pane_title(session))
+            pane = cell.embed_pane()
+            if pane is None:
+                continue
+            if renderer is not None:
+                pane._detail_renderer = renderer  # noqa: SLF001
+                # 仅失效静态缓存；有 live grid 时 invalidate_detail 不会 refresh 盖住画面
+                pane.invalidate_detail()
+        if focus_key:
+            self._focus_key = focus_key
+        elif self._panes:
+            self._focus_key = self._panes[0].session_key
 
     def add_hosted_pane(
         self,
@@ -408,8 +482,20 @@ class SplitPaneArea(Vertical):
                 self._focus_key = session_key
                 return
 
-    def ordered_session_keys(self) -> list[str]:
-        return [p.session_key for p in self._panes]
+    def _handle_pane_focused(self, session_key: str) -> None:
+        self._focus_key = session_key
+        if self._on_pane_focused is not None:
+            self._on_pane_focused(session_key)
+
+    def reconcile_session_keys(self, key_by_keepalive: dict[str, str]) -> None:
+        """按 keepalive 名把格子的 session_key 对齐到最新扫描快照（占位→真实）。"""
+        for spec in self._panes:
+            kname = spec.keepalive_name
+            if not kname:
+                continue
+            mapped = key_by_keepalive.get(kname)
+            if mapped:
+                spec.session_key = mapped
 
     def _cells(self) -> list[PaneCell]:
         row = self.query_one("#pane-row", Horizontal)
@@ -445,16 +531,22 @@ class SplitPaneArea(Vertical):
             self._focus_key = self._panes[-1].session_key if self._panes else None
         if notify:
             self._on_pane_close(spec.session_key)
+        # 只卸被关的那一格，勿整排 remount——否则同伴格会闪断、预览格丢失 renderer。
+        self.call_next(self._remove_cell_async, spec)
+
+    async def _remove_cell_async(self, spec: PaneSpec) -> None:
+        row = self.query_one("#pane-row", Horizontal)
+        for cell in list(self._cells()):
+            if cell.spec.cell_id == spec.cell_id:
+                await cell.remove()
+                break
         if not self._panes:
-            self.call_next(self._mount_panes_async, [])
+            await row.remove_children()
+            await row.mount(Static(t("split.empty_hint"), id="pane-row-empty"))
+            self.call_after_refresh(self._on_focus_list)
             return
-        rebuild = []
-        for p in self._panes:
-            sess = self._find_session(p.session_key)
-            if sess is None:
-                continue
-            rebuild.append((p, sess, None))
-        self.call_next(self._mount_panes_async, rebuild, focus_key=self._focus_key)
+        if self._focus_key:
+            self.call_after_refresh(lambda: self.focus_session_key(self._focus_key))
 
     def _schedule_mount(
         self,
@@ -491,6 +583,7 @@ class SplitPaneArea(Vertical):
                 title=self._pane_title(session),
                 on_close=lambda s=spec: self._close_spec(s),
                 on_focus_list=self._on_focus_list,
+                on_pane_focused=self._handle_pane_focused,
                 osc_report=self._osc_report,
                 detail_renderer=renderer,
             )

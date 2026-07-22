@@ -100,6 +100,98 @@ def detect_channel() -> Channel:
     return "dev"
 
 
+def package_file() -> str:
+    import pickup
+
+    return os.path.abspath(pickup.__file__)
+
+
+def find_checkout_root(start: str | None = None) -> str | None:
+    """自 start（默认 cwd）向上找含 pyproject.toml + src/pickup 的源码根。"""
+    cur = os.path.abspath(start or os.getcwd())
+    for _ in range(10):
+        pyproject = os.path.join(cur, "pyproject.toml")
+        init = os.path.join(cur, "src", "pickup", "__init__.py")
+        if os.path.isfile(pyproject) and os.path.isfile(init):
+            try:
+                with open(pyproject, "r", encoding="utf-8") as fh:
+                    text = fh.read(400)
+                if 'name = "pickup"' in text or "name = 'pickup'" in text:
+                    return cur
+            except OSError:
+                pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def is_loaded_from_checkout(checkout_root: str | None = None) -> bool:
+    """当前 import 的 pickup 是否来自给定（或 cwd 探测到的）源码树。"""
+    root = checkout_root if checkout_root is not None else find_checkout_root()
+    if not root:
+        return False
+    pkg = package_file()
+    src = os.path.join(os.path.abspath(root), "src", "pickup")
+    try:
+        return os.path.commonpath([pkg, src]) == src
+    except ValueError:
+        return False
+
+
+def stale_source_warning(cwd: str | None = None) -> str | None:
+    """在 pickup 源码树内开发，但实际加载的是别处的安装副本时返回告警；否则 None。
+
+    普通 pipx/brew 用户不在仓库里跑，不会触发。
+    """
+    root = find_checkout_root(cwd)
+    if root is None:
+        return None
+    if is_loaded_from_checkout(root):
+        return None
+    script = os.path.join(root, "scripts", "dev-install.sh")
+    return (
+        f"正在仓库 {root} 中开发，但当前进程加载的是 {package_file()}，"
+        f"改源码不会生效。请运行: bash {script} ，然后重启 TUI。"
+    )
+
+
+def install_report(cwd: str | None = None) -> dict:
+    """供 diagnose / --version：版本、路径、渠道、是否与 cwd 源码树一致。"""
+    import pickup
+
+    root = find_checkout_root(cwd)
+    pkg = package_file()
+    channel = detect_channel()
+    from_checkout = is_loaded_from_checkout(root) if root else False
+    editable_like = channel == "dev" or from_checkout
+    warning = stale_source_warning(cwd)
+    hints: list[str] = []
+    if warning:
+        hints.append(warning)
+    elif root and not from_checkout:
+        hints.append(
+            f"开发安装请运行: bash {os.path.join(root, 'scripts', 'dev-install.sh')}"
+        )
+    elif not editable_like and channel == "pip":
+        hints.append(
+            "若在改仓库源码，请用 scripts/dev-install.sh 做 editable 安装，"
+            "不要只 force-reinstall 非 -e 副本"
+        )
+    return {
+        "version": pickup.__version__,
+        "package_file": pkg,
+        "python": sys.executable,
+        "channel": channel,
+        "checkout_root": root,
+        "loaded_from_checkout": from_checkout,
+        "editable_like": editable_like,
+        "stale_source_warning": warning,
+        "hints": hints,
+    }
+
+
 def _site_packages_dirs() -> list[str]:
     dirs: list[str] = []
     try:

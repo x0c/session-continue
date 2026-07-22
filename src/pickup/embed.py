@@ -313,20 +313,44 @@ def paste(name: str, text: str) -> None:
 _IMG_SENTINEL_BEGIN = "␞PICKUP_IMG_BEGIN␞"
 _IMG_SENTINEL_END = "␞PICKUP_IMG_END␞"
 _IMAGE_PASTE_DIR = ".pickup-pastes"
+# 远程网页终端场景下恶意/异常超大粘贴不能拖垮磁盘与内存；浏览器侧也会先压缩。
+_MAX_IMAGE_PASTE_BYTES = 8 * 1024 * 1024
+_MAX_IMAGE_B64_CHARS = (_MAX_IMAGE_PASTE_BYTES * 4) // 3 + 8
+
+
+def _image_suffix(image_bytes: bytes) -> str | None:
+    """按 magic bytes 判定常见图片类型；无法识别返回 None（拒绝落盘）。"""
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if len(image_bytes) >= 12 and image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    return None
 
 
 def extract_pasted_image(text: str) -> bytes | None:
     """识别浏览器增强脚本裹了哨兵的图片粘贴内容，解出原始图片字节；
 
     普通文本粘贴（不含哨兵）返回 None，调用方应转发原文本，走现有 `paste()`。
+    超大载荷或非图片 magic 一律拒绝，避免临时目录被灌满。
     """
     if not (text.startswith(_IMG_SENTINEL_BEGIN) and text.endswith(_IMG_SENTINEL_END)):
         return None
     payload = text[len(_IMG_SENTINEL_BEGIN):-len(_IMG_SENTINEL_END)]
+    if len(payload) > _MAX_IMAGE_B64_CHARS:
+        return None
     try:
-        return base64.b64decode(payload, validate=True)
+        raw = base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError):
         return None
+    if len(raw) > _MAX_IMAGE_PASTE_BYTES:
+        return None
+    if _image_suffix(raw) is None:
+        return None
+    return raw
 
 
 def _pane_cwd(name: str) -> str | None:
@@ -357,6 +381,11 @@ def save_image_and_paste_path(name: str, image_bytes: bytes) -> str | None:
     权限访问）；查不到工作目录时退化到系统临时目录。落盘失败返回 None，调用方
     据此提示用户重试；不在这里改动运行时适配器，保持本模块运行时无关。
     """
+    if len(image_bytes) > _MAX_IMAGE_PASTE_BYTES:
+        return None
+    suffix = _image_suffix(image_bytes)
+    if suffix is None:
+        return None
     cwd = _pane_cwd(name)
     base_dir = (
         os.path.join(cwd, _IMAGE_PASTE_DIR) if cwd
@@ -364,7 +393,7 @@ def save_image_and_paste_path(name: str, image_bytes: bytes) -> str | None:
     )
     try:
         os.makedirs(base_dir, exist_ok=True)
-        fd, path = tempfile.mkstemp(prefix="paste-", suffix=".jpg", dir=base_dir)
+        fd, path = tempfile.mkstemp(prefix="paste-", suffix=suffix, dir=base_dir)
         with os.fdopen(fd, "wb") as f:
             f.write(image_bytes)
     except OSError:

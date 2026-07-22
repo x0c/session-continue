@@ -30,7 +30,7 @@ pickup 的价值是让用户从一个终端界面中继续或接力不同 Coding
 | 分屏组合记忆 | 活跃会话并排布局的隐式记忆（切走再回来自动恢复同伴） | `split_layout.py` → `~/.cache/pickup/split-layout.json`；仅活跃/托管会话 |
 | 侧边栏会话列表 | 左栏的搜索框、新建会话入口及会话卡片 | `SessionListView`、`SessionCard`、`NewSessionCard` |
 | 筛选项目 | 顶部输入框按项目名、路径和标题筛选会话 | `NavState.project_query`；不是独立项目列表页 |
-| 新建会话 | 以选定项目和运行时创建空白会话 | 顶部“＋ 新建会话”的完整选择流程，以及 `n` 快捷路径 |
+| 新建会话 | 以选定项目和运行时创建空白会话 | 侧边栏“＋ 新建会话”完整选择流程，或右栏顶栏点助手加格；无底栏 `n` 快捷键 |
 | 高级操作 | 对当前会话选择同运行时恢复或跨运行时接力 | `a` → `choose_target_runtime()` |
 | 删除会话 | 彻底抹掉选中会话的本地历史，不可恢复；运行中/托管会话先结束再删 | `x` → `ConfirmModal(confirm_key="x")` → `action_delete_session()` |
 | 对话预览 | 右栏展示非进行中会话的完整对话 | 不是旧的“最近提问 / 最近回复”摘要，也不是 Space 全屏页 |
@@ -96,7 +96,7 @@ sequenceDiagram
    - 有托管名称的会话进入内嵌实时终端；
    - 其他会话先显示详情头，再后台暖加载完整对话，完成后无缝刷新；
    - 选中“＋ 新建会话”时显示新建提示。
-5. 用户回车恢复、`n` 新建或 `a` 高级操作。能内嵌时，启动托管工作放到后台 worker，避免 tmux 阻塞冻结界面；无法内嵌时，应用退出并由外层执行启动计划。托管成功后键盘焦点仍留在侧边栏，点右栏才与内嵌会话交互。
+5. 用户回车恢复、侧边栏/顶栏新建或 `a` 高级操作。能内嵌时，启动托管工作放到后台 worker，避免 tmux 阻塞冻结界面；无法内嵌时，应用退出并由外层执行启动计划。托管成功后键盘焦点仍留在侧边栏，点右栏才与内嵌会话交互；多分屏下聚焦某一格时，`PaneCell` → `SplitPaneArea._handle_pane_focused` → `MainScreen._on_pane_focused` 会把侧边栏高亮切到对应会话（`SessionListView.select_session_key`），不 remount 右栏。
 6. 会话刷新发生变化时，界面原地更新内容；集合或顺序变化时才重建列表。标题缓存变化单独触发轻量刷新。
 
 ### 右栏展示状态
@@ -122,8 +122,8 @@ stateDiagram-v2
 | 用户动作 | 前置条件 | 流程 | 结果 |
 |---|---|---|---|
 | 回车选择会话 | 侧边栏选中已有会话 | 构建恢复或接力计划；优先打开已有托管会话 | 右栏内嵌展示；键盘焦点留在侧边栏 |
-| `n` 新建会话 | 能从当前筛选唯一项目或所选会话取得有效项目目录 | 直接按当前默认运行时创建空白会话 | 后台托管后进入右栏展示 |
 | “＋ 新建会话” | 用户需选择项目或运行时 | 先选项目，再选运行时 | 创建空白会话 |
+| 右栏顶栏点助手 | 当前项目目录已知且未满三格 | `_on_runtime_pick` 在当前项目下加一格托管 | 新格进入分屏组合 |
 | `a` 高级操作 | 当前选中已有会话 | 弹窗列出运行时；同运行时为原生恢复，其他运行时为读取历史后新建会话 | 形成启动请求 |
 | `q` 结束会话 | 当前会话是运行中(托管) | 确认弹窗确认后结束托管并立即标记为已结束 | 不等待下次扫描才更新状态 |
 | `x` 删除会话 | 侧边栏选中任意会话 | 确认弹窗（确认键为 `x`）确认后，运行中/托管会话先结束再删，随后调用所选运行时适配器的 `delete_session()` 彻底抹掉本地历史 | 成功后立即从列表摘除；失败（如磁盘/数据库异常）则提示失败原因，卡片保留、不摘除 |
@@ -151,7 +151,7 @@ stateDiagram-v2
 | 选中会话后决定右栏 | `ui/main_screen.py` | `_follow_current_selection()`、`_render_detail()`、`_warm_conversation()` | 非进行中显示完整对话；托管会话挂到右栏实时画面 |
 | 侧边栏筛选项目 | `ui/main_screen.py`、`ui/nav.py`、`pickup.py` | `on_input_changed()`、`NavState.project_query`、`_filter_sessions_by_query()` | 查询只有一份状态；按项目名、路径、标题进行大小写无关模糊匹配 |
 | 会话卡片、状态和列宽 | `ui/session_list.py` | `SessionCard.render()`、`SessionListView.rebuild()` | 渲染运行中 / 运行中(托管) / 已结束；按终端显示宽度排版 |
-| 新建会话 | `ui/main_screen.py`、`ui/modals.py` | `action_new_session()`、`new_session_flow()`、`pick_project()`、`pick_runtime_for_new_session()` | `n` 为直接路径；顶部入口为项目→运行时两步选择 |
+| 新建会话 | `ui/main_screen.py`、`ui/modals.py` | `new_session_flow()`、`pick_project()`、`pick_runtime_for_new_session()`、`_on_runtime_pick()` | 侧边栏「＋ 新建」走项目→运行时；右栏顶栏点助手在当前项目加格。底栏不再绑 `n` |
 | 高级操作与结束确认 | `ui/main_screen.py`、`ui/modals.py` | `action_handoff()`、`choose_target_runtime()`、`ConfirmModal` | 高级操作动态读取注册运行时；结束操作先确认 |
 | 删除会话（不可恢复） | `ui/main_screen.py`、`ui/modals.py`、`store.py`、`runtime/base.py` | `action_delete_session()`、`ConfirmModal(confirm_key="x")`、`SessionStore.remove_session()`、`BaseRuntime.delete_session()` | `ConfirmModal` 的确认键已参数化（结束会话仍是 `q`，删除会话是 `x`）；实际删除逻辑收敛在各运行时适配器，见 `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md`/`docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md` 各存储形态的删除方式 |
 | 右栏静态预览和实时画面挂接 | `ui/embed_pane.py` | `show_detail()`、`focus_session()`、`scroll_detail()` | 本域仅管理呈现切换、焦点与详情滚动；不描述 tmux 实现 |
@@ -186,7 +186,8 @@ stateDiagram-v2
 | Textual 后台 worker | 会话刷新 | `MainScreen._background_refresh_worker()` | 每 3 秒起步，连续空闲后最多退避到 10 秒；扫描变化才重建 |
 | Textual 定时器 | 标题缓存轮询 | `MainScreen._poll_cache()`，0.5 秒 | 后台标题生成完成后，更新标题与 spinner 而不重扫完整历史 |
 | Textual 定时器 | 标题 spinner | `SessionListView._tick_spinner()`，0.15 秒 | 只刷新正在生成标题的卡片；无生成任务直接返回 |
-| 按键绑定 | 主操作 | `MainScreen.BINDINGS`、`_main_bindings()` | `a` 高级操作、`n` 新建、`q` 结束、`Esc` 退出、F12 截图 |
+| 按键绑定 | 主操作 | `MainScreen.BINDINGS`、`_main_bindings()` | `a` 高级操作、`q` 结束、`x` 删除、`Esc` 退出、F12 截图；新建不走底栏快捷键 |
+| 分屏焦点同步 | 右栏 → 侧边栏 | `PaneCell._notify_pane_focused`、`MainScreen._on_pane_focused`、`SessionListView.select_session_key` | 聚焦某一分屏时侧边栏高亮切到对应会话；不得因此 remount 右栏 |
 | 按键路由 | 搜索与焦点 | `MainScreen.on_key()`、`on_input_submitted()` | `/` 聚焦筛选项目；Down/Enter 回列表；Esc 先清空查询再退出 |
 | 选择事件 | 会话操作 | `MainScreen.on_list_view_selected()` | 回车针对新建项或当前会话分流 |
 | 模态流程 | 高级操作 / 新建 / 确认 | `ui/modals.py` | 运行时选择、项目选择和结束确认；未安装运行时不可确认 |
@@ -197,9 +198,10 @@ stateDiagram-v2
 ## §6 核心业务规则与隐性约束
 
 - **AI 易错点**【禁止】恢复旧的全屏预览或纯列表第二套界面。非进行中会话在右栏直接展示完整对话，进行中或已托管会话在右栏挂接内嵌实时终端；Space 全屏预览已经退役。原因：双入口会使按键、滚动、选择和展示语义重新分叉。
-- **AI 易错点**【侧边栏末行间隔】搜索框、新建会话项、会话卡和未来新增的任何左栏控件，最后一行必须是控件自身高度内的间隔空行；搜索框高 2、新建项高 2、会话卡高 3。禁止用 `margin`、兄弟空隙或 `ListItem` padding 做分隔，因为点击空隙不会命中本项，选中高亮也不完整。
+- **AI 易错点**【侧边栏末行间隔】搜索框、新建会话项和未来新增的左栏控件，最后一行必须是控件自身高度内的间隔空行；搜索框高 2、新建项高 2。会话卡高 3，三行正文（标题 / 状态+运行时靠右 / 时间靠右），不再另加末行空行。禁止用 `margin`、兄弟空隙或 `ListItem` padding 做分隔，因为点击空隙不会命中本项，选中高亮也不完整。
 - **AI 易错点**【状态消抖】用户结束托管会话后，必须同时清掉托管标记并立即把 `live` / `pid` 标为结束，且保留强制结束状态直到扫描确认进程真的结束。否则列表会从“运行中(托管)”短暂闪成“运行中”，再延迟变“已结束”。
-- **AI 易错点**【新建回调】`NewSessionRequest` 没有关联历史会话；托管成功回调只能对 `LaunchRequest` 读取 `.session`。按 `n` 新建会话曾因未区分两种请求而闪退，回归测试必须保留。
+- **AI 易错点**【新建回调】`NewSessionRequest` 没有关联历史会话；托管成功回调只能对 `LaunchRequest` 读取 `.session`。空白新建路径曾因未区分两种请求而闪退，回归：`test_new_session_request_hosts_without_reading_session`。
+- **AI 易错点**【分屏焦点与侧边栏】多分屏时用户点到某一格，侧边栏必须切到该格会话高亮（`select_session_key`）；只更新标题栏 `-active` 不够。同步高亮时 `_follow_current_selection` 因 `any_embed_focused()` 早退，避免 remount 抢焦点。
 - **AI 易错点**【多语言与绑定】所有新增用户可见文案都进入 `i18n.py` 的 `_MESSAGES`，且同时提供 en / zh。Textual 的按键绑定在类创建时已合并；本地化只能更新 description，不能整体替换绑定表，否则会丢失列表继承的方向键和确认键。
 - **AI 易错点**【确认弹窗的确认键已参数化】`ConfirmModal(message, confirm_key="q")` 的确认键不再写死为 `q`：结束会话仍用默认 `q`，删除会话显式传 `confirm_key="x"`。新增任何需要二次确认的危险动作时，必须选一个与触发键一致的 `confirm_key`（而不是复用默认 `q`），否则用户会按错键、或误把另一个动作的确认键当成本动作的确认键。`t("modal.confirm_hint", confirm_key=...)` 的提示行文案同步跟着变。
 - **AI 易错点**【宽度不是字符数】侧边栏列宽、标题截断、运行时名右对齐和预览折行一律使用 Rich 的终端显示宽度工具链（`_text_width()` / `_fit_cell()`）；禁止用 `len()`、`ljust()` 或自写 East Asian Width 表。中文、emoji、组合字符会使字符数与终端格宽不一致。
@@ -208,16 +210,17 @@ stateDiagram-v2
 - **AI 易错点**【列表刷新策略】会话键的成员与顺序不变时，`SessionListView.rebuild()` 必须原地替换卡片数据，只刷新有变化的卡片；仅新增、删除或重排才清空重建。标题 spinner 没有生成任务时直接返回，不能高频复制全部标题状态。
 - **AI 易错点**【推导原选中会话必须以 DOM 为准】后台重扫是先 `store.refresh()` 再 `call_from_thread` 触发 `rebuild()`，这一刻 store 已经变了（新会话按 mtime 置顶插入）但 DOM 卡片还是旧的。`rebuild()` 推导「重建前选中的是哪条会话」必须用 `_displayed_selected_key()`（按已渲染的 `_session_cards()` 索引 `self.index`），不能用 `selected_session()`——它是按**刚重算过的** `visible_sessions()` 索引同一个 `self.index`，新会话已经把顺序打乱后，同一下标会指向别的会话。真实复现过：聚焦第三条时后台刷出一条新会话，高亮和右栏跟着串位跳到第二条。`selected_session()` 仍可安全用于用户交互期（回车/删除/结束会话等），那些时刻 DOM 与 store 本就同步。
 - **AI 易错点**【详情缓存失效】对话预览按历史文件 mtime 失效；列表扫描后右栏详情也必须失效并按稳定会话键重新读取当前快照。否则标题、状态、摘要或对话会停留在旧字典闭包里。
-- **AI 易错点**【右栏滚动语义】静态对话的 `detail_offset`（0 为顶部，增大表示更靠后）与实时画面的 `history_offset`（0 为直播底部）方向相反。滚轮进入静态对话时必须取反，保证“下滚看更晚内容”。
+- **AI 易错点**【右栏滚动语义】静态对话的 `detail_offset`（0 为顶部，增大表示更靠后）与实时画面的 `history_offset`（0 为直播底部）方向相反。滚轮进入静态对话时必须取反，保证“下滚看更晚内容”。选中预览默认钉在最新（`_detail_stick_bottom`）；用户离开底部后刷新不得强行钉回。
+- **AI 易错点**【SSH 真彩失真】TUI 颜色变脏/退化到 256 或 16 色，通常是远端缺 `COLORTERM=truecolor`（sshd 未 `AcceptEnv COLORTERM`），不是 pickup 为省带宽降色。见 `docs/MAINTAINER_GUIDE.md` 对应踩坑。
 - **AI 易错点**【点击选择】会动态增删的会话卡、新建项和弹窗菜单项必须关闭 Textual 文本拖选；它们的点击语义是选择/确认。右栏内嵌实时终端保留文本选择和 Ctrl+C 复制，不能全局关闭。
 - **AI 易错点**【窗口缩放必须防抖】拖动终端窗口时备用屏幕会被终端自行 reflow，差分重绘会花屏，需要整屏全量重绘清残影；但全量重绘、`tmux resize-window` 和唤醒抓帧都必须在尺寸停稳（约 120ms）后再做一次，禁止每次 Resize 都狂刷。拖动期右栏只按当前宽度裁补旧缓存行即可。
 - **AI 易错点**【右栏顶栏与分栏标题】助手顶栏按钮靠右排列，背景必须与底部操作栏共用 `$footer-background`，避免出现割裂的纯黑色条。侧边栏与右栏之间、右栏各分栏之间统一保留一列空白间隔：`SplitPaneArea` 左侧 `margin-left: 1`，第二格及后续 `PaneCell` 左侧 `margin-left: 1`；不画任何分隔线或边框，避免终端字体把线条字符渲成连续方块。标题栏使用非纯黑的 `$surface` 灰色背景，活跃分栏切换为 `$primary-muted`（弱化主色底，避免高饱和蓝条抢过内嵌内容），文字统一用 `auto 90%` 保证深浅主题下的对比度。禁止再用整圈边框或标题前圆点表示焦点。`PaneCell._sync_active_marker` / `set_title` 必须容忍标题栏尚未挂上或已卸下（双击顶栏快速加格时焦点回调会落在中间态），禁止对 `_PaneHeader` 裸 `query_one`。
 - **AI 易错点**【壳层配色层级】pickup 自有主题是 `pickup-dark` / `pickup-light`（冷静工作台），不是 Textual 默认主题。筛选框用 `$panel` / 聚焦 `$primary-muted`，禁止再铺 `$primary-darken-*` 大色块；列表选中只靠主题 `block-cursor-*` 抬一层冷灰蓝底，**禁止**再给 `ListItem.-highlight` 加 `border-left`——`tall`/`solid` 边框在终端里会和选中底拼成「双蓝条」。饱和色只留给助手标签、运行中状态、警告/错误。
 - 【隐性依赖】`Footer` 展示的是 `MainScreen.BINDINGS` 的本地化 description。验证时中文环境必须看到 `a 高级操作`，英文环境必须看到 `a Advanced`；不要再手绘底部帮助行。
-- 【隐性依赖】真实终端冒烟必须运行当前源码 `python3 -m pickup` 或先覆盖安装。用户 shell 中的 `pickup` 可能指向旧 site-packages 副本；布局、配色或按键改动后也必须重启已打开的终端界面。
+- 【隐性依赖】真实终端冒烟必须跑「`pickup` 入口实际加载的包」：`python3 -m pickup`、或对 **pipx / site-packages 同一解释器** 覆盖安装后再敲 `pickup`。系统 `python3 -c "import pickup"` 与 `pickup` CLI 可能不是同一份代码（2026-07-21：源码已钉底、pipx 旧包仍顶对齐）。布局、配色、预览滚动改动后也必须重启已打开的 TUI。命令见 `AGENTS.md`「本机入口」。
 - 【隐性依赖】截图验收分两类：`docs/screenshots/capture.py` 使用虚构数据，适合提交和回归；F12 截图反映真实 TUI，可能含私密对话，只能本地诊断。Textual SVG 转 PNG 可能把真彩色压成灰阶，运行时配色要以真机或卡片样式断言确认。
 - 【消歧】“运行中 / 运行中(托管) / 已结束”是终端界面的进程活性展示；它与标题模块的状态标签及机器接口英文 `status` 不是同一套语义，不能互相替换。
-- 【消歧】“对话预览”固定在右栏，旧 Space 全屏预览入口不得复活；`e` 全屏接管已删除。
+- 【消歧】“对话预览”固定在右栏，旧 Space 全屏预览入口不得复活；`e` 全屏接管已删除。默认展示最新消息（底部），不是会话开头。
 - **AI 易错点**【禁止】侧边栏选中或回车托管后自动聚焦右栏。焦点必须留在侧边栏，只有鼠标点右栏才进入内嵌交互；右栏滚轮与焦点无关。
 - 【边界】本域仅将进行中会话交给 `EmbedPane`。tmux 抓帧、控制通道、鼠标协议、主题注入和输入转发的协议细节转至“内嵌实时终端”领域，不要为改主屏而跨层复制实现。
 

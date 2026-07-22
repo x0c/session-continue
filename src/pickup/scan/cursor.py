@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,7 +28,6 @@ from pickup import titles
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
 from pickup.scan.common import (
     live_processes,
-    open_file_paths,
     process_command_line,
     process_environ,
 )
@@ -47,6 +47,55 @@ _OPEN_CHAT_STORE_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/store[.]db"
 )
+# 判活时只收集 Cursor chat 相关 fd，避免读取 agent 打开的全部文件。
+_CURSOR_FD_HINT = ".cursor/chats/"
+
+
+def _cursor_store_paths_for_pids(pids: list[int]) -> dict[int, list[str]]:
+    """只读 agent 进程中与 Cursor chat store 相关的打开路径。"""
+    if not pids:
+        return {}
+    result: dict[int, list[str]] = {}
+    if sys.platform.startswith("linux"):
+        for pid in pids:
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                names = os.listdir(fd_dir)
+            except OSError:
+                continue
+            paths: list[str] = []
+            for name in names:
+                try:
+                    path = os.readlink(os.path.join(fd_dir, name))
+                except OSError:
+                    continue
+                if _CURSOR_FD_HINT in path.replace("\\", "/"):
+                    paths.append(path)
+            if paths:
+                result[pid] = paths
+        return result
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-Fn", "-p", ",".join(str(pid) for pid in pids)],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    current: int | None = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                current = int(line[1:])
+            except ValueError:
+                current = None
+            continue
+        if current is None or current not in pids:
+            continue
+        if line.startswith("n"):
+            path = line[1:]
+            if _CURSOR_FD_HINT in path.replace("\\", "/"):
+                result.setdefault(current, []).append(path)
+    return result
 
 
 def _read_json(path: str):
@@ -292,7 +341,7 @@ def _apply_live_flags(sessions: list[dict]) -> None:
     if not agents:
         return
 
-    open_paths = open_file_paths([pid for pid, _ in agents])
+    open_paths = _cursor_store_paths_for_pids([pid for pid, _ in agents])
 
     for pid, _cwd in agents:
         resume_id = _resume_id_from_cmdline(process_command_line(pid))
@@ -385,10 +434,13 @@ def load_conversation(path: str) -> list[ConversationMessage]:
     if os.path.isfile(store_path):
         messages: list[ConversationMessage] = []
         try:
-            uri = f"file:{os.path.abspath(store_path)}?mode=ro"
+            uri = f"file:{os.path.abspath(store_path)}?mode=ro&immutable=1"
             with sqlite3.connect(uri, uri=True) as conn:
+                # 跳过二进制 DAG blob，只读 JSON 消息行（大 store.db 预览提速）。
                 rows = conn.execute(
-                    "SELECT rowid, data FROM blobs ORDER BY rowid"
+                    "SELECT rowid, data FROM blobs "
+                    "WHERE substr(data, 1, 1) = X'7B' "
+                    "ORDER BY rowid"
                 ).fetchall()
         except sqlite3.Error:
             rows = []

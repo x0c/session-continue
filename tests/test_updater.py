@@ -47,8 +47,38 @@ class ChannelDetectionTests(unittest.TestCase):
     def test_detects_dev_source_checkout(self) -> None:
         with mock.patch.object(updater.site, "getusersitepackages", return_value="/home/user/.local/lib/python3.12/site-packages"):
             with mock.patch.object(updater.site, "getsitepackages", return_value=[]):
-                with self._with_pkg_file("/Users/geraltgraham/Codes/pickup/cli/src/pickup"):
+                with self._with_pkg_file("/Users/demo/Codes/pickup/cli/src/pickup"):
                     self.assertEqual(updater.detect_channel(), "dev")
+
+    def test_find_checkout_root_and_stale_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = os.path.join(td, "cli")
+            src = os.path.join(root, "src", "pickup")
+            os.makedirs(src)
+            with open(os.path.join(root, "pyproject.toml"), "w", encoding="utf-8") as fh:
+                fh.write('[project]\nname = "pickup"\nversion = "0.0.0"\n')
+            with open(os.path.join(src, "__init__.py"), "w", encoding="utf-8") as fh:
+                fh.write("__version__ = '0.0.0'\n")
+            self.assertEqual(updater.find_checkout_root(src), root)
+            with self._with_pkg_file(src):
+                self.assertTrue(updater.is_loaded_from_checkout(root))
+                self.assertIsNone(updater.stale_source_warning(cwd=root))
+            with self._with_pkg_file(
+                "/home/u/.local/pipx/venvs/pickup/lib/python3.12/site-packages/pickup"
+            ):
+                warn = updater.stale_source_warning(cwd=root)
+                self.assertIsNotNone(warn)
+                assert warn is not None
+                self.assertIn("dev-install.sh", warn)
+                self.assertIn(root, warn)
+
+    def test_install_report_includes_paths(self) -> None:
+        report = updater.install_report()
+        self.assertIn("version", report)
+        self.assertTrue(os.path.isabs(report["package_file"]))
+        self.assertIn(report["channel"], ("brew", "pip", "dev"))
+        self.assertIn("loaded_from_checkout", report)
+        self.assertIn("stale_source_warning", report)
 
     def test_is_updatable_only_for_brew_and_pip(self) -> None:
         self.assertTrue(updater.is_updatable("brew"))

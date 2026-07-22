@@ -531,6 +531,7 @@ def cmd_diagnose(args, registry) -> dict:
     """只读诊断：缓存路径、日志是否存在、runtime 配色自检、tmux 版本。不启动 TUI。"""
     from pickup import embed
     from pickup import observe
+    from pickup import updater
     import pickup
 
     shots_dir = os.path.join(observe.CACHE_DIR, observe.SCREENSHOTS_DIR_NAME)
@@ -540,6 +541,14 @@ def cmd_diagnose(args, registry) -> dict:
         tmux_version = list(ver) if ver is not None else None
     except Exception:
         tmux_version = None
+    install = updater.install_report()
+    hints = [
+        "界面异常/闪退时先看 data.last_error（最近一次完整 traceback）",
+        "也可直接读 events.log / embed-error.log",
+        "TUI 内按 F12 导出当前截图到 screenshots_dir",
+        "开发机请用 bash scripts/dev-install.sh（editable），勿只信 python3 -c import",
+    ]
+    hints.extend(install.get("hints") or [])
     return _ok({
         "cache_dir": observe.CACHE_DIR,
         "events_log": observe.EVENTS_LOG,
@@ -551,12 +560,14 @@ def cmd_diagnose(args, registry) -> dict:
         "debug": bool(os.environ.get("PICKUP_DEBUG")),
         "runtime_label_style_claude": pickup.runtime_label_style("claude"),
         "tmux_version": tmux_version,
-        "hints": [
-            "界面异常/闪退时先看 data.last_error（最近一次完整 traceback）",
-            "也可直接读 events.log / embed-error.log",
-            "TUI 内按 F12 导出当前截图到 screenshots_dir",
-            "改源码后需 pip install --user --force-reinstall --no-deps . 并重启 TUI",
-        ],
+        "version": install["version"],
+        "package_file": install["package_file"],
+        "python": install["python"],
+        "install_channel": install["channel"],
+        "checkout_root": install["checkout_root"],
+        "loaded_from_checkout": install["loaded_from_checkout"],
+        "stale_source_warning": install["stale_source_warning"],
+        "hints": hints,
     })
 
 
@@ -702,7 +713,7 @@ COMMANDS = [
     },
     {
         "name": "diagnose",
-        "help": "只读诊断 TUI/缓存可观测性路径（events.log、embed-error.log、最近闪退、截图目录、tmux）；不启动界面",
+        "help": "只读诊断 TUI/缓存可观测性路径（events.log、embed-error.log、最近闪退、截图目录、tmux、安装路径）；不启动界面",
         "args": [],
         "fields": {
             "cache_dir": "本地缓存目录（默认 ~/.cache/pickup）",
@@ -715,6 +726,13 @@ COMMANDS = [
             "debug": "当前是否开启 PICKUP_DEBUG",
             "runtime_label_style_claude": "配色自检样例（应为 bold #D97757）",
             "tmux_version": "探测到的 tmux 版本三元组或 null",
+            "version": "当前加载的 pickup.__version__",
+            "package_file": "当前进程 import 的 pickup.__file__ 绝对路径",
+            "python": "当前解释器 sys.executable",
+            "install_channel": "安装渠道：brew / pip / dev",
+            "checkout_root": "若 cwd 落在源码树内则为该树根，否则 null",
+            "loaded_from_checkout": "package_file 是否来自 checkout_root（开发验收用）",
+            "stale_source_warning": "源码树内却加载了别处副本时的告警文案；正常为 null",
             "hints": "给 Agent/维护者的下一步排查提示",
         },
     },

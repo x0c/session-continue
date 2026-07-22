@@ -94,6 +94,31 @@ class SplitLayoutStore:
         self.last_focus_key = focus or ""
         self._reindex_group(gid)
 
+    def migrate_session_key(self, old_key: str, new_key: str) -> None:
+        """占位卡转正或重扫后会话键变化时，把分屏记忆从旧键迁到新键。"""
+        if not old_key or not new_key or old_key == new_key:
+            return
+        gid = self.session_to_group.get(old_key)
+        if not gid:
+            return
+        group = self.groups.get(gid)
+        if group is None:
+            return
+        seen: set[str] = set()
+        migrated: list[str] = []
+        for key in group.session_keys:
+            mapped = new_key if key == old_key else key
+            if mapped not in seen:
+                migrated.append(mapped)
+                seen.add(mapped)
+        group.session_keys = migrated[:MAX_PANES]
+        if group.focus_key == old_key:
+            group.focus_key = new_key
+        if self.last_focus_key == old_key:
+            self.last_focus_key = new_key
+        self._drop_sessions_from_other_groups(group.session_keys)
+        self._reindex_group(gid)
+
     def remove_session(self, session_key: str) -> None:
         """从组合中移除单个会话；组合空则删组。"""
         gid = self.session_to_group.pop(session_key, None)
@@ -177,14 +202,9 @@ def load_layout() -> SplitLayoutStore:
                 session_keys=session_keys,
                 focus_key=str(g["focus_key"]) if g.get("focus_key") else None,
             )
-    index = raw.get("session_to_group") or {}
-    if isinstance(index, dict):
-        for sk, gid in index.items():
-            if sk in store.groups or any(sk in g.session_keys for g in store.groups.values()):
-                store.session_to_group[str(sk)] = str(gid)
-    # 索引与 groups 不一致时以 groups 为准重建
+    # 磁盘上的 session_to_group 可能陈旧或与 groups 矛盾；一律以 groups 重建。
     store.session_to_group.clear()
-    for gid, group in store.groups.items():
+    for gid in store.groups:
         store._reindex_group(gid)
     return store
 
