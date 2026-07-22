@@ -8,6 +8,7 @@ import time
 from typing import Callable
 
 from pickup import embed, keepalive, titles
+from pickup.cache import get_cache
 from pickup.display import (
     _filter_sessions_by_query,
     _normalize_cwd,
@@ -462,10 +463,18 @@ class SessionStore:
             cached = self.conversations.get(key)
             if cached is not None and cached[0] == mtime:
                 return list(cached[1])
-        runtime = self.registry.get(str(session.get("source") or ""))
+        runtime_id = str(session.get("source") or "")
+        persistent = get_cache().get_conversation(runtime_id, key, path) if path else None
+        if persistent is not None:
+            with self.lock:
+                self.conversations[key] = (mtime, list(persistent))
+            return list(persistent)
+        runtime = self.registry.get(runtime_id)
         messages = runtime.load_conversation(session)
         with self.lock:
             self.conversations[key] = (mtime, list(messages))
+        if path:
+            get_cache().put_conversation(runtime_id, key, path, list(messages))
         return messages
 
     def peek_conversation(self, session: dict) -> list[ConversationMessage] | None:

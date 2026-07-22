@@ -677,6 +677,26 @@ class TranslateTextualKeyTests(unittest.TestCase):
 
 
 class ParseScreenTests(unittest.TestCase):
+    def test_native_rows_match_python_parser(self):
+        """原生热路径必须与逐格 Python 参考实现保持完全相同的可见结果。"""
+        cases = (
+            ("abc", 5, 2),
+            ("a\x1b[1;31mb\x1b[0mc", 5, 1),
+            ("\x1b[38;5;200mx\x1b[48;2;255;0;0my", 3, 1),
+            ("a好🙂e\u0301x", 9, 1),
+            ("a\x1b[2Kb\x1b(Bc", 5, 1),
+        )
+        for screen, width, height in cases:
+            with self.subTest(screen=screen, width=width, height=height):
+                expected = [embed.row_text_and_spans(row) for row in embed.parse_screen(
+                    screen, width, height,
+                )]
+                actual = embed.parse_screen_rows(screen, width, height)
+                self.assertEqual(
+                    [(row.text, list(row.spans)) for row in actual],
+                    expected,
+                )
+
     def test_plain_text_and_padding(self):
         grid = embed.parse_screen("abc", 5, 2)
         self.assertEqual("".join(c.ch for c in grid[0]), "abc  ")

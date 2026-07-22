@@ -2,49 +2,118 @@ name: release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "要同步到 Homebrew 配方的版本 tag（如 v0.3.0）"
+        description: "要发布的版本标签（如 v0.24.0）"
         required: true
 
+permissions:
+  contents: write
+
 jobs:
-  bump-homebrew-formula:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_17" }
+          - { os: ubuntu-latest, target: aarch64, manylinux: "2_17" }
+          - { os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
+          - { os: ubuntu-latest, target: aarch64, manylinux: musllinux_1_2 }
+          - { os: macos-latest, target: universal2, manylinux: auto }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: dist/*.whl
+
+  source:
     runs-on: ubuntu-latest
     steps:
-      # 不再用 mislav/bump-homebrew-formula-action：GitHub 从 2026-05-16 起
-      # tarball 端点对 HEAD 请求改答 303（原来是 302），该 action 只认严格
-      # 相等的 302，导致每次都以 "unexpected HTTP 303 response" 失败。
-      # 上游修复 PR（mislav/bump-homebrew-formula-action#342）尚未合并/发版，
-      # 改用 curl + git 直接更新配方，不依赖该 action 的重定向处理逻辑。
-      # 参考：https://github.com/mislav/bump-homebrew-formula-action/issues/340
-      - name: Bump Homebrew formula
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install 'maturin>=1.9,<2'
+      - run: maturin sdist --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: dist/*.tar.gz
+
+  github-release:
+    needs: [wheels, source]
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - id: tag
+        run: echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: dist
+          merge-multiple: true
+      - run: sha256sum dist/* > dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          generate_release_notes: true
+          files: dist/*
+
+  bump-homebrew-formula:
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bump Homebrew formula to source release
         env:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ needs.github-release.outputs.tag }}
         run: |
           set -euo pipefail
-
           version="${VERSION#v}"
           download_url="https://github.com/x0c/pickup/archive/refs/tags/${VERSION}.tar.gz"
           sha256=$(curl -fsSL "$download_url" | sha256sum | cut -d' ' -f1)
-
           git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/x0c/homebrew-tap.git" tap
           cd tap
-
           formula="Formula/pickup.rb"
           sed -i \
             -e "s#^  url \".*\"#  url \"${download_url}\"#" \
             -e "s#^  sha256 \".*\"#  sha256 \"${sha256}\"#" \
             "$formula"
-
-          if git diff --quiet -- "$formula"; then
-            echo "配方已是最新版本，无需提交"
-            exit 0
+          if ! grep -q 'depends_on "maturin" => :build' "$formula"; then
+            sed -i '/depends_on "tmux"/a\\  depends_on "maturin" => :build' "$formula"
           fi
-
+          if ! grep -q 'depends_on "rust" => :build' "$formula"; then
+            sed -i '/depends_on "maturin"/a\\  depends_on "rust" => :build' "$formula"
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("Formula/pickup.rb")
+          text = path.read_text()
+          old = "    virtualenv_install_with_resources\n"
+          new = """    venv = virtualenv_create(libexec, \"python3.12\")
+              venv.pip_install resources
+              system \"maturin\", \"build\", \"--release\", \"--interpreter\", libexec/\"bin/python\", \"--out\", \"dist\"
+              venv.pip_install Dir[\"dist/*.whl\"].first
+              bin.install_symlink libexec/\"bin/pickup\"
+          """
+          if old in text:
+              path.write_text(text.replace(old, new))
+          PY
+          if git diff --quiet -- "$formula"; then exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$formula"

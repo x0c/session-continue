@@ -69,10 +69,20 @@ def _row_to_strip(row: list) -> Strip:
     (文本, 样式段) 转成 `Segment` 列表交给 `Strip`——`Strip` 的 cell 宽度按
     Rich 自己的宽字符表自动推算，不需要在这里手动处理 CJK/emoji 占两格。
     """
-    text, spans = embed.row_text_and_spans(row)
+    if isinstance(row, embed.ParsedRow):
+        text, spans = row.text, row.spans
+    else:
+        text, spans = embed.row_text_and_spans(row)
     if not spans:
         return Strip([Segment(text)] if text else [])
     return Strip([Segment(text[start:end], style) for start, end, style in spans])
+
+
+def _row_cell_width(row) -> int:
+    """兼容 Python Cell 网格和原生解析器的预编译行，返回终端格宽度。"""
+    if isinstance(row, embed.ParsedRow):
+        return cell_len(row.text)
+    return len(row)
 
 
 # 滚轮一格滚动的行数，与旧版 PREVIEW_MOUSE_SCROLL_LINES 保持一致的手感
@@ -149,6 +159,9 @@ class EmbedPane(Widget):
         # 状态，命中即复用，不是每帧重算——这类画面刷新频率远低于托管会话本身。
         self._static_key: tuple | None = None
         self._static_strips_cache: list[Strip] | None = None
+        # 详情全文排版与“当前可见窗口”分开缓存：滚动只切片，不重新排版整段对话。
+        self._detail_full_key: tuple | None = None
+        self._detail_full_cache: list[Strip] | None = None
         self._cursor: tuple[int, int, bool] | None = None
         # 选区高亮样式缓存，键是当前主题名（主题切换时自动失效重算）；避免在
         # render_line 热路径里每行每帧都重新解析一次组件样式。
@@ -291,6 +304,8 @@ class EmbedPane(Widget):
         """
         self._static_key = None
         self._static_strips_cache = None
+        self._detail_full_key = None
+        self._detail_full_cache = None
         if self.session_name is None or self.dead or self._grid is None:
             self.refresh()
             self._schedule_detail_pin()
@@ -384,7 +399,7 @@ class EmbedPane(Widget):
                     state = last_state
                     frame_key = (generation, history_offset, pane_w, pane_h, text)
                     if frame_key != last_frame_key:
-                        grid = embed.parse_screen(text, pane_w, pane_h)
+                        grid = embed.parse_screen_rows(text, pane_w, pane_h)
                         capture_ms = int((time.perf_counter() - capture_t0) * 1000)
                         if capture_ms >= 100:
                             from pickup import observe
@@ -462,12 +477,12 @@ class EmbedPane(Widget):
         """
         old_grid = self._grid
         height = len(grid)
-        width = len(grid[0]) if grid else 0
+        width = _row_cell_width(grid[0]) if grid else 0
         same_shape = (
             old_grid is not None
             and self._strips is not None
             and len(old_grid) == height
-            and (height == 0 or len(old_grid[0]) == width)
+            and (height == 0 or _row_cell_width(old_grid[0]) == width)
         )
         if not same_shape:
             self._strips = [_row_to_strip(row) for row in grid]
@@ -644,11 +659,17 @@ class EmbedPane(Widget):
 
     def _detail_full_strips(self) -> list[Strip]:
         """把详情全文编译成完整 Strip 列表（高度不限），供窗口切片与滚动上限计算。"""
+        key = (id(self._detail_renderer), self.size.width, self.visual_style)
+        if self._detail_full_key == key and self._detail_full_cache is not None:
+            return self._detail_full_cache
         visual = visualize(self, self._static_renderable())
-        return Visual.to_strips(
+        strips = Visual.to_strips(
             self, visual, self.size.width, None, self.visual_style,
             apply_selection=False,
         )
+        self._detail_full_key = key
+        self._detail_full_cache = strips
+        return strips
 
     def _detail_max_offset(self, full_len: int | None = None) -> int:
         pane_h = max(1, self.size.height)

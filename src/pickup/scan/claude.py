@@ -16,7 +16,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
+from pickup.cache import get_cache
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.native import json_loads
 from pickup.scan.common import is_ephemeral_agent_cwd
 from pickup.scan.common import parse_timestamp as _parse_timestamp
 from pickup.scan.common import shorten_cwd as _shorten_cwd
@@ -83,8 +85,8 @@ def _read_head(path: str, max_lines: int = 300) -> list[dict]:
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
+                    obj = json_loads(line)
+                except (json.JSONDecodeError, ValueError):
                     continue
                 entries.append(obj)
     except OSError:
@@ -109,8 +111,8 @@ def _read_tail(path: str, max_bytes: int = 65536) -> list[dict]:
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
+                entries.append(json_loads(line))
+            except (json.JSONDecodeError, ValueError):
                 pass
     except OSError:
         pass
@@ -402,8 +404,8 @@ def _peek_head_meta(path: str, max_lines: int = 40) -> tuple[str | None, str | N
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
+                    obj = json_loads(line)
+                except (json.JSONDecodeError, ValueError):
                     continue
                 if cwd is None and obj.get("cwd"):
                     cwd = obj.get("cwd")
@@ -476,10 +478,14 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
         if peek_cwd and not cached_isdir(peek_cwd):
             continue  # 廉价探测已确认 cwd 不存在，跳过整文件解析
 
-        try:
-            info = _build_session_info(fpath, proj)
-        except OSError:
-            continue
+        cache = get_cache()
+        info = cache.get_session("claude", fpath)
+        if info is None:
+            try:
+                info = _build_session_info(fpath, proj)
+            except OSError:
+                continue
+            cache.put_session("claude", fpath, info)
         if not info["first_user_msg"] or info["fallback_title"] == "(仅本地命令)":
             continue  # 无用户消息的空会话
         if info["first_user_msg"].startswith(titles.PROMPT_MARKER):
@@ -530,8 +536,8 @@ def load_conversation(path: str) -> list[ConversationMessage]:
         with open(path, encoding="utf-8", errors="replace") as file:
             for line in file:
                 try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
+                    entry = json_loads(line)
+                except (json.JSONDecodeError, ValueError):
                     continue
                 if entry.get("isMeta") or entry.get("isSidechain"):
                     continue

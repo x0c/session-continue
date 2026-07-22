@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "pickup"
-version = "0.23.7"
+version = "0.24.0"
 description = "Terminal session picker and handoff tool for Claude Code, Codex CLI, OpenCode, Kimi Code CLI, and Cursor Agent CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development",
   "Topic :: Terminals",
 ]
@@ -41,8 +42,9 @@ Homepage = "https://github.com/x0c/pickup"
 Issues = "https://github.com/x0c/pickup/issues"
 
 [project.scripts]
-pickup = "pickup.cli:main"
+pickup = "pickup.bootstrap:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["pickup*"]
+[tool.maturin]
+python-source = "src"
+module-name = "pickup._native"
+features = ["pyo3/abi3-py310"]

@@ -16,7 +16,9 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
+from pickup.cache import file_signature, get_cache
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.native import json_loads
 from pickup.scan.common import is_ephemeral_agent_cwd
 from pickup.scan.common import parse_timestamp as _parse_timestamp
 from pickup.scan.common import shorten_cwd as _shorten_cwd
@@ -37,12 +39,12 @@ def _load_index() -> dict[str, str]:
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
+                    obj = json_loads(line)
                     sid = obj.get("id")
                     name = obj.get("thread_name")
                     if sid and name:
                         index[sid] = name
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     pass
     except OSError:
         pass
@@ -109,7 +111,7 @@ def _read_session_head(path: str, max_lines: int = 30) -> list[dict]:
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
+                    obj = json_loads(line)
                     entries.append(obj)
                     t = obj.get("type")
                     pt = (obj.get("payload") or {}).get("type", "")
@@ -119,7 +121,7 @@ def _read_session_head(path: str, max_lines: int = 30) -> list[dict]:
                         found_user = True
                     if found_meta and found_user:
                         break
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     pass
     except OSError:
         pass
@@ -143,8 +145,8 @@ def _read_session_tail(path: str, max_bytes: int = 8192) -> list[dict]:
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
+                entries.append(json_loads(line))
+            except (json.JSONDecodeError, ValueError):
                 pass
     except OSError:
         pass
@@ -358,6 +360,7 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     慢，实测是首屏卡顿主因之一（结果与逐次调用字节级一致）。
     """
     index = _load_index()
+    index_version = repr(file_signature(SESSION_INDEX))
     all_files = _find_all_session_files()
     live_ids = _live_session_ids()
 
@@ -380,10 +383,15 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
 
     results: list[dict] = []
     for _, path in candidates:
-        try:
-            info = _build_session_info(path, index)
-        except OSError:
-            continue
+        cache = get_cache()
+        info = cache.get_session("codex", path, index_version)
+        if info is None:
+            try:
+                info = _build_session_info(path, index)
+            except OSError:
+                continue
+            if info is not None:
+                cache.put_session("codex", path, info, index_version)
         if info is None:
             continue
         if info["thread_source"] == "subagent":
@@ -426,8 +434,8 @@ def load_conversation(path: str) -> list[ConversationMessage]:
         with open(path, encoding="utf-8", errors="replace") as file:
             for line in file:
                 try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
+                    entry = json_loads(line)
+                except (json.JSONDecodeError, ValueError):
                     continue
                 if entry.get("type") != "event_msg":
                     continue

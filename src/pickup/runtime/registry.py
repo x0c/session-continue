@@ -94,7 +94,16 @@ class RuntimeRegistry:
 
         with ThreadPoolExecutor(max_workers=max(1, len(runtimes))) as pool:
             scanned = pool.map(_scan_one, runtimes)
-        return {runtime.id: result for runtime, result in zip(runtimes, scanned)}
+            result = {runtime.id: sessions for runtime, sessions in zip(runtimes, scanned)}
+        # 扫描器只把缓存写意图放进内存队列；所有运行时完成后合成一次事务，
+        # 避免首次扫描为每条会话各做一次 SQLite 同步提交。
+        try:
+            from pickup.cache import get_cache
+
+            get_cache().flush_pending()
+        except Exception:
+            pass  # 派生缓存永远不能影响原始会话扫描结果
+        return result
 
     def build_launch_plan(self, request: LaunchRequest) -> LaunchPlan:
         source_id = str(request.session.get("source") or "")

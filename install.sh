@@ -3,7 +3,7 @@
 # 用法：curl -fsSL https://raw.githubusercontent.com/x0c/pickup/main/install.sh | bash
 set -euo pipefail
 
-REPO="x0c/pickup"
+REPO="${PICKUP_REPO:-x0c/pickup}"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "错误：未找到 python3，请先安装 Python 3.10 及以上版本" >&2
@@ -38,7 +38,52 @@ if [ -z "$VERSION" ]; then
 fi
 
 echo "正在安装 pickup ${VERSION} ..."
-python3 -m pip install --user --upgrade "git+https://github.com/${REPO}.git@${VERSION}"
+VERSION_NUMBER="${VERSION#v}"
+MACHINE=$(uname -m)
+case "$MACHINE" in
+  x86_64|amd64) ARCH="x86_64" ;;
+  arm64|aarch64) ARCH="aarch64" ;;
+  *) echo "错误：暂不支持处理器架构 ${MACHINE}" >&2; exit 1 ;;
+esac
+
+SYSTEM=$(uname -s)
+case "$SYSTEM" in
+  Darwin)
+    WHEEL_PATTERN="^pickup-${VERSION_NUMBER}-cp310-abi3-macosx_.*_universal2\\.whl$"
+    ;;
+  Linux)
+    if ldd --version 2>&1 | grep -qi musl; then
+      PLATFORM="musllinux_1_2"
+    else
+      PLATFORM="manylinux_2_17"
+    fi
+    WHEEL_PATTERN="^pickup-${VERSION_NUMBER}-cp310-abi3-${PLATFORM}_${ARCH}\\.whl$"
+    ;;
+  *)
+    echo "错误：pickup 当前只支持 macOS 与 Linux" >&2
+    exit 1
+    ;;
+esac
+
+WHEEL_URL="${PICKUP_WHEEL_URL:-}"
+if [ -z "$WHEEL_URL" ]; then
+  WHEEL_URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" \
+    | WHEEL_PATTERN="$WHEEL_PATTERN" python3 -c '
+import json, os, re, sys
+pattern = re.compile(os.environ["WHEEL_PATTERN"])
+assets = json.load(sys.stdin).get("assets", [])
+print(next((item["browser_download_url"] for item in assets
+            if pattern.match(item.get("name", ""))), ""))
+')
+fi
+
+if [ -n "$WHEEL_URL" ]; then
+  python3 -m pip install --user --upgrade "$WHEEL_URL"
+else
+  echo "未找到匹配的预编译包，正在从源码构建（需要本机 Rust 工具链）..."
+  python3 -m pip install --user --upgrade \
+    "https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"
+fi
 
 SCRIPTS_DIR="$(python3 -m site --user-base)/bin"
 case ":${PATH}:" in

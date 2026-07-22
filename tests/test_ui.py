@@ -347,7 +347,10 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 focus_key=key0,
             )
-            await _wait_until(lambda: len(area.cells()) == 2)
+            await _wait_until(
+                lambda: len(area.cells()) == 2
+                and all(cell.embed_pane() is not None for cell in area.cells()),
+            )
             keeper = area.cells()[1]
             keeper_pane = keeper.embed_pane()
             self.assertIsNotNone(keeper_pane)
@@ -1207,6 +1210,19 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(cards), 4)
             self.assertIn("claude:s99", [pickup.session_key(c.session) for c in cards])
 
+    async def test_screen_serializes_concurrent_list_rebuilds(self) -> None:
+        """后台重扫和交互刷新同时到达时，列表重建必须串行，不能重复挂载条目。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            screen = app.screen
+            await asyncio.gather(screen._rebuild_list(), screen._rebuild_list())
+
+            list_view = screen.query_one(SessionListView)
+            self.assertEqual(len(list_view.query(f"#{NEW_SESSION_ID}")), 1)
+            self.assertEqual(len(list_view._session_cards()), 3)
+
     async def test_rebuild_keeps_focus_on_same_session_when_new_session_appears(self) -> None:
         """回归测试：真实反馈——聚焦第三条会话时后台刷出一条新会话，高亮和
         右栏会跟着「串位」跳到相邻的第二条。根因是 `rebuild()` 曾用
@@ -1332,6 +1348,33 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertTrue(pane.has_focus)
                 self.assertFalse(list_view.has_focus)
+
+    async def test_stale_highlight_after_hosting_keeps_live_pane(self) -> None:
+        """托管落库早于列表重建时，旧卡片高亮事件不能把实时终端盖回静态预览。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        with mock.patch("pickup.embed.is_alive", return_value=True):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(delay=0.2)
+                await pilot.press("down")
+                await pilot.pause(delay=0.2)
+                screen = app.screen
+                list_view = screen.query_one(SessionListView)
+                area = screen.query_one(SplitPaneArea)
+                stale_session = dict(list_view.selected_session())
+                list_view._session_cards()[0].session = stale_session
+                self.assertNotIn("keepalive_name", stale_session)
+
+                store.mark_hosted("claude:s0", "pickup-claude-s0")
+                self.assertNotIn("keepalive_name", stale_session)
+                with (
+                    mock.patch.object(area, "show_hosted_group", wraps=area.show_hosted_group) as live,
+                    mock.patch.object(area, "show_single_preview", wraps=area.show_single_preview) as static,
+                ):
+                    screen._follow_current_selection()
+
+                live.assert_called_once()
+                static.assert_not_called()
 
     async def test_right_pane_wheel_scrolls_while_list_focused(self) -> None:
         """焦点在侧边栏时，鼠标在右栏滚轮仍应滚动静态预览（与焦点无关）。"""
@@ -1724,7 +1767,7 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
         registry.build_launch_plan = lambda request: LaunchPlan(
             ("bash", "-c", "printf 'CAPTURE-RECOVERY-TEST\\n'; cat"), None
         )
-        original_parse_screen = embed.parse_screen
+        original_parse_screen = embed.parse_screen_rows
         parse_calls = 0
 
         def flaky_parse_screen(*args, **kwargs):
@@ -1735,7 +1778,7 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             return original_parse_screen(*args, **kwargs)
 
         app = PickupApp(store, embed_ok=True)
-        with (mock.patch("pickup.embed.parse_screen", side_effect=flaky_parse_screen),
+        with (mock.patch("pickup.embed.parse_screen_rows", side_effect=flaky_parse_screen),
               mock.patch("pickup._log_embed_error") as log_error):
             async with app.run_test(size=(120, 30)) as pilot:
                 await pilot.pause(delay=0.2)
@@ -2207,6 +2250,20 @@ class EmbedPaneSelectionStyleTests(unittest.IsolatedAsyncioTestCase):
 class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
     """窗口缩放：行宽即时裁补；tmux resize + 抓帧必须防抖，不能拖动期狂刷。"""
 
+    def test_sync_strips_accepts_native_parsed_rows(self) -> None:
+        """原生解析器返回预编译行时，首帧和逐行更新都不能按 Cell 列表取长度。"""
+        pane = EmbedPane()
+        pane.refresh = mock.Mock()
+        first = [pickup.embed.ParsedRow("abc   ", (), 1)]
+        second = [pickup.embed.ParsedRow("abd   ", (), 2)]
+
+        pane._sync_strips(first)
+        self.assertEqual(pane._strips[0].cell_length, 6)
+        pane._sync_strips(second)
+
+        self.assertEqual(pane._strips[0].text, "abd   ")
+        self.assertEqual(pane._grid, second)
+
     def test_render_line_adjusts_cached_strip_to_current_width(self) -> None:
         from rich.segment import Segment
         from textual.strip import Strip
@@ -2659,8 +2716,9 @@ class DeleteSessionFlowTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(delay=0.3)  # worker 推弹窗 + ConfirmModal 武装
             self.assertIsInstance(app.screen, ConfirmModal)
             await pilot.press("x")
-            await pilot.pause(delay=0.2)
+            await _wait_until(lambda: not isinstance(app.screen, ConfirmModal))
             list_view = app.screen.query_one(SessionListView)
+            await _wait_until(lambda: not list_view._session_cards())
             self.assertEqual(list_view._session_cards(), [])
         claude_runtime.delete_session.assert_called_once_with(sessions[0])
         self.assertIsNone(store.find_session("claude:s0"))

@@ -32,10 +32,9 @@ _MAX_ANCESTOR_DEPTH = 20
 
 _BASE_ARGV = ("tmux", "-L", SOCKET_NAME)
 
-# tmux -f 配置内容内联在代码里，而不是仓库里独立的 .conf 文件：项目用 setuptools
-# py_modules（扁平模块，不是包）分发，只会安装 .py 文件，任何同目录下的非 .py 文件
-# 装不进去（曾用独立 keepalive.tmux.conf 实测过，pip 装完只有 keepalive.py，配置文件
-# 完全缺失，wrap_plan 在真实安装环境里会直接报 `-f` 文件不存在）。改动配置只改这个
+# tmux -f 配置内容内联在代码里，而不是仓库里独立的 .conf 文件：安装产物只包含
+# 明确纳入包的数据，独立配置不能依赖源码目录相对路径（曾用独立配置实测过，安装后
+# 文件完全缺失，wrap_plan 在真实安装环境里会直接报 `-f` 文件不存在）。改动只改这个
 # 常量即可，_ensure_config_file() 会在下次调用时自动把新内容重新落盘覆盖旧文件。
 _TMUX_CONFIG = """\
 # pickup 保活会话专用 tmux 配置：只在 `tmux -L pickup-keepalive` 这个独立 socket 上生效，

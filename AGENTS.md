@@ -54,6 +54,7 @@
 - `docs/TERMINAL_UI_KNOWLEDGE_BASE.md`：终端界面、侧边栏筛选/新建会话、对话预览（含默认钉底滚动）、右侧多分屏顶栏、分屏组合记忆、高级操作弹窗、Footer 按键、多语言文案、截图验收；排查 SSH 下 TUI 颜色失真 / 真彩降级时也读
 - `docs/EMBEDDED_TERMINAL_KNOWLEDGE_BASE.md`：内嵌实时终端、右栏托管画面（最多三格）、控制通道池、抓帧与按键转发、焦点边界/结束会话、连接中卡死
 - `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md`：会话扫描、对话预览数据、判活、扫描性能、各助手历史格式
+- `docs/PERFORMANCE_KNOWLEDGE_BASE.md`：启动、扫描、预览、终端渲染、派生缓存、原生加速、性能基准与预编译包
 - `docs/CROSS_RUNTIME_HANDOFF_KNOWLEDGE_BASE.md`：跨助手接力、高级操作、原生恢复、空白新建、启动计划与接力提示词
 - `docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md`：新增一种 AI 助手、补扫描/预览/恢复/接力/空白新建与注册验收
 - `docs/OBSERVABILITY_KNOWLEDGE_BASE.md`：事件日志、诊断、F12 截图观测、界面异常排查

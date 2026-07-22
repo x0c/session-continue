@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from pickup import keepalive
 from pickup import titles
+from pickup.cache import get_cache
 from pickup.models import format_message_time, session_key
 from pickup.runtime import LaunchError, default_registry
 from pickup.runtime.base import usable_cwd
@@ -135,6 +136,20 @@ def _resume_command(runtime, session: dict) -> str | None:
     except Exception:
         return None
     return _format_resume_command(plan.argv)
+
+
+def _load_conversation(runtime, session: dict):
+    """Agent 查询与 TUI 共用持久正文缓存；文件变化时由签名自动失效。"""
+    runtime_id = str(session.get("source") or "")
+    key = session_key(session)
+    path = str(session.get("path") or "")
+    cached = get_cache().get_conversation(runtime_id, key, path) if path else None
+    if cached is not None:
+        return cached
+    messages = runtime.load_conversation(session)
+    if path:
+        get_cache().put_conversation(runtime_id, key, path, list(messages))
+    return messages
 
 
 def _apply_fields(payload: dict, fields: list[str] | None) -> dict:
@@ -358,7 +373,7 @@ def cmd_search(args, registry) -> dict:
                 score, matched_fields = _score_quick_match(session, title, keywords)
                 results.append((score, "quick", matched_fields, runtime, session, None))
             elif args.deep:
-                messages = runtime.load_conversation(session)
+                messages = _load_conversation(runtime, session)
                 full_text = "\n".join(m.text for m in messages).lower()
                 if all(kw in full_text for kw in keywords):
                     score, matched_fields = _score_quick_match(session, title, keywords)
@@ -397,7 +412,7 @@ def cmd_show(args, registry) -> dict:
     out = getattr(args, "out", None)
     fields = _parse_fields(getattr(args, "fields", None), DEFAULT_SHOW_FIELDS if compact else None)
     payload = session_payload(session, cache, runtime)
-    messages = runtime.load_conversation(session)
+    messages = _load_conversation(runtime, session)
     total_messages = len(messages)
     if not args.full:
         n = args.messages if args.messages else 20

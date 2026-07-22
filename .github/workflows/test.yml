@@ -6,11 +6,18 @@ on:
 
 jobs:
   python:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - { os: ubuntu-latest, python-version: "3.10" }
+          - { os: ubuntu-latest, python-version: "3.11" }
+          - { os: ubuntu-latest, python-version: "3.12" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: ubuntu-latest, python-version: "3.14" }
+          - { os: macos-latest, python-version: "3.10" }
+          - { os: macos-latest, python-version: "3.14" }
 
     steps:
       - uses: actions/checkout@v4
@@ -23,3 +30,5 @@ jobs:
         run: python -m compileall -q src/pickup tests
       - name: Test
         run: python -m unittest discover -s tests -v
+      - name: Verify native accelerator
+        run: python -c "from pickup.native import available; assert available()"

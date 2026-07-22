@@ -27,7 +27,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
+from pickup.cache import get_cache
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.native import json_loads
 from pickup.scan.common import is_ephemeral_agent_cwd
 from pickup.scan.common import live_pids_by_process_name
 from pickup.scan.common import parse_timestamp as _parse_iso
@@ -99,8 +101,8 @@ def _iter_message_entries(lines):
         if _USER_EVENT_MARKER not in line and _LOOP_EVENT_MARKER not in line:
             continue
         try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
+            yield json_loads(line)
+        except (json.JSONDecodeError, ValueError):
             continue
 
 
@@ -283,7 +285,13 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     for _, session_dir, session_id in candidates:
         if len(results) >= limit:
             break
-        info = _build_session_info(session_dir, session_id)
+        wire_path = _wire_path(session_dir)
+        cache = get_cache()
+        info = cache.get_session("kimi", wire_path)
+        if info is None:
+            info = _build_session_info(session_dir, session_id)
+            if info is not None:
+                cache.put_session("kimi", wire_path, info)
         if info is None:
             continue
         if is_ephemeral_agent_cwd(info["cwd"]):

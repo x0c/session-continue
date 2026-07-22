@@ -6,6 +6,8 @@ __pycache__/
 htmlcov/
 build/
 dist/
+target/
+*.so
 .venv/
 venv/
 env/

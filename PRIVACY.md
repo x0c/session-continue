@@ -24,6 +24,13 @@ The tool reads these files to build a recent-session list, extract a compact pre
   sessions were last shown side-by-side in the right pane; session keys and project paths only).
 - Update-check state under `~/.cache/pickup/update.json` (which version you last dismissed, and on
   which day) — only written when you click "dismiss" on the update notification or run `pickup update`.
+- A bounded derived-performance database under `~/.cache/pickup/performance-cache.sqlite3`. It may
+  contain parsed session metadata and conversation preview text copied from history files that your
+  OS user can already read. Entries are keyed by exact source-file signatures and rebuilt when those
+  files change. The directory is user-only, the database is user-readable/writable, and nothing in it
+  is uploaded. Inspect it with `pickup cache status`, preview deletion with
+  `pickup cache clear --dry-run`, clear it with `pickup cache clear`, or disable it with
+  `PICKUP_CACHE=0`.
 
 It does not write to Claude Code, Codex CLI, OpenCode, or Kimi Code CLI history.
 

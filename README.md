@@ -17,7 +17,7 @@ Keywords: Claude Code session manager, Codex CLI resume, OpenCode session manage
 - Resume with the original runtime using native commands such as `claude --resume`, `codex resume`, `opencode -s <id>`, and `kimi -S <id>`, and `agent --resume`.
 - Select a finished session to preview the full conversation in the right pane (live/hosted sessions show embedded terminals instead), or keep up to three active sessions side by side.
 - Hand off unfinished work between runtimes without rewriting or faking session files.
-- Keep generated titles in a local cache so repeat launches stay fast.
+- Reuse a bounded local cache and native hot-path accelerator so repeat launches, previews, and live panes stay fast.
 - Use JSON output for scripts and launchers.
 
 ## Privacy Model
@@ -28,7 +28,7 @@ The tool is local-first.
 - It does not upload session history by itself.
 - Cross-runtime handoff passes the original history file path to the target runtime instead of copying the whole conversation into command-line arguments.
 - Optional title generation calls the preferred installed agent CLI (Claude Code first, then Codex) and may consume its account quota.
-- Title cache files are stored under `~/.cache/pickup/`.
+- Title and derived performance caches are stored under `~/.cache/pickup/`; they can be inspected or cleared locally.
 
 See [PRIVACY.md](PRIVACY.md) for the detailed privacy and data-flow notes.
 
@@ -53,7 +53,7 @@ brew install x0c/tap/pickup
 curl -fsSL https://raw.githubusercontent.com/x0c/pickup/main/install.sh | bash
 ```
 
-Requires Python 3.10+. Installs via `pip install --user` and prints a `PATH` hint if the install directory isn't already on it.
+Requires Python 3.10+. On supported macOS/Linux machines the script installs a prebuilt native wheel, falling back to a source build only when no matching wheel exists. It prints a `PATH` hint if the install directory isn't already on it.
 
 ### From Source
 
@@ -99,6 +99,8 @@ pickup -d               # enable detailed diagnostic logging
 pickup -q               # suppress non-essential startup messages
 pickup --no-color       # disable colors (also respects NO_COLOR)
 pickup update           # manually check for and install the latest version
+pickup cache status     # inspect the bounded local performance cache
+pickup cache clear      # clear derived metadata and conversation cache
 ```
 
 Common aliases are supported: `-h` / `--help`, `-v` / `-V` / `--version`,
@@ -107,6 +109,8 @@ and `-d` / `--debug` / `--verbose`.
 JSON output includes runtime, session ID, title, working directory, update time, size, status, resume command, and history path.
 
 The TUI defaults to English. If your system locale is Chinese (`zh*`), the interface switches to Chinese automatically. Force a language with `PICKUP_LANG=en` or `PICKUP_LANG=zh`.
+
+The derived cache defaults to 256 MiB and invalidates entries whenever the source history changes. Set `PICKUP_CACHE=0` to disable it, `PICKUP_CACHE_MAX_MB` to change its bound, or `PICKUP_NATIVE=0` to force the portable Python fallback for troubleshooting.
 
 ## Embedded Panes (work on multiple sessions at once)
 

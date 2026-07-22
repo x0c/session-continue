@@ -34,6 +34,7 @@ from rich.style import Style
 
 from pickup import keepalive
 from pickup.models import LaunchPlan
+from pickup.native import parse_ansi_rows as _native_parse_ansi_rows
 
 _CREATE_TIMEOUT = 5.0
 _CALL_TIMEOUT = 1.5
@@ -1108,6 +1109,62 @@ def parse_screen(text: str, width: int, height: int) -> list[list[Cell]]:
     while len(grid) < height:
         grid.append([_BLANK] * width)
     return grid
+
+
+@dataclass(frozen=True)
+class ParsedRow:
+    """终端热路径的一行：已经合并文本与样式，不再向 Python 暴露逐格对象。"""
+
+    text: str
+    spans: tuple[tuple[int, int, Style], ...]
+    fingerprint: int
+
+
+@functools.lru_cache(maxsize=4096)
+def _native_style(
+    fg: tuple[int, int, int, int],
+    bg: tuple[int, int, int, int],
+    bold: bool,
+    dim: bool,
+    underline: bool,
+    reverse: bool,
+) -> Style:
+    def colour(value: tuple[int, int, int, int]):
+        kind, a, b, c = value
+        if kind < 0:
+            return None
+        if kind == 0:
+            return Color.from_ansi(a)
+        return Color.from_rgb(a, b, c)
+
+    return Style(
+        color=colour(fg),
+        bgcolor=colour(bg),
+        bold=bold or None,
+        dim=dim or None,
+        underline=underline or None,
+        reverse=reverse or None,
+    )
+
+
+def parse_screen_rows(text: str, width: int, height: int) -> list[ParsedRow]:
+    """解析供界面直接绘制的行；优先走释放 GIL 的原生解析，自动纯 Python 回退。"""
+    raw_rows = _native_parse_ansi_rows(text, width, height)
+    if raw_rows is not None:
+        result = []
+        for row_text, raw_spans, fingerprint in raw_rows:
+            spans = tuple(
+                (start, end, _native_style(fg, bg, bold, dim, underline, reverse))
+                for start, end, fg, bg, bold, dim, underline, reverse in raw_spans
+            )
+            result.append(ParsedRow(row_text, spans, fingerprint))
+        return result
+
+    result = []
+    for row in parse_screen(text, width, height):
+        row_text, spans = row_text_and_spans(row)
+        result.append(ParsedRow(row_text, tuple(spans), hash(tuple(row))))
+    return result
 
 
 # ---------------------------------------------------------------------------

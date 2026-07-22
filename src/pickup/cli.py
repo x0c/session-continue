@@ -236,7 +236,8 @@ def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
 
     # 与 main() 的 TUI 入口相同：趁 Textual 接管终端前探测外层终端前景/背景色，
     # 供内嵌面板聚焦时经 refresh-client -r 注入托管 pane
-    theme_mod._OSC_REPORT = pkg._probe_osc_colours()
+    # 颜色应答通常在数毫秒内到达；不应答的终端不能再阻塞首屏 1.2 秒。
+    theme_mod._OSC_REPORT = pkg._probe_osc_colours(timeout=0.06)
 
     from pickup.ui.app import run_app
     chosen = run_app(store, True, _DirectLaunch(plan, runtime_id, ident), theme_mod._OSC_REPORT)
@@ -386,7 +387,8 @@ def main() -> None:
     # refresh-client -r 注入托管 pane，让 pane 内 agent 的深/浅主题检测拿到真实值。
     # 这一步仍然必须在 UI 启动前同步完成（EmbedPane/MainScreen 的深浅色主题判断
     # 依赖它），但现在跟上面的后台扫描线程是并行的，不再是"扫描 + 探测"首尾相加。
-    theme_mod._OSC_REPORT = _probe_osc_colours()
+    # 首屏优先：终端若 60ms 内不应答就用默认主题，避免把协议超时暴露成启动卡顿。
+    theme_mod._OSC_REPORT = _probe_osc_colours(timeout=0.06)
     observe.init(debug=bool(os.environ.get("PICKUP_DEBUG")))
     # 在源码树里开发却加载了 pipx/site-packages 副本时，启动前打一次 stderr 告警
     # （普通发行版用户 cwd 不在仓库内，不会触发）。

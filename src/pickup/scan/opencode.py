@@ -17,6 +17,7 @@ from itertools import groupby
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
 from pickup.models import ConversationMessage, format_message_time
+from pickup.native import json_loads
 from pickup.scan.common import live_pids_by_process_name, shorten_cwd as _shorten_cwd
 
 DB_FILENAME = "opencode.db"
@@ -97,8 +98,8 @@ def _status_tag(last_msg_data: str | None) -> str:
     if not last_msg_data:
         return titles.STATUS_NONE
     try:
-        msg = json.loads(last_msg_data)
-    except json.JSONDecodeError:
+        msg = json_loads(last_msg_data)
+    except (json.JSONDecodeError, ValueError):
         return titles.STATUS_NONE
     if not isinstance(msg, dict):
         return titles.STATUS_NONE
@@ -272,8 +273,8 @@ def load_conversation(db_path: str, session_id: str) -> list[ConversationMessage
     for _, group_iter in groupby(rows, key=lambda r: r["message_id"]):
         group = list(group_iter)
         try:
-            msg = json.loads(group[0]["msg_data"]) or {}
-        except json.JSONDecodeError:
+            msg = json_loads(group[0]["msg_data"]) or {}
+        except (json.JSONDecodeError, ValueError):
             continue
         if not isinstance(msg, dict):
             continue
@@ -284,8 +285,8 @@ def load_conversation(db_path: str, session_id: str) -> list[ConversationMessage
         texts = []
         for r in group:
             try:
-                part = json.loads(r["part_data"]) or {}
-            except json.JSONDecodeError:
+                part = json_loads(r["part_data"]) or {}
+            except (json.JSONDecodeError, ValueError):
                 continue
             text = str(part.get("text") or "").strip()
             if text:

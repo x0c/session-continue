@@ -25,7 +25,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pickup import titles
+from pickup.cache import file_signature, get_cache
 from pickup.models import ConversationMessage, effective_session_time, format_message_time
+from pickup.native import json_loads
 from pickup.scan.common import (
     is_ephemeral_agent_cwd,
     live_processes,
@@ -248,7 +250,17 @@ def scan_sessions(cwd_filter: str | None = None, limit: int = 50) -> list[dict]:
     for _, chat_dir, chat_id in candidates:
         if len(results) >= limit:
             break
-        info = _build_session_info(chat_dir, chat_id)
+        meta_path = os.path.join(chat_dir, "meta.json")
+        extra_version = repr((
+            file_signature(os.path.join(chat_dir, "prompt_history.json")),
+            file_signature(os.path.join(chat_dir, "store.db")),
+        ))
+        cache = get_cache()
+        info = cache.get_session("cursor", meta_path, extra_version)
+        if info is None:
+            info = _build_session_info(chat_dir, chat_id)
+            if info is not None:
+                cache.put_session("cursor", meta_path, info, extra_version)
         if info is None:
             continue
         if is_ephemeral_agent_cwd(info["cwd"]):
@@ -454,8 +466,8 @@ def load_conversation(path: str) -> list[ConversationMessage]:
             if not raw.startswith(b"{"):
                 continue
             try:
-                obj = json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                obj = json_loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                 continue
             if not isinstance(obj, dict):
                 continue
