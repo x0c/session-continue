@@ -66,6 +66,23 @@ async def _wait_for_embed_pane(screen) -> EmbedPane:
     return _primary_embed_pane(screen)
 
 
+async def _wait_for_embed_session(
+    screen, session_name: str, *, tries: int = 500, interval: float = 0.01,
+) -> EmbedPane:
+    """右栏异步替换格子时反复取当前 Widget，直到它已绑定目标托管会话。"""
+    for _ in range(tries):
+        try:
+            pane = _primary_embed_pane(screen)
+        except AssertionError:
+            pane = None
+        if pane is not None and pane.session_name == session_name:
+            return pane
+        await asyncio.sleep(interval)
+    raise AssertionError(
+        f"等待 {tries * interval:.2f}s 后仍未挂载托管会话：{session_name}"
+    )
+
+
 
 async def _wait_until(predicate, *, tries: int = 200, interval: float = 0.01) -> None:
     """等待后台 worker 达到断言条件，避免用固定长延迟放慢整套界面测试。"""
@@ -421,7 +438,7 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.screen._session_is_active(sessions[0]))  # noqa: SLF001
 
     async def test_reconcile_split_keys_after_provisional_becomes_real(self) -> None:
-        """占位卡转正后 session_key 变化，分屏记忆不得被 prune 清掉。"""
+        """占位卡转正后，分屏和侧边栏选择都必须迁移到真实会话。"""
         provisional_id = "abcd1234"
         real_id = "real-session-uuid"
         kname = "pickup-claude-abcd1234"
@@ -441,23 +458,36 @@ class AppThemeTests(unittest.IsolatedAsyncioTestCase):
         old_key = pickup.session_key(provisional)
         new_key = pickup.session_key(real)
         app = PickupApp(store, embed_ok=True)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause(delay=0.2)
-            area = app.screen.query_one(SplitPaneArea)
-            app.screen._split_store.set_group("/tmp", [old_key], focus_key=old_key)  # noqa: SLF001
-            with mock.patch("pickup.embed.is_alive", return_value=True):
-                area.show_hosted_group(
-                    "/tmp",
-                    [(provisional, kname, lambda: "")],
-                    focus_key=old_key,
-                )
-                store.sessions["claude"] = [real]
-                store.hosted[new_key] = kname
-                app.screen._reconcile_split_session_keys()  # noqa: SLF001
-                group = app.screen._split_store.get_group(new_key)  # noqa: SLF001
-                self.assertIsNotNone(group)
-                self.assertEqual(group.session_keys, [new_key])
-                self.assertEqual(area.pane_specs()[0].session_key, new_key)
+        # 本测手动模拟一次扫描替换；禁止后台定时重扫把 fixture 又写回占位卡。
+        with mock.patch.object(store, "refresh", return_value=False):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(delay=0.2)
+                area = app.screen.query_one(SplitPaneArea)
+                app.screen._split_store.set_group("/tmp", [old_key], focus_key=old_key)  # noqa: SLF001
+                with mock.patch("pickup.embed.is_alive", return_value=True):
+                    area.show_hosted_group(
+                        "/tmp",
+                        [(provisional, kname, lambda: "")],
+                        focus_key=old_key,
+                    )
+                    list_view = app.screen.query_one(SessionListView)
+                    await list_view.rebuild(select_key=old_key)
+                    self.assertEqual(
+                        pickup.session_key(list_view.selected_session()), old_key
+                    )
+                    store.sessions["claude"] = [real]
+                    store._order = [new_key]  # noqa: SLF001 — 模拟重扫把占位卡替换成真实卡
+                    store.hosted[new_key] = kname
+                    await app.screen._rebuild_list()  # noqa: SLF001
+                    group = app.screen._split_store.get_group(new_key)  # noqa: SLF001
+                    self.assertIsNotNone(group)
+                    self.assertEqual(group.session_keys, [new_key])
+                    self.assertEqual(area.pane_specs()[0].session_key, new_key)
+                    self.assertEqual(
+                        pickup.session_key(list_view.selected_session()), new_key,
+                        "占位卡转成真实卡后仍应选中同一份运行中会话",
+                    )
+                    self.assertEqual(area.ordered_session_keys(), [new_key])
 
     async def test_resize_full_repaint_is_debounced(self) -> None:
         """连续缩放手势只在停稳后触发一次整屏全量重绘，不能每次尺寸变化都狂刷。"""
@@ -1279,7 +1309,10 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
         store, registry = _make_store()
         registry.build_launch_plan = lambda request: LaunchPlan(("claude",), None)
         app = PickupApp(store, embed_ok=True)
-        with mock.patch("pickup.embed.host_session", return_value="pickup-claude-s0"):
+        with (
+            mock.patch("pickup.embed.host_session", return_value="pickup-claude-s0"),
+            mock.patch("pickup.embed.is_alive", return_value=True),
+        ):
             async with app.run_test(size=(120, 30)) as pilot:
                 await pilot.pause(delay=0.2)
                 list_view = app.screen.query_one(SessionListView)
@@ -1287,11 +1320,14 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("down")
                 await pilot.press("enter")
                 await _wait_until(lambda: app.screen._host_pending == 0)
-                pane = await _wait_for_embed_pane(app.screen)
-                await _wait_until(lambda: pane.session_name == "pickup-claude-s0")
+                pane = await _wait_for_embed_session(app.screen, "pickup-claude-s0")
                 self.assertTrue(list_view.has_focus)
                 self.assertFalse(pane.has_focus)
 
+                # 托管成功后列表重建仍可能排在下一帧；等 DOM 稳定并重新取当前 pane，
+                # 避免点击刚被替换掉的旧 Widget。
+                await pilot.pause(delay=0.2)
+                pane = await _wait_for_embed_session(app.screen, "pickup-claude-s0")
                 await pilot.click(pane)
                 await pilot.pause()
                 self.assertTrue(pane.has_focus)
@@ -1398,7 +1434,10 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
         registry.build_new_session_plan = lambda request: LaunchPlan(("claude",), "/tmp")
         app = PickupApp(store, embed_ok=True)
 
-        with mock.patch("pickup.embed.host_session", return_value="pickup-claude-new"):
+        with (
+            mock.patch("pickup.embed.host_session", return_value="pickup-claude-new"),
+            mock.patch("pickup.embed.is_alive", return_value=True),
+        ):
             async with app.run_test(size=(120, 30)) as pilot:
                 await pilot.pause(delay=0.2)
                 app.screen._embed_open(
@@ -1406,9 +1445,6 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
                     add_pane=False,
                 )
                 await _wait_until(lambda: app.screen._host_pending == 0)
-                pane = await _wait_for_embed_pane(app.screen)
-                # 共享机/全量套件负载下 2s 偶发不够：host worker 已完成但 focus 回调排队稍晚。
-                await _wait_until(lambda: pane.session_name == "pickup-claude-new", tries=500)
                 await _wait_until(
                     lambda: any(
                         s.get("keepalive_name") == "pickup-claude-new"
@@ -1416,6 +1452,7 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     tries=500,
                 )
+                await _wait_for_embed_session(app.screen, "pickup-claude-new")
 
     async def test_cross_runtime_handoff_shows_hosted_card_and_keeps_embed(self) -> None:
         """回归：Claude→Cursor 接力后左栏立刻出现托管卡，右栏保持新 embed。
@@ -1435,7 +1472,12 @@ class MainScreenHostWorkerTests(unittest.IsolatedAsyncioTestCase):
         registry.build_launch_plan = lambda request: LaunchPlan(("agent", "--force", "prompt"), "/tmp")
         app = PickupApp(store, embed_ok=True)
 
-        with mock.patch("pickup.embed.host_session", return_value="pickup-cursor-handoff") as host_mock:
+        with (
+            mock.patch(
+                "pickup.embed.host_session", return_value="pickup-cursor-handoff"
+            ) as host_mock,
+            mock.patch("pickup.embed.is_alive", return_value=True),
+        ):
             async with app.run_test(size=(120, 30)) as pilot:
                 await pilot.pause(delay=0.2)
                 pane = _primary_embed_pane(app.screen)
@@ -2300,6 +2342,19 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
             self._hosted_names.append(pane.session_name)
             await _wait_for_pane_text(pane, "DIRECT-HELLO")
             self.assertTrue(pane.has_focus)
+
+            await _wait_until(lambda: store.find_session("claude:directtest01") is not None)
+            provisional = store.find_session("claude:directtest01")
+            self.assertIsNotNone(provisional)
+            self.assertTrue(provisional["provisional"])
+            self.assertTrue(provisional["live"])
+            self.assertEqual(provisional["keepalive_name"], pane.session_name)
+            self.assertEqual(provisional["fallback_title"], "新Claude会话")
+            self.assertEqual(provisional["cwd"], os.getcwd())
+            self.assertIn(
+                "claude:directtest01",
+                [pickup.session_key(session) for session in store.all_sessions()],
+            )
 
             await pilot.press(*"x")
             await _wait_for_pane_text(pane, "x")
