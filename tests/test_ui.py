@@ -84,8 +84,8 @@ async def _wait_for_embed_session(
 
 
 
-async def _wait_until(predicate, *, tries: int = 200, interval: float = 0.01) -> None:
-    """等待后台 worker 达到断言条件，避免用固定长延迟放慢整套界面测试。"""
+async def _wait_until(predicate, *, tries: int = 500, interval: float = 0.01) -> None:
+    """等待后台 worker 达到断言条件；成功立即返回，慢速 Runner 最多等五秒。"""
     for _ in range(tries):
         if predicate():
             return
@@ -2390,7 +2390,10 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
 
         app = PickupApp(store, embed_ok=True, direct=direct)
         async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause(delay=0.2)
+            area = app.screen.query_one(SplitPaneArea)
+            await _wait_until(
+                lambda: any(cell.embed_pane() is not None for cell in area.cells()),
+            )
             pane = _primary_embed_pane(app.screen)
             # embed.host_session 现在跑在后台 worker 里（见 _host_direct_worker），
             # 不再保证固定延迟内一定完成，轮询等待比死等更稳。
@@ -2398,7 +2401,7 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(pane.session_name)
             self._hosted_names.append(pane.session_name)
             await _wait_for_pane_text(pane, "DIRECT-HELLO")
-            self.assertTrue(pane.has_focus)
+            await _wait_until(lambda: pane.has_focus)
 
             await _wait_until(lambda: store.find_session("claude:directtest01") is not None)
             provisional = store.find_session("claude:directtest01")
