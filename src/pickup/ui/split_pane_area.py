@@ -52,34 +52,38 @@ class _PaneClose(Static):
         self._on_close()
 
 
+# 活跃格顶/底高亮色：主题变量 = $primary-muted 再提亮约 10%（见 app.py），
+# 比纯 muted 更好辨认，仍避免高饱和蓝条抢过内嵌内容。
+_ACTIVE_PANE_BG = "$pane-active-background"
+
+
 class _PaneHeader(Horizontal):
     ALLOW_SELECT = False
 
-    DEFAULT_CSS = """
-    _PaneHeader {
+    DEFAULT_CSS = f"""
+    _PaneHeader {{
         height: 1;
         width: 1fr;
         margin: 0;
         padding: 0;
         color: auto 90%;
         background: $surface;
-    }
-    _PaneHeader.-active {
+    }}
+    _PaneHeader.-active {{
         color: auto 90%;
-        /* 活跃格用主色弱化底，避免整条高饱和蓝条抢过内嵌内容 */
-        background: $primary-muted;
-    }
-    _PaneHeader.-active _PaneClose {
+        background: {_ACTIVE_PANE_BG};
+    }}
+    _PaneHeader.-active _PaneClose {{
         color: auto 90%;
-    }
-    _PaneHeader Static.title {
+    }}
+    _PaneHeader Static.title {{
         width: 1fr;
         height: 1;
         content-align: left middle;
         margin: 0;
         padding: 0;
         text-overflow: ellipsis;
-    }
+    }}
     """
 
     def __init__(
@@ -105,8 +109,33 @@ class _PaneHeader(Horizontal):
         self.set_class(active, "-active")
 
 
+class _PaneFooter(Static):
+    """分栏底条：无文字，仅与标题栏同步高亮当前激活格。"""
+
+    ALLOW_SELECT = False
+
+    DEFAULT_CSS = f"""
+    _PaneFooter {{
+        height: 1;
+        width: 1fr;
+        margin: 0;
+        padding: 0;
+        background: $surface;
+    }}
+    _PaneFooter.-active {{
+        background: {_ACTIVE_PANE_BG};
+    }}
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+
+    def set_active(self, active: bool) -> None:
+        self.set_class(active, "-active")
+
+
 class PaneCell(Vertical):
-    """单格：标题栏 + EmbedPane。"""
+    """单格：标题栏 + EmbedPane + 底条高亮。"""
 
     ALLOW_SELECT = False
 
@@ -156,6 +185,7 @@ class PaneCell(Vertical):
             osc_report=self._osc_report,
             id=f"embed-{self.spec.cell_id}",
         )
+        yield _PaneFooter(classes="footer")
 
     def on_mount(self) -> None:
         self.call_after_refresh(self._start_session)
@@ -185,6 +215,13 @@ class PaneCell(Vertical):
                 return child
         return None
 
+    def _pane_footer(self) -> _PaneFooter | None:
+        """与标题栏同：重建中间态可能尚未挂上或已卸下。"""
+        for child in self.children:
+            if isinstance(child, _PaneFooter):
+                return child
+        return None
+
     def set_title(self, title: str) -> None:
         self._title = title
         header = self._pane_header()
@@ -209,13 +246,16 @@ class PaneCell(Vertical):
         self._on_pane_focused(self.spec.session_key)
 
     def _sync_active_marker(self) -> None:
-        # 双击顶栏助手、快速增删分栏时，焦点回调可能落在「标题栏尚未 compose
-        # / 旧格已卸下」的中间态；真机复现：NoMatches: '_PaneHeader'。缺标题栏
-        # 时静默跳过即可，下一轮焦点事件会再同步。
+        # 双击顶栏助手、快速增删分栏时，焦点回调可能落在「标题栏/底条尚未 compose
+        # / 旧格已卸下」的中间态；真机复现：NoMatches: '_PaneHeader'。缺件时
+        # 静默跳过即可，下一轮焦点事件会再同步。
+        active = self.has_focus_within
         header = self._pane_header()
-        if header is None:
-            return
-        header.set_active(self.has_focus_within)
+        if header is not None:
+            header.set_active(active)
+        footer = self._pane_footer()
+        if footer is not None:
+            footer.set_active(active)
 
 
 class SplitPaneArea(Vertical):

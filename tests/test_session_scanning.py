@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -2540,8 +2541,9 @@ class ProjectSidebarTests(unittest.TestCase):
         self.assertEqual(groups[0]["count"], 2)
 
     def test_session_store_projects_resolves_project_groups(self) -> None:
-        """SessionStore.projects 必须能调用 _project_groups，不能 NameError 闪退。"""
+        """SessionStore.projects 合并会话 cwd（并可扫 git 根），不能 NameError 闪退。"""
         from pickup.store import SessionStore
+        from pickup import projects as projects_mod
 
         runtime = mock.Mock(id="claude", display_name="Claude")
         runtime.scan_signature.return_value = None
@@ -2554,7 +2556,10 @@ class ProjectSidebarTests(unittest.TestCase):
         store.sessions = {
             "claude": [{"cwd": "/proj/a", "mtime": 3}, {"cwd": "/proj/b", "mtime": 1}],
         }
-        groups = store.projects()
+        # 跳过真实家目录 git 扫描，只断言会话源聚合。
+        with mock.patch.dict(os.environ, {"PICKUP_PROJECT_ROOTS": ""}):
+            projects_mod.clear_filesystem_cache()
+            groups = store.projects()
         self.assertEqual([g["cwd_key"] for g in groups], ["/proj/a", "/proj/b"])
         self.assertEqual(groups[0]["count"], 1)
 
@@ -2674,7 +2679,11 @@ class TmuxRequirementTests(unittest.TestCase):
 
 
 class DirectLaunchTests(unittest.TestCase):
-    """`pickup claude [参数…]` / `pickup codex [参数…]` 直启透传子命令的分发逻辑。"""
+    """`pickup claude [参数…]` / `pickup codex [参数…]` 直启透传子命令的分发逻辑。
+
+    裸位置参数已改为项目名匹配（见 test_projects.DirectLaunchProjectTests）；
+    透传用例的首参必须以 `-` 开头。
+    """
 
     def _registry_returning(self, plan: LaunchPlan) -> mock.Mock:
         registry = mock.Mock()
@@ -2682,38 +2691,44 @@ class DirectLaunchTests(unittest.TestCase):
         return registry
 
     def test_passes_through_args_and_wraps_with_keepalive_by_default(self) -> None:
-        plan = LaunchPlan(("claude", "--dangerously-skip-permissions", "把测试修到全绿"), None)
+        plan = LaunchPlan(("claude", "--dangerously-skip-permissions", "--print", "hi"), None)
         wrapped = LaunchPlan(("tmux", "-L", "pickup-keepalive", "new-session", "-A", "-s", "sc-claude-xxxx"), None)
         registry = self._registry_returning(plan)
 
         with (
             mock.patch.object(pickup, "keepalive") as keepalive_mock,
             mock.patch.object(pickup, "execute_launch") as execute_launch,
+            mock.patch.object(pickup, "_require_tmux"),
+            mock.patch.object(pickup.sys.stdin, "isatty", return_value=False),
+            mock.patch.object(pickup.sys.stdout, "isatty", return_value=False),
         ):
             keepalive_mock.enabled.return_value = True
             keepalive_mock.new_session_ident.return_value = "xxxx"
             keepalive_mock.wrap_plan.return_value = wrapped
 
-            pickup._dispatch_direct_launch(["claude", "把测试修到全绿"], registry)
+            pickup._dispatch_direct_launch(["claude", "--print", "hi"], registry)
 
-        registry.build_passthrough_plan.assert_called_once_with("claude", ["把测试修到全绿"])
+        registry.build_passthrough_plan.assert_called_once_with("claude", ["--print", "hi"])
         keepalive_mock.enabled.assert_called_once_with(False)
         keepalive_mock.wrap_plan.assert_called_once_with(plan, "claude", "xxxx")
         execute_launch.assert_called_once_with(wrapped)
 
     def test_no_keepalive_prefix_strips_flag_and_skips_wrap(self) -> None:
-        plan = LaunchPlan(("codex", "--dangerously-bypass-approvals-and-sandbox", "resume"), None)
+        plan = LaunchPlan(("codex", "--dangerously-bypass-approvals-and-sandbox", "--resume", "x"), None)
         registry = self._registry_returning(plan)
 
         with (
             mock.patch.object(pickup, "keepalive") as keepalive_mock,
             mock.patch.object(pickup, "execute_launch") as execute_launch,
+            mock.patch.object(pickup, "_require_tmux"),
+            mock.patch.object(pickup.sys.stdin, "isatty", return_value=False),
+            mock.patch.object(pickup.sys.stdout, "isatty", return_value=False),
         ):
             keepalive_mock.enabled.return_value = False
 
-            pickup._dispatch_direct_launch(["--no-keepalive", "codex", "resume"], registry)
+            pickup._dispatch_direct_launch(["--no-keepalive", "codex", "--resume", "x"], registry)
 
-        registry.build_passthrough_plan.assert_called_once_with("codex", ["resume"])
+        registry.build_passthrough_plan.assert_called_once_with("codex", ["--resume", "x"])
         keepalive_mock.enabled.assert_called_once_with(True)
         keepalive_mock.wrap_plan.assert_not_called()
         execute_launch.assert_called_once_with(plan)
@@ -2725,6 +2740,9 @@ class DirectLaunchTests(unittest.TestCase):
         with (
             mock.patch.object(pickup, "keepalive") as keepalive_mock,
             mock.patch.object(pickup, "execute_launch", side_effect=pickup.LaunchError("未找到 claude 命令")),
+            mock.patch.object(pickup, "_require_tmux"),
+            mock.patch.object(pickup.sys.stdin, "isatty", return_value=False),
+            mock.patch.object(pickup.sys.stdout, "isatty", return_value=False),
         ):
             keepalive_mock.enabled.return_value = False
 
@@ -2747,6 +2765,7 @@ class DirectLaunchTests(unittest.TestCase):
             mock.patch.object(pickup, "SessionStore") as store_cls,
             mock.patch.object(pickup, "_spawn_title_daemon"),
             mock.patch.object(pickup, "_probe_osc_colours", return_value=None),
+            mock.patch.object(pickup, "_require_tmux"),
             mock.patch("pickup.ui.app.run_app", return_value=None) as run_app,
             mock.patch.object(pickup.embed, "close_channel"),
             mock.patch.object(pickup, "execute_launch") as execute_launch,
@@ -3402,6 +3421,61 @@ class CursorScanTests(unittest.TestCase):
         self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --resume=-1"))
         self.assertIsNone(scan_cursor._resume_id_from_cmdline("agent --force"))
 
+    def test_live_flags_prefer_blank_host_over_secondary_resume(self) -> None:
+        """同一 chat 并存无 resume 托管与二次 --resume 时，live pid 绑前者。
+
+        否则 annotate 会挂到 pickup-cursor-<uuid>，占位卡 pickup-cursor-<8位>
+        退不掉，侧边栏双卡。
+        """
+        from pickup.scan import cursor as scan_cursor
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = str(root / "proj")
+            Path(cwd).mkdir()
+            chat_id = "cdadd85a-bdf5-4d65-bb52-92e8f2a84b60"
+            self._chat(
+                root,
+                "ws1",
+                chat_id,
+                title="Pickup Session Issue",
+                cwd=cwd,
+                updated_ms=1_700_000_000_000,
+                prompts=["奇怪的现象"],
+            )
+            real_cwd = os.path.realpath(cwd)
+            blank_pid = 3294260
+            resume_pid = 3306659
+            agents = [
+                (resume_pid, real_cwd),  # 故意把 resume 放前面，确保不是靠遍历顺序
+                (blank_pid, real_cwd),
+            ]
+            cmdlines = {
+                blank_pid: "/Users/x/.local/bin/agent --force",
+                resume_pid: f"/Users/x/.local/bin/agent --force --resume {chat_id}",
+            }
+            open_paths = {
+                blank_pid: [f"/Users/x/.cursor/chats/ws1/{chat_id}/store.db"],
+                resume_pid: [f"/Users/x/.cursor/chats/ws1/{chat_id}/store.db"],
+            }
+
+            with mock.patch.object(scan_cursor, "CHATS_DIR", str(root)), mock.patch.object(
+                scan_cursor, "live_processes", return_value=agents
+            ), mock.patch.object(
+                scan_cursor,
+                "process_command_line",
+                side_effect=lambda pid: cmdlines[pid],
+            ), mock.patch.object(
+                scan_cursor, "_cursor_store_paths_for_pids", return_value=open_paths
+            ), mock.patch.object(
+                scan_cursor, "process_environ", return_value={}
+            ):
+                sessions = scan_cursor.scan_sessions(limit=10)
+
+            self.assertEqual(len(sessions), 1)
+            self.assertTrue(sessions[0]["live"])
+            self.assertEqual(sessions[0]["pid"], blank_pid)
+
     def test_chat_ids_from_open_paths_dedupes_wal_shm(self) -> None:
         from pickup.scan import cursor as scan_cursor
 
@@ -3413,6 +3487,63 @@ class CursorScanTests(unittest.TestCase):
             "/Users/x/.cursor/chats/ws/other/meta.json",
         ]
         self.assertEqual(scan_cursor._chat_ids_from_open_paths(paths), [chat_id])
+
+    def test_is_cursor_agent_cmdline_accepts_wrapper_skips_worker(self) -> None:
+        """Cursor agent 判活必须认 wrapper/cmdline，并排除 worker-server。"""
+        from pickup.scan.common import is_cursor_agent_cmdline
+
+        self.assertTrue(
+            is_cursor_agent_cmdline(
+                "/home/u/.local/bin/agent --use-system-ca "
+                "/home/u/.local/share/cursor-agent/versions/2026.07.20/index.js --force"
+            )
+        )
+        self.assertTrue(
+            is_cursor_agent_cmdline(
+                "/home/u/.local/share/cursor-agent/versions/x/node "
+                "/home/u/.local/share/cursor-agent/versions/x/index.js --force "
+                "--resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+        )
+        self.assertFalse(
+            is_cursor_agent_cmdline(
+                "/home/u/.local/share/cursor-agent/versions/x/node "
+                "/home/u/.local/share/cursor-agent/versions/x/index.js worker-server"
+            )
+        )
+        self.assertFalse(is_cursor_agent_cmdline("claude --resume x"))
+        self.assertFalse(is_cursor_agent_cmdline(""))
+
+    def test_live_processes_agent_finds_mainthread_renamed_process(self) -> None:
+        """comm 被改成 MainThread 时 pgrep -x agent 为空，仍须按 cmdline 找到 agent。
+
+        真机（2026-07-23）：Cursor agent 的 /proc/pid/comm=MainThread，侧边栏
+        live 全灭 → 占位卡无法退役 → 同一会话双卡（临时 id + 真实 UUID）。
+        """
+        from pickup.scan import common
+
+        agent_pid = 424242
+        cwd = "/tmp/pickup-agent-live-test"
+
+        def fake_check_output(argv, **kwargs):
+            if argv[:2] == ["pgrep", "-x"]:
+                raise subprocess.CalledProcessError(1, argv)
+            raise AssertionError(f"unexpected check_output: {argv}")
+
+        with mock.patch.object(
+            common.subprocess, "check_output", side_effect=fake_check_output
+        ), mock.patch.object(
+            common, "_cursor_agent_pids_by_cmdline", return_value=[agent_pid]
+        ), mock.patch.object(
+            common.os, "readlink", return_value=cwd
+        ), mock.patch.object(
+            common.sys, "platform", "linux"
+        ), mock.patch.object(
+            common.os.path, "realpath", side_effect=lambda p: p
+        ):
+            found = common.live_processes("agent")
+
+        self.assertEqual(found, [(agent_pid, cwd)])
 
 
 class DeleteSessionScanTests(unittest.TestCase):

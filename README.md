@@ -158,22 +158,28 @@ around when their content updates; only genuinely new sessions appear, always pr
 
 ## Direct Launch
 
-`pickup claude [args...]`, `pickup codex [args...]`, `pickup opencode [args...]`, and
-`pickup kimi [args...]`, and `pickup cursor [args...]` start a brand-new session
-directly. In a real terminal they open the same sidebar TUI with the new session already hosted and
-focused in the right-hand pane, so you can type immediately; outside a real
-terminal (piped/scripted) or with `--no-keepalive` they take over the terminal the classic way
-instead. Everything after the runtime name is passed through unchanged to the
-underlying command; `pickup` only prepends the runtime's auto-approve flag
-(`--dangerously-skip-permissions` for Claude, `--dangerously-bypass-approvals-and-sandbox` for Codex,
-`-y` for Kimi)
-unless you already included it yourself, and hosts the session with
-[Keep-Alive](#keep-alive-survive-ssh-disconnects) either way.
+`pickup claude [args...]`, `pickup codex [args...]`, `pickup opencode [args...]`,
+`pickup kimi [args...]`, and `pickup cursor [args...]` start a brand-new session.
+In a real terminal they open the same sidebar TUI with the new session already hosted and
+focused in the right-hand pane; outside a real terminal (piped/scripted) or with
+`--no-keepalive` they take over the terminal the classic way instead.
+
+Two forms after the runtime name:
+
+1. **Project shortcut** — first argument does **not** start with `-` (e.g. `pickup claude subswap`):
+   fuzzy-match a local project (session history cwds ∪ git roots under `$HOME`, overridable with
+   `PICKUP_PROJECT_ROOTS`), then open a blank session in that directory. Multiple matches → numbered
+   picker. Extra args after the project name are rejected.
+2. **Passthrough** — no args, or first arg starts with `-` (e.g. `pickup claude --resume id`):
+   remaining args go straight to the underlying CLI; `pickup` only prepends the runtime's
+   auto-approve flag unless you already included it, and hosts with
+   [Keep-Alive](#keep-alive-survive-ssh-disconnects).
 
 ```bash
-pickup claude                       # blank auto-approved Claude session, hosted in the sidebar TUI
-pickup claude Fix the failing tests # same, with a first instruction passed straight to claude
-pickup codex resume                 # `codex resume`, auto-approved and hosted in the TUI
+pickup claude                       # blank Claude session in the current directory (TUI-hosted)
+pickup claude subswap               # blank Claude session in the matched project directory
+pickup claude --print "hi"          # passthrough flags/args to claude
+pickup codex --resume <id>          # `codex --resume`, auto-approved and hosted in the TUI
 pickup opencode                     # blank OpenCode TUI session, hosted in the TUI
 pickup kimi                         # blank auto-approved Kimi session, hosted in the TUI
 pickup --no-keepalive claude        # classic full-terminal launch without the background tmux wrapper

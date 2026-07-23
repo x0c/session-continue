@@ -238,6 +238,68 @@ class OscProbeFlushTests(unittest.TestCase):
             os.close(master)
             os.close(slave)
 
+    def test_tmux_settle_drains_late_passthrough_pair(self) -> None:
+        """回归：TMUX 下裸应答到齐后立刻退出会漏掉晚到的 passthrough 应答。
+
+        v0.24.3 的 flush 只能清「此刻已在队列里」的字节；passthrough 若在 flush
+        之后才到，仍会漏进 Textual。直启默认焦点在搜索框时就会复现乱码+空列表。
+        settle 窗口必须在 flush 前把这对迟到应答读掉。
+        """
+        import pty
+        import select
+        import threading
+        from pickup import theme
+
+        master, slave = pty.openpty()
+
+        class _FakeStd:
+            def __init__(self, fd: int) -> None:
+                self._fd = fd
+
+            def fileno(self) -> int:
+                return self._fd
+
+            def isatty(self) -> bool:
+                return True
+
+        bare = b"\x1b]10;rgb:1111/1111/1111\x07\x1b]11;rgb:2222/2222/2222\x07"
+        late = b"\x1b]10;rgb:aaaa/aaaa/aaaa\x07\x1b]11;rgb:bbbb/bbbb/bbbb\x07"
+
+        def _respond() -> None:
+            time.sleep(0.04)  # 等探测完成 setraw 并进入 select
+            os.write(master, bare)
+            time.sleep(0.05)  # 仍在 tmux settle(0.12s) 内
+            os.write(master, late)
+
+        writer = threading.Thread(target=_respond)
+        try:
+            writer.start()
+            with mock.patch.dict(os.environ, {"TMUX": "1"}, clear=False):
+                os.environ.pop("PICKUP_OSC_REPORT", None)
+                with mock.patch.object(theme.sys, "stdin", _FakeStd(slave)), \
+                        mock.patch.object(theme.sys, "stdout", _FakeStd(slave)):
+                    report = theme._probe_osc_colours(timeout=0.5)
+            writer.join(timeout=2.0)
+
+            self.assertIsNotNone(report)
+            self.assertIn(b"rgb:bbbb", report)
+
+            os.set_blocking(slave, False)
+            leftover = b""
+            while True:
+                r, _, _ = select.select([slave], [], [], 0.05)
+                if not r:
+                    break
+                chunk = os.read(slave, 4096)
+                if not chunk:
+                    break
+                leftover += chunk
+            self.assertEqual(leftover, b"", f"settle 后仍有残留：{leftover!r}")
+        finally:
+            writer.join(timeout=1.0)
+            os.close(master)
+            os.close(slave)
+
 
 class AppThemeTests(unittest.IsolatedAsyncioTestCase):
     """pickup 自身界面配色应跟随外层终端探测到的深浅色（真机反馈：浅色终端下
@@ -1653,7 +1715,7 @@ class PaneCellHeaderSyncTests(unittest.TestCase):
             on_focus_list=lambda: None,
             osc_report=None,
         )
-        # 未 mount / 未 compose：子节点为空
+        # 未 mount / 未 compose：子节点为空（标题栏与底条都缺）
         cell._sync_active_marker()  # noqa: SLF001 — 不得抛 NoMatches
         cell.set_title("new-title")
         self.assertEqual(cell._title, "new-title")  # noqa: SLF001
@@ -1738,7 +1800,9 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             cell = app.screen.query_one(SplitPaneArea)._cells()[0]  # noqa: SLF001
             title = cell.query_one(".title")
             header = cell.query_one(".header")
+            footer = cell.query_one(".footer")
             self.assertFalse(header.has_class("-active"))
+            self.assertFalse(footer.has_class("-active"))
             self.assertFalse(title.render().plain.startswith("● "))
 
             # 点右栏后才聚焦内嵌会话；ctrl+backslash 回列表，'c' 关闭分栏
@@ -1746,10 +1810,12 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(pane.has_focus)
             self.assertTrue(header.has_class("-active"))
+            self.assertTrue(footer.has_class("-active"))
             self.assertFalse(title.render().plain.startswith("● "))
             await pilot.press("ctrl+backslash")
             await pilot.pause()
             self.assertFalse(header.has_class("-active"))
+            self.assertFalse(footer.has_class("-active"))
             await pilot.press("c")
             await pilot.pause()
             area = app.screen.query_one(SplitPaneArea)
@@ -2492,6 +2558,57 @@ class DirectLaunchHostingTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press(*"x")
             await _wait_for_pane_text(pane, "x")
             self.assertIn("x", pane.render().plain.split("DIRECT-HELLO")[-1])
+
+    async def test_direct_launch_disables_search_focus_until_hosted(self) -> None:
+        """直启挂载期间搜索框不可聚焦，避免迟到 OSC 应答灌进筛选框滤空列表。"""
+        from textual.widgets import Input
+
+        store, _ = _make_store()
+        # 故意拖慢 host_session，拉长「搜索框本可吞键」的窗口
+        release = threading.Event()
+
+        def delayed_host(*_a, **_k):
+            if not release.wait(timeout=5.0):
+                raise TimeoutError("测试未能及时释放 delayed_host")
+            return "pickup-claude-directfocus1"
+
+        plan = LaunchPlan(("true",), None)
+        direct = pickup._DirectLaunch(plan, "claude", "directfocus1")
+        app = PickupApp(store, embed_ok=True, direct=direct)
+        with mock.patch("pickup.embed.host_session", side_effect=delayed_host):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(delay=0.05)
+                search = app.screen.query_one("#project-search", Input)
+                self.assertFalse(
+                    search.can_focus,
+                    "直启托管完成前搜索框必须不可聚焦，否则 OSC 泄漏会滤空侧边栏",
+                )
+                release.set()
+                await _wait_until(lambda: search.can_focus)
+                # 模拟泄漏垃圾已写入：恢复焦点后应被清掉
+                search.value = "\x1b]11;rgb:aaaa/bbbb/cccc\x07"
+                app.screen._restore_direct_search_focus()
+                self.assertEqual(search.value, "")
+                self.assertEqual(app.screen.nav.project_query, "")
+
+    async def test_search_rejects_osc_leak_garbage(self) -> None:
+        """兜底：搜索框若已出现 OSC 泄漏特征，必须清空且不把列表滤空。"""
+        from textual.widgets import Input
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            search = app.screen.query_one("#project-search", Input)
+            list_view = app.screen.query_one(SessionListView)
+            before = len(list_view.visible_sessions())
+            self.assertGreater(before, 0)
+            search.focus()
+            search.value = "]11;rgb:1e1e/1e1e/2e2e"
+            await pilot.pause(delay=0.2)
+            self.assertEqual(search.value, "")
+            self.assertEqual(app.screen.nav.project_query, "")
+            self.assertEqual(len(list_view.visible_sessions()), before)
 
 
 class RightPanePreviewTests(unittest.IsolatedAsyncioTestCase):

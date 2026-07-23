@@ -201,25 +201,71 @@ _DIRECT_LAUNCH_LIMIT = 50
 
 
 def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
-    """处理 `pickup [--no-keepalive] <runtime> [参数…]` 直启透传子命令。
+    """处理 `pickup [--no-keepalive] <runtime> [参数…]` 直启子命令。
 
-    参数原样交给底层运行时（`registry.build_passthrough_plan` 只垫上默认全自动放行参数，
-    用户已显式带了就不重复）。真实终端且内嵌可用时默认进入 TUI 侧边栏模式：新会话
-    托管进保活 socket 并嵌入右栏，与界面内「新建会话」同一条路径；非真实终端、
-    `--no-keepalive` 或内嵌不可用（无 tmux/被环境变量禁用）时保持旧的直接启动行为。
+    分流：
+    - `pickup claude subswap`：第二个位置参数不以 `-` 开头 → 项目名模糊匹配，
+      在匹配目录下 `build_new_session_plan`（新建空白会话）。
+    - `pickup claude --resume …` / 无额外参数：透传（`build_passthrough_plan` 只垫
+      默认全自动放行参数，用户已显式带了就不重复）。
 
-    经 `import pickup as pkg` 取符号，便于测试对包顶层做 patch.object。
+    真实终端且内嵌可用时默认进入 TUI 侧边栏模式；非真实终端、`--no-keepalive`
+    或内嵌不可用时保持直接启动。经 `import pickup as pkg` 取符号，便于测试 patch。
     """
     import pickup as pkg
+    from pickup import projects as projects_mod
 
     pkg._require_tmux()
     no_keepalive = argv and argv[0] == "--no-keepalive"
     rest = argv[1:] if no_keepalive else argv
     runtime_id, user_args = rest[0], rest[1:]
-    plan = registry.build_passthrough_plan(runtime_id, user_args)
+
+    project_query: str | None = None
+    if user_args and not user_args[0].startswith("-"):
+        project_query = user_args[0]
+        if user_args[1:]:
+            print(
+                f"项目快捷启动不接受额外参数：{user_args[1:]!r}。"
+                "透传请让参数以 - 开头（如 pickup claude --resume id）。",
+                file=pkg.sys.stderr,
+            )
+            pkg.sys.exit(1)
+
+    tty = bool(pkg.sys.stdin.isatty() and pkg.sys.stdout.isatty())
+    use_tui = tty and pkg.embed.available(no_keepalive)
+    store = None
+
+    if use_tui:
+        pkg.keepalive.reap_idle()
+        store = pkg.SessionStore(limit=_DIRECT_LAUNCH_LIMIT, registry=registry)
+        store.load()
+        pkg._spawn_title_daemon(_DIRECT_LAUNCH_LIMIT)
+
+    if project_query is not None:
+        try:
+            if store is not None:
+                discovered = projects_mod.discover(
+                    projects_mod.session_cwds_from_sessions(store.sessions),
+                )
+            else:
+                scanned = registry.scan_all(_DIRECT_LAUNCH_LIMIT)
+                discovered = projects_mod.discover(
+                    projects_mod.session_cwds_from_sessions(scanned),
+                )
+            cwd = projects_mod.resolve_query(project_query, discovered)
+            plan = registry.get(runtime_id).build_new_session_plan(cwd)
+        except projects_mod.ProjectResolveError as exc:
+            print(str(exc), file=pkg.sys.stderr)
+            pkg.sys.exit(1)
+        except pkg.LaunchError as exc:
+            print(f"启动失败：{exc}", file=pkg.sys.stderr)
+            pkg.sys.exit(1)
+    else:
+        plan = registry.build_passthrough_plan(runtime_id, user_args)
+
     ident = pkg.keepalive.new_session_ident()
 
-    if not (pkg.sys.stdin.isatty() and pkg.sys.stdout.isatty()) or not pkg.embed.available(no_keepalive):
+    if not use_tui:
         if pkg.keepalive.enabled(no_keepalive):
             plan = pkg.keepalive.wrap_plan(plan, runtime_id, ident)
         try:
@@ -229,21 +275,11 @@ def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
             pkg.sys.exit(1)
         return
 
-    pkg.keepalive.reap_idle()  # 顺带回收空闲太久没人管的后台保活会话，与主 TUI 入口一致
-    store = pkg.SessionStore(limit=_DIRECT_LAUNCH_LIMIT, registry=registry)
-    store.load()
-    pkg._spawn_title_daemon(_DIRECT_LAUNCH_LIMIT)
-
-    # 与 main() 的 TUI 入口相同：趁 Textual 接管终端前探测外层终端前景/背景色，
-    # 供内嵌面板聚焦时经 refresh-client -r 注入托管 pane
-    # 颜色应答通常在数毫秒内到达（读到即返回，快终端不受此上限影响）；tmux/SSH
-    # 往返可能上百毫秒，上限给足 0.25s 才能在 Textual 接管前把应答收完——否则晚到
-    # 的应答会漏进 TUI 变成搜索框乱码。不应答的终端最多白等 0.25s。
+    # 与 main() 的 TUI 入口相同：趁 Textual 接管终端前探测外层终端前景/背景色。
     theme_mod._OSC_REPORT = pkg._probe_osc_colours(timeout=0.25)
 
     from pickup.ui.app import run_app
     chosen = run_app(store, True, _DirectLaunch(plan, runtime_id, ident), theme_mod._OSC_REPORT)
-    # 兜底关闭内嵌控制通道，同 main() 的退出路径
     pkg.embed.close_channel()
     if isinstance(chosen, pkg.updater.RestartRequest):
         pkg._restart_process()

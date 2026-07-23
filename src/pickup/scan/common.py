@@ -52,6 +52,93 @@ def parse_timestamp(value) -> float | None:
         return None
 
 
+def is_cursor_agent_cmdline(cmdline: str) -> bool:
+    """判断命令行是否为 Cursor Agent CLI 主进程（不是 worker-server）。
+
+    新版 agent 会把 ``/proc/<pid>/comm`` 改成 ``MainThread``，``pgrep -x agent``
+    因此失效；判活必须改认 argv0=``agent`` 或 ``cursor-agent/.../index.js``。
+    """
+    text = str(cmdline or "").strip()
+    if not text or "worker-server" in text:
+        return False
+    argv0 = text.split(None, 1)[0]
+    if os.path.basename(argv0) == "agent":
+        return True
+    normalized = text.replace("\\", "/")
+    return "cursor-agent/" in normalized and "/index.js" in normalized
+
+
+def _cursor_agent_pids_by_cmdline() -> list[int]:
+    """按 cmdline 扫描 Cursor agent 主进程 pid；失败返回空列表。"""
+    pids: list[int] = []
+    if sys.platform.startswith("linux"):
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return []
+        for name in entries:
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/cmdline", "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            cmdline = raw.replace(b"\x00", b" ").decode(errors="replace").strip()
+            if is_cursor_agent_cmdline(cmdline):
+                pids.append(int(name))
+        return pids
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except (OSError, subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if is_cursor_agent_cmdline(parts[1]):
+            pids.append(pid)
+    return pids
+
+
+def _pids_for_process_name(process_name: str) -> list[int]:
+    """精确进程名 +（仅 agent）cmdline 兜底，合并去重。"""
+    found: list[int] = []
+    seen: set[int] = set()
+    try:
+        raw = subprocess.check_output(
+            ["pgrep", "-x", process_name], stderr=subprocess.DEVNULL
+        ).decode().split()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        raw = []
+    for pid_str in raw:
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid not in seen:
+            seen.add(pid)
+            found.append(pid)
+    if process_name == "agent":
+        for pid in _cursor_agent_pids_by_cmdline():
+            if pid not in seen:
+                seen.add(pid)
+                found.append(pid)
+    return found
+
+
 def live_processes(process_name: str) -> list[tuple[int, str]]:
     """返回全部存活同名进程的 ``(pid, 归一化 cwd)`` 列表。
 
@@ -60,22 +147,12 @@ def live_processes(process_name: str) -> list[tuple[int, str]]:
     会话并存）。调用方若只能保守地标「该目录最新一条」，再自行折叠；若能从
     命令行解析出会话 ID，则应逐进程精确绑定。
 
-    已知局限：同名的其它子命令进程（如 `<name> serve`/`<name> run`）会被一并
-    计入。任一环节失败都静默降级为空列表，不抛异常。
+    对 ``agent``：除 ``pgrep -x`` 外还会按 cmdline 兜底（Cursor 会把 comm 改成
+    ``MainThread``）。已知局限：同名的其它子命令进程（如 ``<name> serve``）
+    会被一并计入。任一环节失败都静默降级为空列表，不抛异常。
     """
     found: list[tuple[int, str]] = []
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-x", process_name], stderr=subprocess.DEVNULL
-        ).decode().split()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return found
-
-    for pid_str in pids:
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            continue
+    for pid in _pids_for_process_name(process_name):
         cwd = None
         if sys.platform.startswith("linux"):
             try:
@@ -85,7 +162,8 @@ def live_processes(process_name: str) -> list[tuple[int, str]]:
         elif sys.platform == "darwin":
             try:
                 out = subprocess.check_output(
-                    ["lsof", "-a", "-p", pid_str, "-d", "cwd", "-Fn"], stderr=subprocess.DEVNULL
+                    ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                    stderr=subprocess.DEVNULL,
                 ).decode(errors="replace")
             except (subprocess.CalledProcessError, FileNotFoundError, OSError):
                 continue

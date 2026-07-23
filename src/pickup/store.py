@@ -12,9 +12,9 @@ from pickup.cache import get_cache
 from pickup.display import (
     _filter_sessions_by_query,
     _normalize_cwd,
-    _project_groups,
 )
 from pickup.models import ConversationMessage, session_key
+from pickup.projects import project_entries
 from pickup.runtime import RuntimeRegistry, default_registry
 
 # 新扫到的会话：mtime 在此窗口内才插到列表最前；更旧的（常为临时 cwd 复活）
@@ -270,10 +270,14 @@ class SessionStore:
             self._projects = None
 
     def projects(self) -> list[dict]:
-        """跨所有来源聚合的项目文件夹列表（侧边栏用），惰性计算并缓存。"""
+        """跨所有来源聚合的项目文件夹列表（新建会话 / 侧边栏用），惰性计算并缓存。
+
+        合并会话 cwd 与本机 git 根扫描（见 pickup.projects），字段形状仍是
+        cwd_key / label / count / latest_mtime。
+        """
         with self.lock:
             if self._projects is None:
-                self._projects = _project_groups(self.sessions)
+                self._projects = project_entries(self.sessions)
             return self._projects
 
     def all_sessions(self) -> list[dict]:

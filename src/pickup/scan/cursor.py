@@ -350,6 +350,10 @@ def _apply_live_flags(sessions: list[dict]) -> None:
     1. 命令行 `--resume <chatId>`；
     2. 进程已打开的 `~/.cursor/chats/.../<chatId>/store.db`；
     3. 环境变量 `PICKUP_SESSION_ID` / `SC_SESSION_ID`（仅完整会话 id）。
+
+    同一 chat 若同时有「无 --resume 的原托管进程」和后来的 ``--resume`` 进程，
+    必须优先绑前者：占位卡退役依赖 annotate 把真实会话标上原 tmux 名
+    （``pickup-cursor-<临时8位>``）；若先绑到二次 resume，占位卡会残留成双卡。
     """
     by_id = {str(session.get("id") or ""): session for session in sessions}
     agents = list(live_processes("agent"))
@@ -357,27 +361,38 @@ def _apply_live_flags(sessions: list[dict]) -> None:
         return
 
     open_paths = _cursor_store_paths_for_pids([pid for pid, _ in agents])
+    cmdlines = {pid: process_command_line(pid) for pid, _ in agents}
 
-    for pid, _cwd in agents:
-        resume_id = _resume_id_from_cmdline(process_command_line(pid))
-        if resume_id and resume_id in by_id:
-            _mark_live(by_id[resume_id], pid)
-            continue
+    def bind_pid(pid: int, *, allow_resume: bool) -> None:
+        cmdline = cmdlines.get(pid) or ""
+        resume_id = _resume_id_from_cmdline(cmdline)
+        if resume_id:
+            if not allow_resume:
+                return
+            if resume_id in by_id:
+                _mark_live(by_id[resume_id], pid)
+            return
 
-        bound = False
         for chat_id in _chat_ids_from_open_paths(open_paths.get(pid) or []):
             session = by_id.get(chat_id)
             if session is not None and _mark_live(session, pid):
-                bound = True
-                break
-        if bound:
-            continue
+                return
 
         env = process_environ(pid)
         ident = env.get("PICKUP_SESSION_ID") or env.get("SC_SESSION_ID") or ""
         session = _session_for_pickup_ident(by_id, ident)
         if session is not None:
             _mark_live(session, pid)
+
+    # 先无 --resume（原空白新建/接力托管），再 --resume（原生恢复或二次点开）。
+    for pid, _cwd in agents:
+        if _resume_id_from_cmdline(cmdlines.get(pid) or ""):
+            continue
+        bind_pid(pid, allow_resume=False)
+    for pid, _cwd in agents:
+        if not _resume_id_from_cmdline(cmdlines.get(pid) or ""):
+            continue
+        bind_pid(pid, allow_resume=True)
 
 
 def _text_from_content(content) -> str:

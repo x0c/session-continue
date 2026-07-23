@@ -44,6 +44,18 @@ _IDLE_ROUNDS_BEFORE_BACKOFF = 3  # 连续几轮扫描都没变化才开始拉长
 CACHE_POLL_INTERVAL = 0.5  # 秒，标题缓存文件轮询间隔（比会话重扫轻得多，保持高频）
 LIST_PANE_WIDTH = 39  # 分栏时左栏固定宽度，对应旧版 EMBED_LEFT_BAND
 
+
+def _filter_looks_like_osc_leak(value: str) -> bool:
+    """搜索框内容是否像外层终端 OSC 10/11 应答泄漏（含 ESC 或 rgb: 片段）。
+
+    探测结束后才迟到的应答会被 Textual 当键盘输入灌进有焦点的 Input；
+    这种垃圾永远不该成为项目筛选条件。
+    """
+    if not value:
+        return False
+    return "\x1b" in value or "rgb:" in value
+
+
 # 动作名 → 文案 key；实例化时只改 description，不能整表替换（会丢掉 ListView/Screen 继承绑键）
 _ACTION_I18N = {
     "handoff": "action.advanced",
@@ -160,6 +172,11 @@ class MainScreen(Screen):
             # 直启子命令：焦点最终要落在内嵌面板上（用户就是来操作新会话的）。
             # 不要先调 SessionListView.focus()——它走 call_later，会在托管完成后
             # 把焦点抢回列表（真机冒烟回归过）。
+            # 托管完成前也绝不能让默认焦点落在搜索框：Textual 会把第一个可聚焦
+            # 控件（#project-search）当作焦点，探测结束后才迟到的 OSC 应答会被当
+            # 键盘输入灌进筛选框，把侧边栏滤空（`pickup cursor` 等直启真机复现）。
+            search = self.query_one("#project-search", Input)
+            search.can_focus = False
             self._host_direct_launch()
         else:
             self.query_one(SessionListView).focus()
@@ -740,7 +757,18 @@ class MainScreen(Screen):
     def _on_host_failed(self) -> None:
         """host worker 失败收尾：释放托管计数并给用户终端响铃。"""
         self._host_pending = max(0, self._host_pending - 1)
+        self._restore_direct_search_focus()
         self.app.bell()
+
+    def _restore_direct_search_focus(self) -> None:
+        """直启托管结束（成功或失败）后恢复搜索框可聚焦，并清掉 OSC 泄漏垃圾。"""
+        if self.direct is None:
+            return
+        search = self.query_one("#project-search", Input)
+        search.can_focus = True
+        if _filter_looks_like_osc_leak(search.value):
+            search.value = ""
+            self.nav.project_query = ""
 
     def _on_embed_hosted(
         self, request, name: str, same_runtime: bool, add_pane: bool = False,
@@ -849,6 +877,7 @@ class MainScreen(Screen):
 
     def _on_direct_hosted(self, name: str) -> None:
         self._host_pending = max(0, self._host_pending - 1)
+        self._restore_direct_search_focus()
         area = self._split_area()
         direct = self.direct
         runtime = self.store.registry.get(direct.runtime_id)
@@ -893,6 +922,14 @@ class MainScreen(Screen):
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "project-search":
+            return
+        # 兜底：任何路径漏进搜索框的 OSC 应答都直接丢掉，避免把会话列表滤空。
+        if _filter_looks_like_osc_leak(event.value):
+            if event.input.value:
+                event.input.value = ""
+            self.nav.project_query = ""
+            await self.query_one(SessionListView).rebuild(keep_selection=True)
+            self._update_header()
             return
         self.nav.project_query = event.value
         await self.query_one(SessionListView).rebuild(keep_selection=True)

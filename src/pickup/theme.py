@@ -56,17 +56,35 @@ def _probe_osc_colours(timeout: float = 1.2) -> bytes | None:
     except termios.error:
         return None
     buf = bytearray()
+    # 裸查询应答 2 段（OSC 10+11）。在 tmux 里还会再发一对 DCS passthrough 查询，
+    # 最多 4 段 rgb:。若读满 2 段就立刻退出，passthrough 晚到的应答会落在 tcflush
+    # 之后、漏进随后接管的 Textual——直启（`pickup cursor` 等）默认焦点在搜索框
+    # 时尤其致命：乱码灌进筛选、侧边栏被滤空。先凑齐至少 2 段，再在 settle 窗口
+    # 里继续收可能迟到的 passthrough；最后仍靠 flush 清尾巴。
+    in_tmux = bool(os.environ.get("TMUX"))
     try:
         tty.setraw(fd)
         os.write(sys.stdout.fileno(), b"\x1b]10;?\a\x1b]11;?\a")
-        if os.environ.get("TMUX"):
+        if in_tmux:
             # 内层 ESC 双写是 tmux DCS passthrough 的转义规则（Claude Code 同款）
             os.write(sys.stdout.fileno(),
                      b"\x1bPtmux;\x1b\x1b]10;?\x07\x1b\\"
                      b"\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and buf.count(b"rgb:") < 2:
-            r, _, _ = select.select([fd], [], [], max(0.05, deadline - time.monotonic()))
+            r, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not r:
+                break
+            buf += os.read(fd, 256)
+        # settle：首对应答到齐（或主超时结束）后再短等一阵，吃掉已在路上的
+        # passthrough 重复应答。窗口有硬顶，避免挂死；窗口内无数据立即结束。
+        settle_budget = 0.12 if in_tmux else 0.03
+        settle_end = time.monotonic() + settle_budget
+        while True:
+            remaining = settle_end - time.monotonic()
+            if remaining <= 0:
+                break
+            r, _, _ = select.select([fd], [], [], remaining)
             if not r:
                 break
             buf += os.read(fd, 256)
