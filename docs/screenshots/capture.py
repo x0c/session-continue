@@ -9,7 +9,11 @@
 
     python3 docs/screenshots/capture.py
 
-产物写入本目录：list.png（左栏列表 + 右栏完整对话预览）。
+产物写入本目录：list.png（左栏列表 + 右栏完整对话预览；无 Rich 假窗口边框）。
+
+**NO_COLOR：** 许多 CI / Agent 环境默认 `NO_COLOR=1`。Textual 会启用 Monochrome
+滤镜，整屏真彩变灰阶。本脚本在创建 App 前清除该变量；不要在带着 NO_COLOR 的
+壳里另写绕过路径。
 
 真机运行中的 TUI 请用 **F12**（`MainScreen.action_save_screenshot`）导出到
 `~/.cache/pickup/screenshots/`；勿把含真实对话的截图提交进仓库。
@@ -24,6 +28,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+# Textual 在 App.__init__ 里若见到 NO_COLOR 会启用 Monochrome；必须在创建
+# PickupApp 之前清掉。setdefault 不覆盖调用方已显式设置的真彩 / 语言。
+os.environ.pop("NO_COLOR", None)
+os.environ.setdefault("COLORTERM", "truecolor")
+os.environ.setdefault("PICKUP_LANG", "en")
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -156,12 +166,72 @@ def _demo_store():
     return store
 
 
+def _strip_window_chrome(svg_text: str) -> str:
+    """去掉 Rich SVG 假 macOS 标题栏，只留终端内容区。"""
+    # 三色点
+    svg_text = re.sub(
+        r'<g transform="translate\(26,\s*22\)">\s*'
+        r"(?:<circle\b[^/]*/>\s*){3}"
+        r"</g>\s*",
+        "",
+        svg_text,
+        flags=re.S,
+    )
+    # 标题「pickup」
+    svg_text = re.sub(
+        r'<text class="[^"]*-title"[^>]*>.*?</text>\s*',
+        "",
+        svg_text,
+        flags=re.S,
+    )
+    # 圆角外框
+    svg_text = re.sub(
+        r'<rect\b[^>]*\brx="8"\s*/>\s*',
+        "",
+        svg_text,
+        count=1,
+    )
+    # 内容组移到原点（Rich 默认 translate(terminal_x, terminal_y)≈(9,41)）
+    svg_text = re.sub(
+        r'(<g transform=")translate\([^"]+\)(" clip-path="url\(#[^"]*-clip-terminal\)">)',
+        r"\1translate(0, 0)\2",
+        svg_text,
+        count=1,
+    )
+    clip = re.search(
+        r'id="[^"]*-clip-terminal"\s*>\s*<rect\b[^>]*?\bwidth="([^"]+)"[^>]*?\bheight="([^"]+)"',
+        svg_text,
+        flags=re.S,
+    )
+    if clip is None:
+        clip = re.search(
+            r'id="[^"]*-clip-terminal"\s*>\s*<rect\b[^>]*?\bheight="([^"]+)"[^>]*?\bwidth="([^"]+)"',
+            svg_text,
+            flags=re.S,
+        )
+        if clip is not None:
+            height, width = clip.group(1), clip.group(2)
+        else:
+            width = height = None
+    else:
+        width, height = clip.group(1), clip.group(2)
+    if width is not None and height is not None:
+        svg_text = re.sub(
+            r'viewBox="0 0 [^"]+"',
+            f'viewBox="0 0 {width} {height}"',
+            svg_text,
+            count=1,
+        )
+    return svg_text
+
+
 def _prepare_svg(svg_text: str) -> str:
-    """去掉远程 @font-face，换成带 CJK 的本地字体，并去掉 textLength/逐行 clip。
+    """去假窗口铬、远程 @font-face，换成带 CJK 的本地字体，并去掉 textLength/逐行 clip。
 
     Rich 按 Fira Code 字宽写了 textLength；换成 Droid 后字宽对不上，cairosvg
     会把字形压成豆腐块。去掉强制字宽与行裁剪后，截图可读（间距略松一点可接受）。
     """
+    svg_text = _strip_window_chrome(svg_text)
     svg_text = re.sub(r"@font-face\s*\{.*?\}", "", svg_text, flags=re.S)
     svg_text = re.sub(
         r"font-family:\s*Fira Code,\s*monospace;",
@@ -228,6 +298,10 @@ _CAIRO_SNIPPET = (
 async def _capture() -> None:
     store = _demo_store()
     app = PickupApp(store, embed_ok=True, osc_report=None)
+    if app.no_color:
+        raise RuntimeError(
+            "PickupApp.no_color 仍为 True：NO_COLOR 未在创建 App 前清除，截图会灰阶"
+        )
     async with app.run_test(size=(140, 36)) as pilot:
         await pilot.pause(delay=0.4)
         # 跳过「新建会话」钉，选中第一条真实会话 → 右栏完整预览
