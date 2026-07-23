@@ -236,8 +236,10 @@ def _dispatch_direct_launch(argv: list[str], registry: RuntimeRegistry) -> None:
 
     # 与 main() 的 TUI 入口相同：趁 Textual 接管终端前探测外层终端前景/背景色，
     # 供内嵌面板聚焦时经 refresh-client -r 注入托管 pane
-    # 颜色应答通常在数毫秒内到达；不应答的终端不能再阻塞首屏 1.2 秒。
-    theme_mod._OSC_REPORT = pkg._probe_osc_colours(timeout=0.06)
+    # 颜色应答通常在数毫秒内到达（读到即返回，快终端不受此上限影响）；tmux/SSH
+    # 往返可能上百毫秒，上限给足 0.25s 才能在 Textual 接管前把应答收完——否则晚到
+    # 的应答会漏进 TUI 变成搜索框乱码。不应答的终端最多白等 0.25s。
+    theme_mod._OSC_REPORT = pkg._probe_osc_colours(timeout=0.25)
 
     from pickup.ui.app import run_app
     chosen = run_app(store, True, _DirectLaunch(plan, runtime_id, ident), theme_mod._OSC_REPORT)
@@ -387,8 +389,11 @@ def main() -> None:
     # refresh-client -r 注入托管 pane，让 pane 内 agent 的深/浅主题检测拿到真实值。
     # 这一步仍然必须在 UI 启动前同步完成（EmbedPane/MainScreen 的深浅色主题判断
     # 依赖它），但现在跟上面的后台扫描线程是并行的，不再是"扫描 + 探测"首尾相加。
-    # 首屏优先：终端若 60ms 内不应答就用默认主题，避免把协议超时暴露成启动卡顿。
-    theme_mod._OSC_REPORT = _probe_osc_colours(timeout=0.06)
+    # 读到应答即返回（快终端只需数毫秒，不受上限影响）；上限给足 0.25s 以覆盖
+    # tmux/SSH 的往返，确保应答在 Textual 接管前收完——上限太短会让晚到的应答漏进
+    # TUI 被当键盘输入注入搜索框（搜索框乱码 + 会话列表被过滤空）。不应答的终端最
+    # 多白等 0.25s，且与上面的后台扫描线程并行，通常被扫描耗时掩盖。
+    theme_mod._OSC_REPORT = _probe_osc_colours(timeout=0.25)
     observe.init(debug=bool(os.environ.get("PICKUP_DEBUG")))
     # 在源码树里开发却加载了 pipx/site-packages 副本时，启动前打一次 stderr 告警
     # （普通发行版用户 cwd 不在仓库内，不会触发）。

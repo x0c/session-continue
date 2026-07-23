@@ -166,6 +166,79 @@ class KittyKeyboardProtocolTests(unittest.TestCase):
         )
 
 
+class OscProbeFlushTests(unittest.TestCase):
+    """回归：OSC 探测结束必须清空终端输入队列，否则没读完的应答尾巴会漏进 Textual
+    被当键盘输入注入搜索框——真机现象是启动时先闪过一行 `...rgb:xxxx/...`、搜索框
+    乱码、且乱字符实时筛选把侧边栏会话列表整个过滤空（tmux/SSH 下 60ms 超时太短、
+    多段应答读不全时高发）。见 theme._probe_osc_colours 的 finally tcflush。"""
+
+    def test_probe_flushes_unread_input_tail(self) -> None:
+        import pty
+        import select
+        import threading
+        from pickup import theme
+
+        master, slave = pty.openpty()
+
+        class _FakeStd:
+            """伪造 stdin/stdout 指向 pty slave（isatty 为真，探测才会真正跑）。"""
+
+            def __init__(self, fd: int) -> None:
+                self._fd = fd
+
+            def fileno(self) -> int:
+                return self._fd
+
+            def isatty(self) -> bool:
+                return True
+
+        # 模拟真实终端：探测进入读循环（已 setraw）后才把应答送来，避免被探测自身
+        # 的 tty.setraw(TCSAFLUSH) 提前清掉。两段完整应答（OSC 10+11，凑够计数 2 让
+        # 读循环提前退出）后再跟一大段尾巴——单次 os.read(256) 读不完，尾巴留在输入
+        # 队列，正是没有 flush 时会漏进 Textual 变成搜索框乱码的那部分。
+        resp = b"\x1b]10;rgb:1e1e/1e1e/2e2e\x07\x1b]11;rgb:1e1e/1e1e/2e2e\x07"
+        tail = b"stray-osc-tail-" + b"x" * 400
+
+        def _respond() -> None:
+            time.sleep(0.04)  # 等探测完成 setraw 并进入 select 等待
+            os.write(master, resp + tail)
+
+        writer = threading.Thread(target=_respond)
+        try:
+            writer.start()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TMUX", None)
+                os.environ.pop("PICKUP_OSC_REPORT", None)
+                with mock.patch.object(theme.sys, "stdin", _FakeStd(slave)), \
+                        mock.patch.object(theme.sys, "stdout", _FakeStd(slave)):
+                    report = theme._probe_osc_colours(timeout=0.5)
+            writer.join()
+
+            # 应答本身要被正确解出（探测仍然有效，没有误伤合法应答）
+            self.assertIsNotNone(report)
+            self.assertIn(b"rgb:", report)
+
+            # 关键断言：探测返回后输入队列必须已被清空，尾巴不会漏进 TUI
+            os.set_blocking(slave, False)
+            leftover = b""
+            while True:
+                r, _, _ = select.select([slave], [], [], 0.1)
+                if not r:
+                    break
+                chunk = os.read(slave, 4096)
+                if not chunk:
+                    break
+                leftover += chunk
+            self.assertEqual(
+                leftover, b"",
+                f"探测后输入队列仍有残留会漏进 TUI 变成搜索框乱码：{leftover!r}",
+            )
+        finally:
+            writer.join()
+            os.close(master)
+            os.close(slave)
+
+
 class AppThemeTests(unittest.IsolatedAsyncioTestCase):
     """pickup 自身界面配色应跟随外层终端探测到的深浅色（真机反馈：浅色终端下
     配色不对——此前只处理了托管会话内的深浅色注入，没接 pickup 自己的界面）。"""

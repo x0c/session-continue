@@ -74,6 +74,15 @@ def _probe_osc_colours(timeout: float = 1.2) -> bytes | None:
         return None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        # 清空可能残留在输入队列里的 OSC 应答尾巴：读循环可能在应答完整到达前
+        # 就因计数够/超时而退出（tmux 多段应答、SSH 往返晚于超时时尤甚），剩下的
+        # 半截字节若留到 Textual 接管后会被当成键盘输入注入搜索框——表现为屏幕先
+        # 闪过一行 `...rgb:xxxx/...`、搜索框乱码、且乱字符实时筛选把会话列表整个
+        # 过滤空。恢复 termios 后无条件丢弃输入队列，杜绝这条泄漏路径。
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except termios.error:
+            pass
     # 只保留 OSC 10/11 应答段，混入的用户按键等杂字节一律丢弃；passthrough 应答
     # 绕行真实终端通常晚于外层 tmux 的缓存应答，拼接在后，tmux 解析时后者生效
     parts = re.findall(rb"\x1b\](?:10|11);[^\x07\x1b]+(?:\x07|\x1b\\)", bytes(buf))
