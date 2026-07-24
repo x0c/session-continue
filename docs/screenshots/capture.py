@@ -50,6 +50,12 @@ OUT_DIR = Path(__file__).resolve().parent
 # Rich/Textual SVG 默认 Fira Code，本机常无 CJK；换成 mono+CJK 本地字体，避免豆腐块。
 _FONT_CSS = '"Noto Sans Mono CJK SC", "Noto Sans CJK SC", "Droid Sans Fallback", monospace'
 
+# 演示用外层终端底色：对齐左栏列表空区实测色 (#1e242b)，避免右栏垫成
+# pickup-dark $background (#0d1117) 后出现「半边深半边浅」的割裂感。
+# osc_report=None 时 EmbedPane 不设 styles.background，空白格会透成纯黑。
+_DEMO_BG_HEX = "#1e242b"
+_DEMO_OSC_REPORT = b"\x1b]11;rgb:1e1e/2424/2b2b\x07"
+
 
 def _demo_store():
     sessions = [
@@ -166,8 +172,28 @@ def _demo_store():
     return store
 
 
+def _terminal_background_hex(svg_text: str) -> str:
+    """终端底色：优先演示 OSC / pickup-dark，否则用 SVG 里已出现的同系深色。
+
+    Rich 只给「有内容的格子」画背景 rect；空白格透明。去掉假窗口铬后若不再
+    垫一层底，cairosvg 会把透明渲成纯黑，右栏大片空洞 vs 左栏石板色——半边黑。
+    """
+    lowered = svg_text.lower()
+    for candidate in (_DEMO_BG_HEX, "#161b22", "#1c2430"):
+        if candidate in lowered:
+            return candidate
+    chrome = re.search(
+        r'<rect\b[^>]*\bfill="(#[0-9A-Fa-f]{6})"[^>]*\brx="8"',
+        svg_text,
+    )
+    if chrome:
+        return chrome.group(1).lower()
+    return _DEMO_BG_HEX
+
+
 def _strip_window_chrome(svg_text: str) -> str:
-    """去掉 Rich SVG 假 macOS 标题栏，只留终端内容区。"""
+    """去掉 Rich SVG 假 macOS 标题栏，只留终端内容区，并垫上不透明终端底色。"""
+    bg = _terminal_background_hex(svg_text)
     # 三色点
     svg_text = re.sub(
         r'<g transform="translate\(26,\s*22\)">\s*'
@@ -184,7 +210,7 @@ def _strip_window_chrome(svg_text: str) -> str:
         svg_text,
         flags=re.S,
     )
-    # 圆角外框
+    # 圆角外框（其 fill 曾充当整窗底；删掉后必须另垫，见下方）
     svg_text = re.sub(
         r'<rect\b[^>]*\brx="8"\s*/>\s*',
         "",
@@ -219,6 +245,17 @@ def _strip_window_chrome(svg_text: str) -> str:
         svg_text = re.sub(
             r'viewBox="0 0 [^"]+"',
             f'viewBox="0 0 {width} {height}"',
+            svg_text,
+            count=1,
+        )
+        # 垫在内容组之前：空白格不再透出纯黑
+        backdrop = (
+            f'<rect fill="{bg}" x="0" y="0" width="{width}" height="{height}" '
+            f'shape-rendering="crispEdges"/>\n'
+        )
+        svg_text = re.sub(
+            r'(<g transform="translate\(0, 0\)" clip-path="url\(#[^"]*-clip-terminal\)">)',
+            backdrop + r"\1",
             svg_text,
             count=1,
         )
@@ -297,7 +334,7 @@ _CAIRO_SNIPPET = (
 
 async def _capture() -> None:
     store = _demo_store()
-    app = PickupApp(store, embed_ok=True, osc_report=None)
+    app = PickupApp(store, embed_ok=True, osc_report=_DEMO_OSC_REPORT)
     if app.no_color:
         raise RuntimeError(
             "PickupApp.no_color 仍为 True：NO_COLOR 未在创建 App 前清除，截图会灰阶"
@@ -309,8 +346,41 @@ async def _capture() -> None:
         await pilot.pause(delay=0.5)
         with tempfile.TemporaryDirectory() as td:
             svg = app.save_screenshot("list.svg", path=td)
-            _svg_to_png(Path(td) / Path(svg).name, OUT_DIR / "list.png")
+            png_path = OUT_DIR / "list.png"
+            _svg_to_png(Path(td) / Path(svg).name, png_path)
+            _assert_png_sane(png_path)
         print(f"wrote {OUT_DIR / 'list.png'}")
+
+
+def _assert_png_sane(png_path: Path) -> None:
+    """出图后自检：拒绝整栏纯黑空洞 / 灰阶（上次 README 翻车点）。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("warning: Pillow 不可用，跳过 PNG 自检", file=sys.stderr)
+        return
+    im = Image.open(png_path).convert("RGB")
+    w, h = im.size
+    right_black = 0
+    right_total = 0
+    chromatic = 0
+    for y in range(0, h, 4):
+        for x in range(w // 3, w, 4):
+            r, g, b = im.getpixel((x, y))
+            right_total += 1
+            if r == 0 and g == 0 and b == 0:
+                right_black += 1
+            if abs(r - g) > 20 or abs(g - b) > 20:
+                chromatic += 1
+    if right_total and right_black / right_total > 0.05:
+        raise RuntimeError(
+            f"截图右栏纯黑占比 {right_black}/{right_total}="
+            f"{100 * right_black / right_total:.0f}%（空白格未垫底），拒绝写入"
+        )
+    if chromatic < 10:
+        raise RuntimeError(
+            f"截图几乎无彩色像素（chromatic={chromatic}），可能仍被 NO_COLOR 灰阶化"
+        )
 
 
 def main() -> None:
