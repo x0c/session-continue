@@ -235,20 +235,56 @@ def update_command(latest_tag: str, channel: Channel | None = None) -> list[str]
     return None
 
 
+def _brew_installed_version() -> tuple[int, ...] | None:
+    """查询 Homebrew 中 pickup 实际已安装的最高版本；查不到返回 None（此时不阻断，
+    避免把「查询失败」误判成「升级失败」）。"""
+    try:
+        result = subprocess.run(
+            ["brew", "list", "--versions", "pickup"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    # 输出形如 "pickup 0.20.0 0.21.0"：首列是包名，其余是保留在本机的各版本
+    versions = [_version_tuple(tok) for tok in (result.stdout or "").split()[1:]]
+    versions = [v for v in versions if v != (0,)]
+    return max(versions) if versions else None
+
+
 def run_update(latest_tag: str, channel: Channel | None = None) -> tuple[bool, str]:
-    """跑升级命令；返回 (是否成功, 合并输出摘要)。dev 渠道直接失败。"""
+    """跑升级命令；返回 (是否成功, 合并输出摘要)。dev 渠道直接失败。
+
+    brew 渠道的两个坑都在这里兜住：
+    1. 用户 shell 里常设 `HOMEBREW_NO_AUTO_UPDATE=1` 提速；子进程继承后
+       `brew upgrade` 不刷新 tap，永远看不到刚发布的新配方 → 空跑退出 0（假成功）。
+       这里为 brew 子进程强制去掉该变量，放开自动刷新。
+    2. 即便如此，`brew upgrade` 什么都没升级也退出 0；必须核实实际安装版本确已
+       到位，否则会误报「更新完成」，用户重启后仍是旧版本。
+    """
     channel = channel or detect_channel()
     cmd = update_command(latest_tag, channel)
     if cmd is None:
         return False, "当前安装方式（源码/开发安装）不支持一键更新"
+    env = os.environ.copy()
+    if channel == "brew":
+        env.pop("HOMEBREW_NO_AUTO_UPDATE", None)
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=180,
+            cmd, capture_output=True, text=True, timeout=300, env=env,
         )
-        output = (result.stdout or "") + (result.stderr or "")
-        return result.returncode == 0, output.strip()[-4000:]
+        output = ((result.stdout or "") + (result.stderr or "")).strip()[-4000:]
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
+    if result.returncode != 0:
+        return False, output
+    if channel == "brew":
+        installed = _brew_installed_version()
+        if installed is not None and installed < _version_tuple(latest_tag):
+            hint = "brew 未升级到最新版本，本地配方可能过期。请手动执行：brew update && brew upgrade pickup"
+            return False, (output + "\n" + hint).strip()
+    return True, output
 
 
 # ---- 更新检查状态（当天忽略过就不再弹，次日恢复） ----

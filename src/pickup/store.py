@@ -251,8 +251,8 @@ class SessionStore:
                 + [key for key in self._order if key in by_key]
                 + [session_key(session) for session in fresh_cold]
             )
-            # 已从扫描结果消失的会话不能继续占着生成状态，否则 has_generating()
-            # 会永久为真，列表仍会空转刷新不存在的卡片。
+            # 已从扫描结果消失的会话不能继续占着生成状态，否则标题生成队列会
+            # 永久挂着不存在的会话键。
             self.generating.intersection_update(by_key)
             for session in by_key.values():
                 key = session_key(session)
@@ -469,17 +469,11 @@ class SessionStore:
         if changed:
             self.dirty.set()
 
-    def snapshot(self) -> tuple[dict[str, str], set[str]]:
-        """一次性取「当前展示标题」和「正在生成的 ID 集合」快照，保证两者一致。"""
+    def snapshot(self) -> dict[str, str]:
+        """取「当前展示标题」快照供界面渲染；正在生成的会话只在标题落地后经
+        poll_cache_updates 刷新，界面不再需要感知生成中状态。"""
         with self.lock:
-            return dict(self.display_titles), set(self.generating)
-
-    def has_generating(self) -> bool:
-        """轻量判断有没有会话在生成标题，只读一个 bool、不拷贝任何 dict/set；
-        供高频轮询（如列表转圈圈 spinner）在没有生成任务时直接跳过 snapshot()
-        的拷贝开销。"""
-        with self.lock:
-            return bool(self.generating)
+            return dict(self.display_titles)
 
     def get_title(self, session: dict) -> str:
         with self.lock:

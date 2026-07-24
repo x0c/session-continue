@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -97,6 +98,54 @@ class ChannelDetectionTests(unittest.TestCase):
 
     def test_update_command_dev_returns_none(self) -> None:
         self.assertIsNone(updater.update_command("0.21.0", "dev"))
+
+
+class RunUpdateTests(unittest.TestCase):
+    """run_update：brew 渠道的假成功兜底——退出 0 不等于真的升级了。"""
+
+    def _completed(self, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_brew_success_when_installed_version_reaches_latest(self) -> None:
+        with mock.patch.object(updater.subprocess, "run", return_value=self._completed(0, "ok")), \
+             mock.patch.object(updater, "_brew_installed_version", return_value=(0, 21, 0)):
+            ok, out = updater.run_update("0.21.0", "brew")
+        self.assertTrue(ok)
+
+    def test_brew_reports_failure_when_upgrade_is_noop(self) -> None:
+        # brew upgrade 退出 0 但装的还是旧版本（本地配方过期）→ 必须报失败而非假成功
+        with mock.patch.object(updater.subprocess, "run", return_value=self._completed(0, "Already up-to-date")), \
+             mock.patch.object(updater, "_brew_installed_version", return_value=(0, 20, 0)):
+            ok, out = updater.run_update("0.21.0", "brew")
+        self.assertFalse(ok)
+        self.assertIn("brew update", out)
+
+    def test_brew_clears_no_auto_update_env(self) -> None:
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return self._completed(0, "ok")
+
+        with mock.patch.dict(updater.os.environ, {"HOMEBREW_NO_AUTO_UPDATE": "1"}, clear=False), \
+             mock.patch.object(updater.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(updater, "_brew_installed_version", return_value=(0, 21, 0)):
+            ok, _ = updater.run_update("0.21.0", "brew")
+        self.assertTrue(ok)
+        self.assertNotIn("HOMEBREW_NO_AUTO_UPDATE", captured["env"])
+
+    def test_brew_success_when_version_unqueryable(self) -> None:
+        # 查不到已安装版本时不阻断，避免把查询失败误判成升级失败
+        with mock.patch.object(updater.subprocess, "run", return_value=self._completed(0, "ok")), \
+             mock.patch.object(updater, "_brew_installed_version", return_value=None):
+            ok, _ = updater.run_update("0.21.0", "brew")
+        self.assertTrue(ok)
+
+    def test_nonzero_returncode_is_failure(self) -> None:
+        with mock.patch.object(updater.subprocess, "run", return_value=self._completed(1, "", "boom")):
+            ok, out = updater.run_update("0.21.0", "brew")
+        self.assertFalse(ok)
+        self.assertIn("boom", out)
 
 
 class FetchLatestTests(unittest.TestCase):

@@ -919,7 +919,6 @@ class SessionCardVisualTests(unittest.TestCase):
         *,
         live=False,
         keepalive_name=None,
-        generating=False,
         source="opencode",
         display_name="OpenCode",
         display_title="修复侧边栏展示",
@@ -941,9 +940,7 @@ class SessionCardVisualTests(unittest.TestCase):
         return SessionCard(
             session,
             store,
-            "◐",
             display_title=display_title,
-            is_generating=generating,
         )
 
     def test_runtime_is_right_aligned_on_second_line_at_fixed_width(self) -> None:
@@ -1040,29 +1037,19 @@ class SessionCardVisualTests(unittest.TestCase):
             f"title should not be bold, spans={title_spans}",
         )
 
-    def test_generating_title_keeps_spinner_without_bold(self) -> None:
-        card = self._card(generating=True)
+    def test_sidebar_shows_no_generating_spinner(self) -> None:
+        """标题生成期间侧边栏不再显示任何「加载中」转圈动画：首行直接以
+        项目名开头，不出现 braille spinner 帧或任何转圈占位字符。"""
+        card = self._card()
         with mock.patch.object(
             SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 3),
         ):
             rendered = card.render()
 
-        lines = rendered.plain.splitlines()
-        first_line = lines[0]
-        runtime_start = lines[1].rfind("OpenCode")
-        self.assertTrue(first_line.startswith("◐ "))
-        # spinner 本身不加粗；项目名允许 bold（与标题对比）。
-        spinner_end = len("◐ ")
-        spinner_spans = [
-            span for span in rendered.spans
-            if span.start < spinner_end and span.end <= len(first_line)
-        ]
-        self.assertFalse(
-            any(
-                "bold" in str(span.style).lower() and span.end <= spinner_end
-                for span in spinner_spans
-            )
-        )
+        first_line = rendered.plain.splitlines()[0]
+        self.assertTrue(first_line.startswith("pickup: "))
+        for frame in pickup.SPINNER_FRAMES:
+            self.assertNotIn(frame, first_line)
 
     def test_running_title_is_green_but_ended_title_is_not(self) -> None:
         """进行中用绿色标题区分；侧边栏不再展示 Running / Ended 文案。"""
@@ -1329,7 +1316,10 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             list_view = app.screen.query_one(SessionListView)
             cards_before = list_view._session_cards()
             self.assertEqual(len(cards_before), 3)
-            self.assertNotIn("Running", cards_before[0].render().plain)
+            # 已结束会话标题保持默认配色（不是进行中的绿色）
+            self.assertFalse(
+                any("#3F9A6A" in str(span.style) for span in cards_before[0].render().spans),
+            )
 
             # 模拟一次后台重扫：s0 的会话字典被替换成新对象（和真实 _merge_scanned
             # 行为一致，扫描结果每次都是新 dict），但会话键集合/顺序没变，
@@ -1346,7 +1336,10 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
                 "会话集合没变时不应该重新 mount 任何 SessionCard 实例",
             )
             self.assertIs(cards_after[0].session, new_session)
-            self.assertIn("Running", cards_after[0].render().plain)
+            # live 翻到 True 后，进行中会话标题应原地变为绿色
+            self.assertTrue(
+                any("#3F9A6A" in str(span.style) for span in cards_after[0].render().spans),
+            )
 
     async def test_refresh_detects_detail_changes_and_updates_card_and_pane_in_place(self) -> None:
         old_session = {
@@ -1523,41 +1516,6 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
 
             await _wait_until(lambda: "会话1" in _primary_embed_pane(app.screen).render().plain)
             self.assertNotIn("会话0", _primary_embed_pane(app.screen).render().plain)
-
-    async def test_tick_spinner_skips_snapshot_when_nothing_generating(self) -> None:
-        """`_tick_spinner` 每 150ms 触发一次；没有会话在生成标题时必须直接
-        跳过，连 `store.snapshot()`（拿锁+拷贝 dict/set）都不该调用。"""
-        store, _ = _make_store()
-        store.generating.clear()
-        app = PickupApp(store, embed_ok=False)
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(delay=0.2)
-            list_view = app.screen.query_one(SessionListView)
-            with mock.patch.object(store, "snapshot", wraps=store.snapshot) as spy:
-                list_view._tick_spinner()
-                spy.assert_not_called()
-
-    async def test_tick_spinner_refreshes_only_generating_cards(self) -> None:
-        """有会话在生成标题时，只应该刷新命中 `generating` 的那几张卡片，
-        其余卡片不应该被触碰（不遍历全部子项逐个 refresh）。"""
-        store, _ = _make_store()
-        app = PickupApp(store, embed_ok=False)
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(delay=0.2)
-            list_view = app.screen.query_one(SessionListView)
-            cards = list_view._session_cards()
-            store.generating.clear()
-            store.generating.add("claude:s0")
-            for card in cards:
-                card.refresh = mock.Mock(wraps=card.refresh)
-
-            list_view._tick_spinner()
-
-            hit = next(c for c in cards if pickup.session_key(c.session) == "claude:s0")
-            others = [c for c in cards if c is not hit]
-            self.assertTrue(hit.refresh.called)
-            for card in others:
-                card.refresh.assert_not_called()
 
     async def test_enter_keeps_list_focus_until_pane_clicked(self) -> None:
         """回车/点选只挂右栏画面，不把键盘焦点抢走；点右栏后才进入内嵌交互。"""
@@ -3001,17 +2959,20 @@ class KillKeepaliveFlowTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("down")
                 list_view = app.screen.query_one(SessionListView)
                 card = list_view._session_cards()[0]
-                self.assertIn("Running (hosted)", card.render().plain)
+                # 托管运行中：标题为进行中绿色
+                self.assertTrue(
+                    any("#3F9A6A" in str(span.style) for span in card.render().spans),
+                )
                 await pilot.press("q")
                 await pilot.pause(delay=0.3)  # worker 推弹窗 + ConfirmModal 武装
                 self.assertIsInstance(app.screen, ConfirmModal)
                 await pilot.press("q")
                 await pilot.pause(delay=0.2)
-                # 确认后立刻应是已结束，不能先闪一帧「运行中」（live 仍为 True）
+                # 确认后立刻应是已结束，不能先闪一帧「运行中」（标题不再是绿色）
                 card = list_view._session_cards()[0]
-                plain = card.render().plain
-                self.assertIn("Ended", plain)
-                self.assertNotIn("Running", plain)
+                self.assertFalse(
+                    any("#3F9A6A" in str(span.style) for span in card.render().spans),
+                )
         kill_mock.assert_called_once_with("pickup-claude-fake")
         current = store.find_session("claude:s0")
         self.assertIsNotNone(current)

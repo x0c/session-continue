@@ -31,9 +31,21 @@ def _restart_process() -> None:
     re-exec 一个全新 pickup 进程，原样透传本次启动的命令行参数。
 
     tmux 保活会话与本进程无关，重启不影响已托管会话；execv 成功后本进程
-    直接被替换，不会返回。"""
+    直接被替换，不会返回。
+
+    优先用 PATH 上的 pickup 可执行文件重启：Homebrew 升级把新版本装进新的
+    Cellar/venv 并把 bin/pickup 软链指向它，而 sys.executable 仍指向旧版本
+    Cellar 里那个冻结的解释器——用它 re-exec 只会重新加载旧代码，用户点了
+    「重启」却还是旧版本。找不到 PATH 上的 pickup（裸模块 / 源码运行）时，
+    再退回当前解释器的 `-m pickup`。"""
+    import shutil
+
     sys.stdout.flush()
     sys.stderr.flush()
+    exe = shutil.which("pickup")
+    if exe:
+        os.execv(exe, [exe, *sys.argv[1:]])
+        return  # execv 正常不会返回；防御性兜底，避免万一继续往下走
     os.execv(sys.executable, [sys.executable, "-m", "pickup", *sys.argv[1:]])
 
 @dataclass(frozen=True)
