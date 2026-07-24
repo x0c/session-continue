@@ -127,6 +127,7 @@ stateDiagram-v2
 | `a` 高级操作 | 当前选中已有会话 | 弹窗列出运行时；同运行时为原生恢复，其他运行时为读取历史后新建会话 | 形成启动请求 |
 | `q` 结束会话 | 当前会话是运行中(托管) | 确认弹窗确认后结束托管并立即标记为已结束 | 不等待下次扫描才更新状态 |
 | `x` 删除会话 | 侧边栏选中任意会话 | 确认弹窗（确认键为 `x`）确认后，运行中/托管会话先结束再删，随后调用所选运行时适配器的 `delete_session()` 彻底抹掉本地历史 | 成功后立即从列表摘除；失败（如磁盘/数据库异常）则提示失败原因，卡片保留、不摘除 |
+| Ctrl/Cmd+点击或 Space | 侧边栏会话卡（非「＋ 新建」） | toggle 多选集（`▸` 标记；最多 3 项）；右栏暂不跟随 | 多选 ≥2 时 Enter 开分屏；Esc 先清多选；↑↓/普通点击清空 |
 | 点击右栏 | 右栏已有预览或托管画面 | 键盘焦点转移到右栏 | 此后按键进入内嵌会话；`Ctrl+\` 回列表 |
 
 ## §2.5 物理路径速查
@@ -156,7 +157,7 @@ stateDiagram-v2
 | 删除会话（不可恢复） | `ui/main_screen.py`、`ui/modals.py`、`store.py`、`runtime/base.py` | `action_delete_session()`、`ConfirmModal(confirm_key="x")`、`SessionStore.remove_session()`、`BaseRuntime.delete_session()` | `ConfirmModal` 的确认键已参数化（结束会话仍是 `q`，删除会话是 `x`）；实际删除逻辑收敛在各运行时适配器，见 `docs/SESSION_SCANNING_KNOWLEDGE_BASE.md`/`docs/NEW_RUNTIME_ONBOARDING_KNOWLEDGE_BASE.md` 各存储形态的删除方式 |
 | 右栏静态预览和实时画面挂接 | `ui/embed_pane.py` | `show_detail()`、`focus_session()`、`scroll_detail()` | 本域仅管理呈现切换、焦点与详情滚动；不描述 tmux 实现 |
 | 多语言文案 | `i18n.py` | `_MESSAGES`、`detect_lang()`、`t()` | 新增用户可见文案必须同时给 en / zh；环境优先级在此定义 |
-| 宽字符与预览正文格式 | `src/pickup/cli.py` 等 | `_text_width()`、`_fit_cell()`、`_preview_lines()` | 中文、emoji 和组合字符按终端显示宽度处理；预览带角色与可选时间 |
+| 宽字符与预览正文格式 | `src/pickup/display.py` 等 | `_text_width()`、`_fit_cell()`、`_preview_lines()` | 中文、emoji 和组合字符按终端显示宽度处理；预览为「角色: 正文」同行，角色与正文同色，可选时间后缀 |
 | 本地截图与界面观测 | `observe.py`、`ui/main_screen.py` | `save_tui_screenshot()`、`action_save_screenshot()` | F12 导出当前真实 TUI；对话内容仅由用户主动截图，不能提交 |
 | 截图夹具验收 | `docs/screenshots/capture.py` | `_demo_store()`、`_capture()` | 用虚构会话生成左右栏截图，不读真实会话历史 |
 | 界面回归验证 | `test_ui.py` | `MainScreenNavigationTests`、`RightPanePreviewTests`、`SidebarVisualLayoutTests` 等 | Textual Pilot 覆盖导航、预览、弹窗、卡片、刷新和内嵌接线 |
@@ -213,7 +214,7 @@ stateDiagram-v2
 - **AI 易错点**【详情缓存失效】对话预览按历史文件 mtime 失效；列表扫描后右栏详情也必须失效并按稳定会话键重新读取当前快照。否则标题、状态、摘要或对话会停留在旧字典闭包里。
 - **AI 易错点**【右栏滚动语义】静态对话的 `detail_offset`（0 为顶部，增大表示更靠后）与实时画面的 `history_offset`（0 为直播底部）方向相反。滚轮进入静态对话时必须取反，保证“下滚看更晚内容”。选中预览默认钉在最新（`_detail_stick_bottom`）；用户离开底部后刷新不得强行钉回。
 - **AI 易错点**【SSH 真彩失真】TUI 颜色变脏/退化到 256 或 16 色，通常是远端缺 `COLORTERM=truecolor`（sshd 未 `AcceptEnv COLORTERM`），不是 pickup 为省带宽降色。见 `docs/MAINTAINER_GUIDE.md` 对应踩坑。
-- **AI 易错点**【点击选择】会动态增删的会话卡、新建项和弹窗菜单项必须关闭 Textual 文本拖选；它们的点击语义是选择/确认。右栏内嵌实时终端保留文本选择和 Ctrl+C 复制，不能全局关闭。
+- **AI 易错点**【点击选择】会动态增删的会话卡、新建项和弹窗菜单项必须关闭 Textual 文本拖选；它们的点击语义是选择/确认。右栏内嵌实时终端保留文本选择（划词抬起自动 OSC 52 复制；Ctrl+C 可再复制），不能全局关闭。
 - **AI 易错点**【窗口缩放必须防抖 + 冻结重排】拖动期禁止每次 Resize 都 `resize-window`/抓帧；停稳后再改托管窗。改窗后助手常会整屏重排数秒，**禁止把重排中间帧刷到右栏**——已有 live 画面时开启 capture hold，稳定或超时后再一次跳到最新（见 `EmbedPane._begin_resize_capture_hold`）。
 - **AI 易错点**【右栏顶栏与分栏标题】助手顶栏按钮靠右排列，背景必须与底部操作栏共用 `$footer-background`，避免出现割裂的纯黑色条。侧边栏与右栏之间、右栏各分栏之间统一保留一列空白间隔：`SplitPaneArea` 左侧 `margin-left: 1`，第二格及后续 `PaneCell` 左侧 `margin-left: 1`；不画任何分隔线或边框，避免终端字体把线条字符渲成连续方块。每格上下各有一条高亮条：标题栏（有标题/关闭）+ 无文字底条（`_PaneFooter`）；默认 `$surface`，聚焦时同步切到主题变量 `$pane-active-background`（`$primary-muted` 再提亮约 10%，便于分辨当前激活格，仍避免高饱和蓝条抢过内嵌内容），标题文字用 `auto 90%` 保证深浅主题下的对比度。禁止再用整圈边框或标题前圆点表示焦点。`PaneCell._sync_active_marker` / `set_title` 必须容忍标题栏/底条尚未挂上或已卸下（双击顶栏快速加格时焦点回调会落在中间态），禁止对 `_PaneHeader` / `_PaneFooter` 裸 `query_one`。
 - **AI 易错点**【壳层配色层级】pickup 自有主题是 `pickup-dark` / `pickup-light`（冷静工作台），不是 Textual 默认主题。筛选框用 `$panel` / 聚焦 `$primary-muted`，禁止再铺 `$primary-darken-*` 大色块；列表选中只靠主题 `block-cursor-*` 抬一层冷灰蓝底，**禁止**再给 `ListItem.-highlight` 加 `border-left`——`tall`/`solid` 边框在终端里会和选中底拼成「双蓝条」。分栏激活条用主题变量 `$pane-active-background`（muted 提亮约 10%），不要直接写死 hex 进 widget CSS。饱和色只留给助手标签、运行中状态、警告/错误。
@@ -251,7 +252,7 @@ python3 docs/screenshots/capture.py
 python3 -m pickup --limit 5
 ```
 
-人工进入终端界面确认：Footer 显示高级操作；高级操作动态列出运行时且默认选中第一个已安装的其他运行时；Esc 先关闭弹窗再退出；选择已结束会话时右栏展示完整对话及角色行；`/`、Down、Enter 与搜索框 Esc 的焦点行为正确。用户本人还应在真实终端点一次关键路径，这是本域最终的体验验收。
+人工进入终端界面确认：Footer 显示高级操作；高级操作动态列出运行时且默认选中第一个已安装的其他运行时；Esc 先关闭弹窗再退出；选择已结束会话时右栏展示完整对话（`角色: 消息` 同行且同色）；`/`、Down、Enter 与搜索框 Esc 的焦点行为正确。用户本人还应在真实终端点一次关键路径，这是本域最终的体验验收。
 
 4. 删除会话是不可恢复的破坏性操作，改动 `action_delete_session`/`ConfirmModal`/`SessionStore.remove_session` 或任一运行时的 `delete_session()` 后，必须在临时构造的假会话（而不是真实用户历史）上跑一遍 `x → x 确认` 全流程，确认：卡片立即消失（不必等下次重扫）；对应磁盘文件/目录/数据库行确实被删除；运行中/托管会话先结束再删；删除失败（如模拟磁盘异常）时卡片保留且有失败提示，不能静默摘除列表项。
 

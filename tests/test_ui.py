@@ -884,6 +884,32 @@ class SessionStoreRemoveSessionTests(unittest.TestCase):
         self.assertIsNotNone(store.find_session("claude:s1"))
         self.assertIsNotNone(store.find_session("claude:s2"))
 
+    def test_pending_delete_blocks_merge_scanned_reinsert(self) -> None:
+        store, _ = _make_store()
+        key = "claude:s0"
+        session = store.find_session(key)
+        self.assertIsNotNone(session)
+        scanned = {
+            runtime_id: list(bucket)
+            for runtime_id, bucket in store.sessions.items()
+        }
+        store.mark_pending_delete(key)
+        self.assertIsNone(store.find_session(key))
+        store._merge_scanned(scanned)
+        self.assertIsNone(store.find_session(key))
+
+    def test_abort_pending_delete_allows_merge_scanned_restore(self) -> None:
+        store, _ = _make_store()
+        key = "claude:s0"
+        scanned = {
+            runtime_id: list(bucket)
+            for runtime_id, bucket in store.sessions.items()
+        }
+        store.mark_pending_delete(key)
+        store.abort_pending_delete(key)
+        store._merge_scanned(scanned)
+        self.assertIsNotNone(store.find_session(key))
+
 
 class SessionCardVisualTests(unittest.TestCase):
     """侧边栏两行卡片的列布局和状态样式不能随刷新优化再次回退。"""
@@ -1193,6 +1219,85 @@ class MainScreenNavigationTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(clicked)
         self.assertIsInstance(app.return_value, pickup.LaunchRequest)
+
+    async def test_ctrl_click_multi_select_does_not_launch(self) -> None:
+        """Ctrl/Cmd+点击只 toggle 多选，不等价 Enter，也不退出应用。"""
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            cards = list(app.screen.query(SessionCard))
+            self.assertGreaterEqual(len(cards), 2)
+            await pilot.click(cards[0], control=True)
+            await pilot.pause()
+            await pilot.click(cards[1], control=True)
+            await pilot.pause()
+            self.assertEqual(list_view.multi_count(), 2)
+            self.assertIn("▸", cards[0].render().plain)
+            self.assertIn("▸", cards[1].render().plain)
+        self.assertIsNone(app.return_value)
+
+    async def test_enter_opens_split_for_multi_selected_sessions(self) -> None:
+        """多选 ≥2 后 Enter 在右栏开分屏（已结束会话走预览格）。"""
+        sessions = [
+            {
+                "source": "claude", "id": f"s{i}", "short_id": f"s{i}",
+                "mtime": time.time() - i * 100, "size_bytes": 1, "size_kb": 1,
+                "native_title": None, "fallback_title": f"Session {i}",
+                "cwd": "/tmp", "live": False,
+            }
+            for i in range(2)
+        ]
+        store, _ = _make_store(sessions=sessions)
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            cards = list(app.screen.query(SessionCard))
+            await pilot.click(cards[0], control=True)
+            await pilot.click(cards[1], control=True)
+            await pilot.pause()
+            self.assertEqual(list_view.multi_count(), 2)
+            await pilot.press("enter")
+            await pilot.pause()
+            area = app.screen.query_one(SplitPaneArea)
+            await _wait_until(lambda: len(area._cells()) == 2)  # noqa: SLF001
+            keys = area.ordered_session_keys()
+            self.assertEqual(len(keys), 2)
+            self.assertEqual(list_view.multi_count(), 0)
+        self.assertIsNone(app.return_value)
+
+    async def test_space_toggles_multi_select_on_focused_session(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            list_view.index = 1
+            await pilot.pause()
+            await pilot.press("space")
+            await pilot.pause()
+            self.assertEqual(list_view.multi_count(), 1)
+            await pilot.press("space")
+            await pilot.pause()
+            self.assertEqual(list_view.multi_count(), 0)
+
+    async def test_escape_clears_multi_select_before_quit(self) -> None:
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            list_view = app.screen.query_one(SessionListView)
+            cards = list(app.screen.query(SessionCard))
+            await pilot.click(cards[0], control=True)
+            await pilot.click(cards[1], control=True)
+            await pilot.pause()
+            self.assertEqual(list_view.multi_count(), 2)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(list_view.multi_count(), 0)
+        self.assertIsNone(app.return_value)
 
     async def test_list_item_gap_padding_is_part_of_hit_area(self) -> None:
         """会话卡第三行（时间行）仍属本卡命中区；不要用 ListItem margin/padding 做分隔。"""
@@ -1965,11 +2070,11 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertFalse(pane._real_cursor_shown, "失焦后应收起外层真实光标")
 
-    async def test_drag_select_then_ctrl_c_copies_to_clipboard(self) -> None:
-        """划词选中托管会话画面里的文字后按 Ctrl+C 应复制，不应转发中断信号。
+    async def test_drag_select_mouseup_auto_copies_to_clipboard(self) -> None:
+        """划词抬起后应自动经 OSC 52 复制，不必再按 Ctrl+C。
 
-        用的是 Textual 内置的鼠标拖拽文本选择（EmbedPane 没有设 ALLOW_SELECT=
-        False），取代旧版 curses 手写的框选高亮 + OSC 52 复制。"""
+        Textual Screen 在 MouseUp 时会发 TextSelected；MainScreen 有选区就
+        copy_to_clipboard。用的是内置拖选（EmbedPane 未关 ALLOW_SELECT）。"""
         store, registry = _make_store()
         registry.build_launch_plan = lambda request: LaunchPlan(
             ("bash", "-c", "printf 'HELLO-SELECT-ME\\n'; while true; do sleep 0.1; done"), None
@@ -1989,7 +2094,31 @@ class MainScreenEmbedFlowTests(unittest.IsolatedAsyncioTestCase):
             await pilot.mouse_up(pane, offset=Offset(14, 0))
             await pilot.pause(delay=0.2)
             self.assertEqual(app.screen.get_selected_text(), "HELLO-SELECT-ME")
+            self.assertEqual(app._clipboard, "HELLO-SELECT-ME")
 
+    async def test_drag_select_then_ctrl_c_still_copies_to_clipboard(self) -> None:
+        """划词后 Ctrl+C 仍可再次复制（兼容习惯；无选区时仍转发中断）。"""
+        store, registry = _make_store()
+        registry.build_launch_plan = lambda request: LaunchPlan(
+            ("bash", "-c", "printf 'HELLO-SELECT-ME\\n'; while true; do sleep 0.1; done"), None
+        )
+        app = PickupApp(store, embed_ok=True)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(delay=0.2)
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause(delay=0.5)
+            pane = _primary_embed_pane(app.screen)
+            self._hosted_names.append(pane.session_name)
+            await _wait_for_pane_text(pane, "HELLO-SELECT-ME")
+
+            await pilot.mouse_down(pane, offset=Offset(0, 0))
+            await pilot.hover(pane, offset=Offset(14, 0))
+            await pilot.mouse_up(pane, offset=Offset(14, 0))
+            await pilot.pause(delay=0.2)
+            self.assertEqual(app.screen.get_selected_text(), "HELLO-SELECT-ME")
+            # 清空后再按 Ctrl+C，确认手动复制路径仍可用
+            app._clipboard = ""
             await pilot.press("ctrl+c")
             await pilot.pause(delay=0.3)
         self.assertEqual(app._clipboard, "HELLO-SELECT-ME")

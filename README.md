@@ -128,6 +128,9 @@ around when their content updates; only genuinely new sessions appear, always pr
   hosted in the right-hand pane.
 - Click a runtime button above the right side to add that agent as another pane in the current project.
   Up to three panes may run together; click a pane to focus it and sync the sidebar selection.
+- `Ctrl`/`Cmd`-click (or `Space`) toggles multi-select on sidebar cards; with two or three selected,
+  `Enter` opens them as a split (ended sessions show conversation preview; live/hosted sessions
+  embed). `Esc` clears multi-select first. Plain click or arrow keys exit multi-select.
 - `Enter` resumes the selected session in the right-hand pane (or reconnects an already-hosted
   live terminal there). Keyboard focus stays on the sidebar so browsing shortcuts keep working;
   click the right pane when you want to type into the agent. Moving the selection alone never
@@ -140,11 +143,9 @@ around when their content updates; only genuinely new sessions appear, always pr
   scrolls conversation preview or live history; over the left sidebar it scrolls the session list.
   At the live edge, agents that request wheel input receive it directly; otherwise pickup browses
   tmux history.
-- Drag to select text in the embedded pane, then press `Ctrl+C` to copy it through OSC 52 (including
-  over SSH when the terminal supports it).
-- `m` (in the list/sidebar) toggles mouse reporting off and on — turn it off when you want
-  your terminal's native drag-to-select for a longer copying session; turn it back on to
-  resume wheel forwarding and embedded-pane text selection.
+- Drag to select text in the embedded pane — releasing the mouse copies it through OSC 52
+  automatically (including over SSH when the terminal supports it). `Ctrl+C` still re-copies
+  the current selection if you need it.
 - The terminal cursor is parked at the agent's own cursor position, so IME preedit popups
   (e.g. CJK input methods) appear right at the agent's input box, not at the bottom of the screen.
 - Dark/light theme detection inside panes is repaired on tmux ≥ 3.5a: `pickup` probes your real

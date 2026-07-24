@@ -16,7 +16,7 @@ import asyncio
 import os
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -85,12 +85,10 @@ def _main_bindings() -> list[Binding]:
         Binding("pageup", "preview_page_up", t("action.preview_page_up"), show=False, priority=True),
         Binding("pagedown", "preview_page_down", t("action.preview_page_down"), show=False, priority=True),
         Binding("escape", "quit_app", t("action.quit")),
-        # 不再单独绑 ctrl+c 退出：Textual 的 Screen 基类自带 ctrl+c -> copy_text
-        # （划词后复制选中文本），子类 BINDINGS 里重复同一个键会按键位覆盖掉
-        # 基类那条，绑了就会让"划词选中 EmbedPane 里的文字后按 Ctrl+C 复制"失效。
-        # 已用 Pilot 验证过：去掉这条后 ctrl+c 在运行时正确解析到
-        # screen.copy_text。Esc 已是文档化的主退出键；未选中任何文本时按 Ctrl+C
-        # 会走 Textual 默认的 help/quit 提示而非直接退出，但不影响 Esc 正常退出。
+        # 不再单独绑 ctrl+c 退出：Textual 的 Screen 基类自带 ctrl+c -> copy_text。
+        # 划词抬起已由 on_text_selected 自动复制；Ctrl+C 仍作手动再复制/无选区时
+        # EmbedPane 转发给托管会话中断。子类 BINDINGS 重复 ctrl+c 会盖掉基类复制绑定。
+        # Esc 是文档化的主退出键。
     ]
 
 
@@ -501,6 +499,8 @@ class MainScreen(Screen):
         if not self.embed_ok:
             return
         session_list = self.query_one(SessionListView)
+        if session_list.multi_count() > 0:
+            return
         area = self._split_area()
         if area.any_embed_focused():
             return
@@ -601,10 +601,11 @@ class MainScreen(Screen):
         out.append("\n")
         for i, (kind, line, suffix) in enumerate(lines):
             out.append("\n")
-            if kind == "assistant" and line.startswith("◆ "):
+            # 角色与正文同色：user 用 cyan，assistant 用该 runtime 品牌色，整段（含续行）一致。
+            if kind == "assistant":
                 style = runtime_style
             else:
-                style = {"user": "bold cyan", "assistant": "bold green", "dim": "dim"}.get(kind, "")
+                style = {"user": "bold cyan", "dim": "dim"}.get(kind, "")
             out.append(line, style=style)
             if suffix:
                 out.append(suffix, style="dim")
@@ -629,11 +630,45 @@ class MainScreen(Screen):
             return
         area.invalidate_all_details()
 
+    def _open_split_from_selection(self, keys: list[str]) -> None:
+        """按侧边栏多选组合开分屏（活跃会话内嵌，已结束会话预览）。"""
+        if not self.embed_ok or len(keys) < 2:
+            return
+        import pickup
+        from pickup import split_layout
+        from pickup.split_layout import MAX_PANES
+
+        keys = keys[:MAX_PANES]
+        focus_key = keys[0]
+        focus_session = self.store.find_session(focus_key)
+        project = pickup._normalize_cwd(focus_session.get("cwd")) if focus_session else ""
+        entries = self._build_hosted_entries(keys)
+        if len(entries) < 2:
+            self.app.bell()
+            return
+        area = self._split_area()
+        area.show_hosted_group(project, entries, focus_key=focus_key)
+        active_keys = [k for k in keys if self._is_session_active(k)]
+        if len(active_keys) >= 2:
+            self._split_store.set_group(project, active_keys, focus_key=focus_key)
+            split_layout.save_layout(self._split_store)
+        self._preview_gen += 1
+        for key in keys:
+            session = self.store.find_session(key)
+            if session is not None:
+                self._warm_conversation(session, self._preview_gen)
+
     # ---- 会话选择/新建 ----
 
     @work
     async def on_list_view_selected(self, event) -> None:
         session_list = self.query_one(SessionListView)
+        multi = session_list.multi_keys()
+        if len(multi) >= 2:
+            session_list.clear_multi()
+            self._open_split_from_selection(multi)
+            return
+        session_list.clear_multi()
         if session_list.is_new_session_selected():
             await self._start_new_session_flow()
             return
@@ -911,6 +946,7 @@ class MainScreen(Screen):
     def _on_pane_focused(self, session_key: str) -> None:
         """右栏某格拿到焦点后，侧边栏高亮切到同一会话（不改右栏布局）。"""
         list_view = self.query_one(SessionListView)
+        list_view.clear_multi()
         if not list_view.select_session_key(session_key):
             return
         self._save_split_layout()
@@ -928,11 +964,15 @@ class MainScreen(Screen):
             if event.input.value:
                 event.input.value = ""
             self.nav.project_query = ""
-            await self.query_one(SessionListView).rebuild(keep_selection=True)
+            list_view = self.query_one(SessionListView)
+            list_view.clear_multi()
+            await list_view.rebuild(keep_selection=True)
             self._update_header()
             return
         self.nav.project_query = event.value
-        await self.query_one(SessionListView).rebuild(keep_selection=True)
+        list_view = self.query_one(SessionListView)
+        list_view.clear_multi()
+        await list_view.rebuild(keep_selection=True)
         self._update_header()
         self._follow_current_selection()
 
@@ -944,6 +984,15 @@ class MainScreen(Screen):
         list_view.focus()
         if list_view.index is None:
             list_view.index = 1 if list_view.visible_sessions() else 0
+
+    def on_text_selected(self, event: events.TextSelected) -> None:
+        """划词抬起：有选区则经 OSC 52 自动复制（无需再按 Ctrl+C / ⌘C）。
+
+        Textual 在每次 MouseUp 都会发 TextSelected（含空点选）；无选区时跳过。
+        """
+        selected = self.get_selected_text()
+        if selected:
+            self.app.copy_to_clipboard(selected)
 
     def on_key(self, event) -> None:
         search = self.query_one("#project-search", Input)
@@ -1012,6 +1061,7 @@ class MainScreen(Screen):
         二次确认按 x（而不是复用 q），与结束会话共用同一套 ConfirmModal 交互形态，
         只是把确认键换成触发本动作的键，避免用户记混"删除按 x 确认却按了 q"。
         """
+        import asyncio
         import sqlite3
         import pickup
         from pickup import keepalive
@@ -1040,14 +1090,24 @@ class MainScreen(Screen):
             split_layout.save_layout(self._split_store)
             if self.embed_ok:
                 self._split_area().remove_by_keepalive(keepalive_name)
+        # 乐观 UI：确认后立刻从内存与侧边栏摘除；磁盘 delete 可能较慢（如 Cursor
+        # 整目录 rmtree），期间后台 refresh 仍可能扫到路径——tombstone 挡回灌。
+        self.store.mark_pending_delete(key)
+        await self._rebuild_list()
+        runtime = self.store.registry.get(str(session.get("source") or ""))
         try:
-            self.store.registry.get(str(session.get("source") or "")).delete_session(session)
+            await asyncio.to_thread(runtime.delete_session, session)
         except (LaunchError, OSError, sqlite3.Error) as exc:
+            self.store.abort_pending_delete(key)
+            try:
+                self.store.refresh()
+            except Exception:
+                pass
+            await self._rebuild_list()
             self.notify(t("notify.delete_failed", error=exc))
             self.app.bell()
             return
-        self.store.remove_session(key)
-        await self._rebuild_list()
+        self.store.finish_pending_delete(key)
 
     def action_close_pane(self) -> None:
         if not self.embed_ok:
@@ -1141,10 +1201,14 @@ class MainScreen(Screen):
     def action_quit_app(self) -> None:
         # 搜索框聚焦时 Esc 先清空查询，再交回列表；列表上 Esc 才真正退出
         search = self.query_one("#project-search", Input)
+        list_view = self.query_one(SessionListView)
         if search.has_focus:
             if search.value:
                 search.value = ""
                 return
-            self.query_one(SessionListView).focus()
+            list_view.focus()
+            return
+        if list_view.has_focus and list_view.multi_count() > 0:
+            list_view.clear_multi()
             return
         self.app.exit(result=None)

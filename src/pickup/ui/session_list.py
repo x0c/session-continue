@@ -15,15 +15,29 @@ import time
 from typing import TYPE_CHECKING
 
 from rich.text import Text
+from textual import events
 from textual.binding import Binding
+from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import ListItem, ListView
 
 if TYPE_CHECKING:
     import pickup
 
+from pickup.i18n import t
+
 
 NEW_SESSION_ID = "__new_session__"
+
+
+class SessionMultiToggleRequested(Message):
+    """Ctrl/Cmd+点击会话卡：切换侧边栏多选集（不触发 ListView Selected）。"""
+
+    bubble = True
+
+    def __init__(self, session_key: str) -> None:
+        super().__init__()
+        self.session_key = session_key
 
 
 class SessionCard(Widget):
@@ -62,7 +76,22 @@ class SessionCard(Widget):
         # display_titles dict 和 generating set，卡片一多就是重复的拷贝开销。
         self.display_title = display_title if display_title is not None else session["fallback_title"]
         self.is_generating = is_generating
+        self._multi_selected = False
         self._render_signature = self._compute_signature()
+
+    def set_multi_selected(self, selected: bool) -> None:
+        if selected == self._multi_selected:
+            return
+        self._multi_selected = selected
+        self.refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        if not (event.ctrl or event.meta):
+            return
+        import pickup
+
+        event.stop()
+        self.post_message(SessionMultiToggleRequested(pickup.session_key(self.session)))
 
     def _compute_signature(self) -> tuple:
         """渲染相关字段的轻量快照，用来判定"内容是否真的变了"、要不要 refresh()。"""
@@ -70,6 +99,7 @@ class SessionCard(Widget):
         return (
             self.display_title,
             self.is_generating,
+            self._multi_selected,
             bool(session.get("live")),
             session.get("keepalive_name"),
             session.get("mtime"),
@@ -112,7 +142,8 @@ class SessionCard(Widget):
             else str(session.get("cwd_display") or t("project.unknown"))
         )
         spinner_prefix = f"{self._spin_char} " if is_gen else ""
-        title_prefix = f"{spinner_prefix}{project}: "
+        multi_prefix = "▸ " if self._multi_selected else ""
+        title_prefix = f"{multi_prefix}{spinner_prefix}{project}: "
         width = max(10, self.size.width or 40)
 
         runtime = store.registry.get(str(session.get("source") or ""))
@@ -182,6 +213,7 @@ class SessionListView(ListView):
         # 覆盖 ScrollableContainer 的 up/down=scroll_*：会话列表应移光标，不是滚视口
         Binding("down", "cursor_down", "Select", show=False),
         Binding("up", "cursor_up", "Select", show=False),
+        Binding("space", "toggle_multi", t("action.toggle_multi"), show=False),
     ]
 
     def __init__(self, store: "pickup.SessionStore", nav, **kwargs) -> None:
@@ -191,6 +223,7 @@ class SessionListView(ListView):
         # 页头占位文案 / 新建会话目录解析共用，禁止在本类另开一份状态。
         self.nav = nav
         self._spin_frame = 0
+        self._multi_keys: list[str] = []
 
     async def on_mount(self) -> None:
         await self.rebuild()
@@ -268,6 +301,76 @@ class SessionListView(ListView):
     def is_new_session_selected(self) -> bool:
         return self.index == 0
 
+    def multi_count(self) -> int:
+        return len(self._multi_keys)
+
+    def multi_keys(self) -> list[str]:
+        return list(self._multi_keys)
+
+    def clear_multi(self) -> None:
+        if not self._multi_keys:
+            return
+        self._multi_keys.clear()
+        self._apply_multi_markers()
+
+    def _prune_multi_keys(self, valid_keys: set[str]) -> None:
+        if not self._multi_keys:
+            return
+        self._multi_keys = [key for key in self._multi_keys if key in valid_keys]
+        self._apply_multi_markers()
+
+    def _apply_multi_markers(self) -> None:
+        import pickup
+
+        selected = set(self._multi_keys)
+        for card in self._session_cards():
+            key = pickup.session_key(card.session)
+            card.set_multi_selected(key in selected)
+
+    def _index_for_session_key(self, session_key: str) -> int | None:
+        import pickup
+
+        for i, card in enumerate(self._session_cards()):
+            if pickup.session_key(card.session) == session_key:
+                return i + 1
+        return None
+
+    def _toggle_multi_key(self, session_key: str) -> None:
+        from pickup.split_layout import MAX_PANES
+
+        if session_key in self._multi_keys:
+            self._multi_keys.remove(session_key)
+        else:
+            if len(self._multi_keys) >= MAX_PANES:
+                self.notify(t("split.multi_full"))
+                self.app.bell()
+                return
+            self._multi_keys.append(session_key)
+        target = self._index_for_session_key(session_key)
+        if target is not None:
+            self.index = target
+        self._apply_multi_markers()
+
+    def action_toggle_multi(self) -> None:
+        session = self.selected_session()
+        if session is None:
+            return
+        import pickup
+
+        self._toggle_multi_key(pickup.session_key(session))
+
+    def action_cursor_down(self) -> None:
+        self.clear_multi()
+        super().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.clear_multi()
+        super().action_cursor_up()
+
+    def on_session_multi_toggle_requested(self, event: SessionMultiToggleRequested) -> None:
+        event.stop()
+        self._toggle_multi_key(event.session_key)
+
     def select_session_key(self, session_key: str) -> bool:
         """按会话键设置列表高亮；找不到对应项时返回 False。
 
@@ -334,6 +437,7 @@ class SessionListView(ListView):
 
         sessions = self.visible_sessions()
         new_keys = [pickup.session_key(session) for session in sessions]
+        self._prune_multi_keys(set(new_keys))
         t0 = time.perf_counter()
 
         if new_keys == self._current_session_keys() and select_key is None:

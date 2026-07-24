@@ -102,8 +102,9 @@ def _preview_lines(
 ) -> list[tuple[str, str, str]]:
     """把真实会话消息整理为带角色样式的聊天记录行。
 
-    每行是 (kind, text, dim_suffix) 三元组：角色行的 dim_suffix 携带发送时间（用淡色
-    单独叠绘，不和角色名共用同一个高亮色），消息缺时间戳（老格式历史）或其余行留空。
+    每行是 (kind, text, dim_suffix) 三元组：首行格式为「角色: 消息内容」，续行按角色
+    前缀宽度缩进对齐正文；kind 为 user/assistant，渲染时整段（含正文）同色。
+    dim_suffix 只挂在首行（发送时间，淡色叠绘）；消息缺时间戳或续行留空。
     """
     content_width = max(1, width - 2)
     from pickup.i18n import t
@@ -117,13 +118,20 @@ def _preview_lines(
             lines.append(("blank", "", ""))
         time_suffix = f"  · {format_message_time(message.timestamp)}" if message.timestamp else ""
         if message.role == "user":
-            lines.append(("user", t("preview.you"), time_suffix))
+            kind = "user"
+            role = t("preview.you")
         else:
-            lines.append(("assistant", f"◆ {runtime_name}", time_suffix))
-        lines.extend(
-            ("body", f"  {line}", "")
-            for line in _wrap_preview_text(message.text.strip(), content_width)
-        )
+            kind = "assistant"
+            role = f"◆ {runtime_name}"
+        prefix = f"{role}: "
+        body_width = max(1, content_width - _text_width(prefix))
+        wrapped = _wrap_preview_text(message.text.strip(), body_width) or [""]
+        indent = " " * _text_width(prefix)
+        for i, part in enumerate(wrapped):
+            if i == 0:
+                lines.append((kind, f"{prefix}{part}", time_suffix))
+            else:
+                lines.append((kind, f"{indent}{part}", ""))
     return lines
 
 

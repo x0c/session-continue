@@ -143,6 +143,14 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "Select a session in a project first",
         "zh": "请先选择某个项目下的会话",
     },
+    "split.multi_full": {
+        "en": "At most 3 panes in a split",
+        "zh": "分屏最多三格",
+    },
+    "action.toggle_multi": {
+        "en": "Toggle multi-select",
+        "zh": "切换多选",
+    },
     "detail.pick_session": {
         "en": "Select a session to view details",
         "zh": "选择一个会话查看详情",

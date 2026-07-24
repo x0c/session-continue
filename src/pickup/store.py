@@ -52,6 +52,10 @@ class SessionStore:
         # 用户刚用 q 结束的会话键：杀掉到进程真正退出之间，扫描仍可能报 live=True。
         # 在确认已死之前强制按已结束展示，避免「托管 → 运行中 → 已结束」闪烁。
         self._force_ended: set[str] = set()
+        # 用户刚按 x 确认删除、磁盘抹除尚未完成（或正在进行）的会话键。
+        # 后台 refresh() 仍可能扫到尚未删净的路径；tombstone 阻止 _merge_scanned
+        # 把卡片灌回列表，直到 delete_session 成功或失败解除。
+        self._pending_deletes: set[str] = set()
         # 值是 (读取时的历史文件 mtime, 消息列表)；文件 mtime 变化就重读，
         # 修掉"同一次 pickup 内 / 关闭预览重开还是旧内容"的问题。
         self.conversations: dict[str, tuple[float | None, list[ConversationMessage]]] = {}
@@ -183,6 +187,17 @@ class SessionStore:
 
     def _merge_scanned(self, scanned: dict[str, list[dict]]) -> None:
         # 每个适配器负责按时间倒序返回，无需在界面层二次排序
+        with self.lock:
+            pending_deletes = set(self._pending_deletes)
+        if pending_deletes:
+            scanned = {
+                runtime_id: [
+                    session
+                    for session in bucket
+                    if session_key(session) not in pending_deletes
+                ]
+                for runtime_id, bucket in scanned.items()
+            }
         keepalive.annotate([session for bucket in scanned.values() for session in bucket])
 
         with self.lock:
@@ -305,6 +320,22 @@ class SessionStore:
                     if session_key(session) == key:
                         return session
         return None
+
+    def mark_pending_delete(self, key: str) -> None:
+        """x 确认后立刻摘除内存状态并打上 tombstone，卡片不必等磁盘 delete 完成。"""
+        with self.lock:
+            self._pending_deletes.add(key)
+        self.remove_session(key)
+
+    def finish_pending_delete(self, key: str) -> None:
+        """磁盘 delete_session 成功后解除 tombstone。"""
+        with self.lock:
+            self._pending_deletes.discard(key)
+
+    def abort_pending_delete(self, key: str) -> None:
+        """磁盘 delete_session 失败：解除 tombstone，交由 refresh() 从磁盘恢复。"""
+        with self.lock:
+            self._pending_deletes.discard(key)
 
     def remove_session(self, key: str) -> None:
         """从当前内存状态里彻底摘除一条会话，供删除动作调用后立即消失。

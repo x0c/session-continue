@@ -1,6 +1,6 @@
 [package]
 name = "pickup-native"
-version = "0.24.4"
+version = "0.24.5"
 edition = "2021"
 description = "Native hot-path accelerator for pickup"
 homepage = "https://github.com/x0c/pickup"
