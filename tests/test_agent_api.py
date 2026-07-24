@@ -226,6 +226,74 @@ class AgentApiTests(unittest.TestCase):
         self.assertEqual(set(result["data"]), {"id", "cwd", "pid", "live"})
         self.assertEqual(result["data"]["cwd"], "/tmp/weather-app")
 
+    # ---- export ----
+
+    def _export_registry(self):
+        """三条不同时间的会话：便于验证 export 的时间范围过滤与正序排列。"""
+        older = _session(self.history_path, id="1111", short_id="1111", mtime=1700001000.0)
+        mid = _session(self.history_path, id="2222", short_id="2222", mtime=1700002000.0)
+        newer = _session(self.history_path, id="3333", short_id="3333", mtime=1700003000.0)
+        runtime = FakeRuntime(
+            [newer, older, mid],  # 乱序传入，验证 export 自己按 mtime 正序输出
+            {sid: self.messages for sid in ("1111", "2222", "3333")},
+        )
+        return RuntimeRegistry((runtime,))
+
+    def _export_args(self, **overrides):
+        base = dict(since=None, until=None, runtime=None, status=None, cwd=None,
+                    limit=200, out=None, compact=False)
+        base.update(overrides)
+        return argparse_namespace(**base)
+
+    def test_cmd_export_filters_by_time_range_and_sorts_ascending(self) -> None:
+        registry = self._export_registry()
+        result = agent_api.cmd_export(self._export_args(since="1700001500", until="1700003500"), registry)
+        data = result["data"]
+        self.assertEqual(data["count"], 2)
+        self.assertEqual([s["id"] for s in data["sessions"]], ["2222", "3333"])  # mtime 正序
+        self.assertEqual(data["range"]["since"], 1700001500.0)
+        self.assertEqual(data["range"]["until"], 1700003500.0)
+
+    def test_cmd_export_includes_full_conversation(self) -> None:
+        registry = self._export_registry()
+        result = agent_api.cmd_export(self._export_args(), registry)
+        self.assertEqual(result["data"]["count"], 3)
+        first = result["data"]["sessions"][0]
+        self.assertEqual(first["message_count_total"], 4)
+        self.assertEqual(first["messages"][0]["text"], "帮我做一个天气 App")
+
+    def test_cmd_export_rejects_inverted_range(self) -> None:
+        with self.assertRaises(agent_api.ApiError) as cm:
+            agent_api.cmd_export(self._export_args(since="1700003000", until="1700001000"), self._export_registry())
+        self.assertEqual(cm.exception.exit_code, agent_api.EXIT_USAGE)
+
+    def test_cmd_export_out_writes_merged_file_and_returns_summary(self) -> None:
+        registry = self._export_registry()
+        out_path = str(Path(self._tmpdir.name) / "export.json")
+        result = agent_api.cmd_export(self._export_args(out=out_path), registry)
+        self.assertEqual(result["data"]["session_count"], 3)
+        self.assertTrue(result["data"]["sessions_omitted"])
+        self.assertNotIn("sessions", result["data"])
+        with open(out_path, encoding="utf-8") as fp:
+            envelope = json.load(fp)
+        self.assertEqual(envelope["data"]["count"], 3)
+        self.assertEqual(len(envelope["data"]["sessions"]), 3)
+
+    def test_parse_time_bound_supports_relative_absolute_and_epoch(self) -> None:
+        self.assertEqual(agent_api._parse_time_bound("1700000000", is_until=False), 1700000000.0)
+        # 只给日期时 --until 补足到当天 23:59:59，--since 落在当天 0 点
+        since = agent_api._parse_time_bound("2026-07-20", is_until=False)
+        until = agent_api._parse_time_bound("2026-07-20", is_until=True)
+        self.assertAlmostEqual(until - since, 86399, delta=1)
+        # 相对时间距今约 24h
+        with mock.patch.object(agent_api.time, "time", return_value=1_000_000.0):
+            self.assertEqual(agent_api._parse_time_bound("24h", is_until=False), 1_000_000.0 - 86400)
+
+    def test_parse_time_bound_rejects_garbage(self) -> None:
+        with self.assertRaises(agent_api.ApiError) as cm:
+            agent_api._parse_time_bound("not-a-time", is_until=False)
+        self.assertEqual(cm.exception.exit_code, agent_api.EXIT_USAGE)
+
     # ---- context ----
 
     def test_cmd_context_returns_handoff_and_resume_command(self) -> None:

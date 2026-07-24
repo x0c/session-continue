@@ -14,7 +14,9 @@ import argparse
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 from pickup import keepalive
 from pickup import titles
@@ -455,6 +457,124 @@ def cmd_show(args, registry) -> dict:
     return _ok(_apply_fields(payload, fields))
 
 
+_REL_TIME_UNITS = {"d": 86400, "h": 3600, "m": 60}  # 相对时间单位：天 / 时 / 分
+
+
+def _parse_time_bound(raw: str, *, is_until: bool) -> float:
+    """把时间边界文本解析为 Unix 时间戳。
+
+    支持：相对时间 `7d`/`24h`/`30m`（距现在多久之前）、绝对时间
+    `2026-07-20` / `2026-07-20 15:30` / `2026-07-20 15:30:45`、以及纯 Unix 时间戳。
+    只给日期（无时分）时，`--until` 侧补足到当天 23:59:59，保证含当天全部会话。
+    """
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[-1] in _REL_TIME_UNITS and raw[:-1].isdigit():
+        return time.time() - int(raw[:-1]) * _REL_TIME_UNITS[raw[-1]]
+    if raw.isdigit() and len(raw) >= 6:  # 长数字按 Unix 时间戳；短数字留给日期格式报错
+        return float(raw)
+    for fmt, date_only in (("%Y-%m-%d %H:%M:%S", False), ("%Y-%m-%d %H:%M", False), ("%Y-%m-%d", True)):
+        try:
+            dt = datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+        if date_only and is_until:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.timestamp()
+    raise ApiError(
+        "usage_error",
+        f"无法解析时间：{raw}（支持 2026-07-20、'2026-07-20 15:30'、7d/24h/30m 或 Unix 时间戳）",
+        EXIT_USAGE,
+    )
+
+
+def cmd_export(args, registry) -> dict:
+    """按时间范围导出区间内所有会话的完整对话，合并为一个 JSON。
+
+    只读：与 list 共用扫描 / 过滤，与 show --full 共用完整对话结构；不触发任何拉起或写会话操作。
+    """
+    since = _parse_time_bound(args.since, is_until=False) if args.since else None
+    until = _parse_time_bound(args.until, is_until=True) if args.until else None
+    if since is not None and until is not None and since > until:
+        raise ApiError("usage_error", "起始时间晚于结束时间", EXIT_USAGE)
+
+    compact = getattr(args, "compact", False)
+    runtimes = [registry.get(args.runtime)] if args.runtime else list(registry)
+    cache = titles.load_cache()
+
+    scanned = _scan_runtimes(runtimes, args.limit)
+    keepalive.annotate([session for bucket in scanned.values() for session in bucket])
+
+    candidates = []
+    for runtime in runtimes:
+        for session in scanned[runtime.id]:
+            mtime = session.get("mtime")
+            if since is not None and (mtime is None or mtime < since):
+                continue
+            if until is not None and (mtime is None or mtime > until):
+                continue
+            if args.status and STATUS_LABELS.get(session.get("status_tag") or "", "unknown") != args.status:
+                continue
+            if args.cwd and args.cwd.lower() not in str(session.get("cwd") or "").lower():
+                continue
+            candidates.append((runtime, session))
+
+    # 时间正序排列，导出文件从早到晚顺读即为一条时间线
+    candidates.sort(key=lambda item: item[1].get("mtime") or 0)
+
+    sessions = []
+    for runtime, session in candidates:
+        payload = session_payload(session, cache, runtime)
+        messages = _load_conversation(runtime, session)
+        payload["messages"] = [
+            {
+                "role": m.role,
+                "text": m.text,
+                "time": format_message_time(m.timestamp) if m.timestamp else None,
+                "mtime": m.timestamp,
+            }
+            for m in messages
+        ]
+        payload["message_count_total"] = len(messages)
+        sessions.append(payload)
+
+    data = {
+        "range": {
+            "since": since,
+            "until": until,
+            "since_display": format_message_time(since) if since else None,
+            "until_display": format_message_time(until) if until else None,
+        },
+        "count": len(sessions),
+        "scan_limit": args.limit,
+        "sessions": sessions,
+    }
+
+    out = getattr(args, "out", None)
+    if not out:
+        return _ok(data)
+
+    envelope = _ok(data)
+    output_path = os.path.abspath(out)
+    parent = os.path.dirname(output_path) or "."
+    if not os.path.isdir(parent):
+        raise ApiError("usage_error", f"输出目录不存在：{parent}", EXIT_USAGE)
+    if os.path.isdir(output_path):
+        raise ApiError("usage_error", f"输出路径是目录：{output_path}", EXIT_USAGE)
+    with open(output_path, "w", encoding="utf-8") as fp:
+        json.dump(envelope, fp, ensure_ascii=False,
+                  separators=(",", ":") if compact else None,
+                  indent=None if compact else 2)
+        fp.write("\n")
+    return _ok({
+        "output_path": output_path,
+        "output_bytes": os.path.getsize(output_path),
+        "session_count": len(sessions),
+        "message_count_total": sum(s["message_count_total"] for s in sessions),
+        "range": data["range"],
+        "sessions_omitted": True,
+    })
+
+
 def cmd_context(args, registry) -> dict:
     session = resolve_ref(registry, args.session, args.limit)
     cache = titles.load_cache()
@@ -678,6 +798,27 @@ COMMANDS = [
         },
     },
     {
+        "name": "export",
+        "help": "导出某个时间范围内所有会话的完整对话，合并为一个 JSON",
+        "args": [
+            {"flags": ["--since"], "kwargs": {"help": "起始时间（含）：2026-07-20 / '2026-07-20 15:30' / 7d、24h、30m（距今）/ Unix 时间戳；省略则不设下界"}},
+            {"flags": ["--until"], "kwargs": {"help": "结束时间（含）：格式同 --since；只给日期时按当天 23:59:59 计；省略则不设上界"}},
+            {"flags": ["--runtime"], "kwargs": {"help": "只导出指定运行时（claude / codex / opencode / kimi / cursor）"}},
+            {"flags": ["--status"], "kwargs": {"choices": ["done", "pending", "aborted", "unknown"], "help": "按状态过滤"}},
+            {"flags": ["--cwd"], "kwargs": {"help": "按工作目录子串过滤（大小写不敏感）"}},
+            {"flags": ["--limit"], "kwargs": {"type": int, "default": 200, "help": "每个运行时最多扫描多少条历史（扫描深度）"}},
+            {"flags": ["--out"], "kwargs": {"help": "写入指定 JSON 文件；省略则打到 stdout。大范围导出建议用 --out"}},
+            {"flags": ["--compact"], "kwargs": {"action": "store_true", "help": "使用紧凑 JSON"}},
+        ],
+        "fields": {
+            "range": "本次导出的时间范围；since/until 为 Unix 时间戳，*_display 为人类可读，null 表示该侧无界",
+            "count": "命中的会话数",
+            "scan_limit": "本次每个运行时的扫描深度（同 --limit）",
+            "sessions": "按最后更新时间正序排列的会话数组；每条含 list 的全部字段，外加 messages 完整对话（结构同 show --full）与 message_count_total",
+            "output_path": "--out 模式下写入的 JSON 文件绝对路径；此模式 stdout 只回文件引用摘要，sessions_omitted 为 true",
+        },
+    },
+    {
         "name": "context",
         "help": "生成接续该会话所需的完整上下文数据包（不执行任何操作）",
         "args": [
@@ -757,6 +898,7 @@ HANDLERS = {
     "list": cmd_list,
     "search": cmd_search,
     "show": cmd_show,
+    "export": cmd_export,
     "context": cmd_context,
     "plan continue": cmd_plan_continue,
     "describe": cmd_describe,
