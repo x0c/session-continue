@@ -76,6 +76,19 @@ def _row_to_strip(row: list) -> Strip:
     return Strip([Segment(text[start:end], style) for start, end, style in spans])
 
 
+def _overlay_style(strip: Strip, style: Style) -> Strip:
+    """把 style 作为「后置样式」叠加到 Strip 每个 Segment 之上。
+
+    `Strip.apply_style` 用的是「基础样式」语义（内部 `style + segment.style`），
+    自带 ANSI 背景色的单元格（tmux 帧里染了底色的格子）会用自己的背景把叠加的
+    选区背景顶掉——表现为「选中一段带背景色的文字后，高亮背景盖不住原背景色，
+    看不出选中效果」。这里改用 `post_style`（内部 `segment.style + style`），让选区
+    样式反过来覆盖每个 Segment 原有的背景/前景：选区背景强制生效，整行统一显示
+    选中高亮；`style` 未设前景时（透明前景语义）仍保留原文字前景色。
+    """
+    return Strip(Segment.apply_style(list(strip), None, style), strip.cell_length)
+
+
 def _row_cell_width(row) -> int:
     """兼容 Python Cell 网格和原生解析器的预编译行，返回终端格宽度。"""
     if isinstance(row, embed.ParsedRow):
@@ -581,7 +594,7 @@ class EmbedPane(Widget):
         selection_style = self._selection_style()
         return Strip.join((
             strip.crop(0, cell_start),
-            strip.crop(cell_start, cell_end).apply_style(selection_style),
+            _overlay_style(strip.crop(cell_start, cell_end), selection_style),
             strip.crop(cell_end),
         ))
 

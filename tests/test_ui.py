@@ -2471,6 +2471,60 @@ class EmbedPaneSelectionStyleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seg.style.color.triplet.hex, "#e0e0e0")
             self.assertNotEqual(seg.style.color, seg.style.bgcolor)
 
+    async def test_selection_overrides_cell_own_background(self) -> None:
+        """自带 ANSI 背景色的单元格（tmux 帧里染了底色的格子）被选中时，选区高亮
+        背景必须盖住原背景色，整段统一显示选中色——否则"选了带背景色的文字看不出
+        选中效果"（本次真机反馈的根因）。
+
+        根因：`Strip.apply_style` 是基础样式语义（`selection + cell`），单元格自带的
+        背景色会把选区背景顶掉。`_apply_selection` 改用 `_overlay_style`（后置样式，
+        `cell + selection`）后，选区背景强制覆盖，同时留空前景以保留原文字色。"""
+        from unittest.mock import PropertyMock
+        from rich.segment import Segment
+        from rich.style import Style
+        from textual.strip import Strip
+        from textual.selection import Selection
+        from textual.geometry import Offset
+
+        store, _ = _make_store()
+        app = PickupApp(store, embed_ok=False)
+        async with app.run_test(size=(120, 30)) as pilot:
+            pane = EmbedPane()
+            await app.screen.mount(pane)
+            await pilot.pause()
+
+            sel_style = pane._selection_style()
+            text = "STATUS"
+            # 整段自带红底白字（模拟状态栏/语法高亮的背景块）
+            strip = Strip(
+                [Segment(text, Style(color="#ffffff", bgcolor="#aa0000"))]
+            ).apply_offsets(0, 0)
+            selection = Selection(Offset(0, 0), Offset(len(text), 0))
+            with mock.patch.object(
+                EmbedPane, "text_selection",
+                new_callable=PropertyMock, return_value=selection,
+            ):
+                out = pane._apply_selection(strip, 0)
+
+            self.assertEqual(out.text, text, "选中带背景色的文字不能丢字")
+            for seg in out:
+                if not seg.text:
+                    continue
+                self.assertEqual(
+                    seg.style.bgcolor, sel_style.bgcolor,
+                    "选区背景必须覆盖单元格自带的 ANSI 背景色",
+                )
+                self.assertNotEqual(
+                    seg.style.bgcolor.triplet.hex if seg.style.bgcolor else None,
+                    "#aa0000",
+                    "原背景色不应残留",
+                )
+                # 前景保留原文字色（透明前景语义）
+                self.assertEqual(
+                    seg.style.color.triplet.hex, "#ffffff",
+                    "选中后应保留原文字前景色",
+                )
+
 
 class EmbedPaneResizeTests(unittest.IsolatedAsyncioTestCase):
     """窗口缩放：行宽即时裁补；tmux resize + 抓帧必须防抖，不能拖动期狂刷。"""
