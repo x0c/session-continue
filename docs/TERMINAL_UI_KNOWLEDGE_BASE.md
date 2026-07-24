@@ -185,8 +185,7 @@ stateDiagram-v2
 |---|---|---|---|
 | Textual 后台 worker | 首屏加载 | `MainScreen._await_initial_load()` | 先显示界面骨架，等待后台扫描完成，支持退出取消 |
 | Textual 后台 worker | 会话刷新 | `MainScreen._background_refresh_worker()` | 每 3 秒起步，连续空闲后最多退避到 10 秒；扫描变化才重建 |
-| Textual 定时器 | 标题缓存轮询 | `MainScreen._poll_cache()`，0.5 秒 | 后台标题生成完成后，更新标题与 spinner 而不重扫完整历史 |
-| Textual 定时器 | 标题 spinner | `SessionListView._tick_spinner()`，0.15 秒 | 只刷新正在生成标题的卡片；无生成任务直接返回 |
+| Textual 定时器 | 标题缓存轮询 | `MainScreen._poll_cache()`，0.5 秒 | 后台标题生成完成后原地刷新标题，不重扫完整历史；侧边栏不画生成中动画 |
 | 按键绑定 | 主操作 | `MainScreen.BINDINGS`、`_main_bindings()` | `a` 高级操作、`q` 结束、`x` 删除、`Esc` 退出、F12 截图；新建不走底栏快捷键 |
 | 分屏焦点同步 | 右栏 → 侧边栏 | `PaneCell._notify_pane_focused`、`MainScreen._on_pane_focused`、`SessionListView.select_session_key` | 聚焦某一分屏时侧边栏高亮切到对应会话；不得因此 remount 右栏 |
 | 按键路由 | 搜索与焦点 | `MainScreen.on_key()`、`on_input_submitted()` | `/` 聚焦筛选项目；Down/Enter 回列表；Esc 先清空查询再退出 |
@@ -209,7 +208,7 @@ stateDiagram-v2
 - **AI 易错点**【宽度不是字符数】侧边栏列宽、标题截断、运行时名右对齐和预览折行一律使用 Rich 的终端显示宽度工具链（`_text_width()` / `_fit_cell()`）；禁止用 `len()`、`ljust()` 或自写 East Asian Width 表。中文、emoji、组合字符会使字符数与终端格宽不一致。
 - **AI 易错点**【筛选状态单一来源】筛选项目只认 `NavState.project_query`。搜索框输入、列表渲染、页头数量和新建会话目录推导必须共用它；不要在列表或弹窗另存一份筛选值。
 - **AI 易错点**【右栏刷新线程边界】Textual 后台 worker 不得直接读写 Widget/DOM；扫描、读取对话和托管启动等阻塞工作在后台进行，结果通过 `call_from_thread()` 回到主线程。退出时 worker 必须可取消，不能用不可打断的无限等待或长 `sleep`。
-- **AI 易错点**【列表刷新策略】会话键的成员与顺序不变时，`SessionListView.rebuild()` 必须原地替换卡片数据，只刷新有变化的卡片；仅新增、删除或重排才清空重建。后台重扫、标题轮询和交互动作可能在同一帧要求重建，主屏必须把完整重建过程串行化；并发执行 `clear()` / `extend()` 会重复挂载固定 ID 的「新建会话」条目并让界面异常。标题 spinner 没有生成任务时直接返回，不能高频复制全部标题状态。回归：`test_screen_serializes_concurrent_list_rebuilds`。
+- **AI 易错点**【列表刷新策略】会话键的成员与顺序不变时，`SessionListView.rebuild()` 必须原地替换卡片数据，只刷新有变化的卡片；仅新增、删除或重排才清空重建。后台重扫、标题轮询和交互动作可能在同一帧要求重建，主屏必须把完整重建过程串行化；并发执行 `clear()` / `extend()` 会重复挂载固定 ID 的「新建会话」条目并让界面异常。标题生成中不在侧边栏画任何加载动画，标题只在缓存轮询命中变化时原地刷新。回归：`test_screen_serializes_concurrent_list_rebuilds`。
 - **AI 易错点**【推导原选中会话必须以 DOM 为准】后台重扫是先 `store.refresh()` 再 `call_from_thread` 触发 `rebuild()`，这一刻 store 已经变了（新会话按 mtime 置顶插入）但 DOM 卡片还是旧的。`rebuild()` 推导「重建前选中的是哪条会话」必须用 `_displayed_selected_key()`（按已渲染的 `_session_cards()` 索引 `self.index`），不能用 `selected_session()`——它是按**刚重算过的** `visible_sessions()` 索引同一个 `self.index`，新会话已经把顺序打乱后，同一下标会指向别的会话。真实复现过：聚焦第三条时后台刷出一条新会话，高亮和右栏跟着串位跳到第二条。`selected_session()` 仍可安全用于用户交互期（回车/删除/结束会话等），那些时刻 DOM 与 store 本就同步。
 - **AI 易错点**【详情缓存失效】对话预览按历史文件 mtime 失效；列表扫描后右栏详情也必须失效并按稳定会话键重新读取当前快照。否则标题、状态、摘要或对话会停留在旧字典闭包里。
 - **AI 易错点**【右栏滚动语义】静态对话的 `detail_offset`（0 为顶部，增大表示更靠后）与实时画面的 `history_offset`（0 为直播底部）方向相反。滚轮进入静态对话时必须取反，保证“下滚看更晚内容”。选中预览默认钉在最新（`_detail_stick_bottom`）；用户离开底部后刷新不得强行钉回。

@@ -116,8 +116,9 @@ The derived cache defaults to 256 MiB and invalidates entries whenever the sourc
 
 `pickup` is a unified, time-ordered session timeline: Claude Code, Codex CLI, OpenCode, Kimi Code,
 and Cursor Agent sessions appear in one list rather than separate runtime tabs. Each card uses three
-rows for `project: title`, state plus runtime, and update time. Title generation uses a spinner without
-changing the title's weight. The right side follows the selection: finished sessions show their full
+rows for `project: title`, state plus runtime, and update time. While a title is being generated the
+card just shows its fallback title with no loading animation, then updates in place once the generated
+title lands. The right side follows the selection: finished sessions show their full
 conversation pinned to the newest message, while hosted sessions render live terminals. The runtime
 buttons above the right side can add another agent in the same project, up to three side-by-side panes;
 the active pane combination is remembered. Once the list is shown its order is stable — cards never jump
@@ -285,7 +286,7 @@ Cost controls:
 
 - generated titles are cached by runtime and session ID;
 - a file lock prevents duplicate title-generation workers;
-- failed, timed-out, invalid, or missing results keep the local fallback title and stop the spinner;
+- failed, timed-out, invalid, or missing results keep the local fallback title;
 - a failed title is not retried automatically on later launches, so it does not repeatedly consume
   account quota. A future title-cache upgrade may retry it under updated rules.
 
