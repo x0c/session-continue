@@ -1006,7 +1006,7 @@ class SessionCardVisualTests(unittest.TestCase):
             )
 
     def test_project_name_is_bold_but_title_is_not(self) -> None:
-        """侧边栏「项目名: 标题」：项目名 bold、标题 dim，形成可见对比。"""
+        """已结束会话「项目名: 标题」：项目名 bold、标题 dim，形成可见对比。"""
         card = self._card(cwd="/tmp/pickup", display_title="修复侧边栏展示")
         with mock.patch.object(
             SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 3),
@@ -1015,11 +1015,9 @@ class SessionCardVisualTests(unittest.TestCase):
 
         lines = rendered.plain.splitlines()
         first_line = lines[0]
-        second_line = lines[1]
         project_start = first_line.index("pickup")
         project_end = project_start + len("pickup")
         title_start = first_line.index("修复侧边栏展示")
-        runtime_start = second_line.rfind("OpenCode")
 
         project_spans = [
             span for span in rendered.spans
@@ -1066,27 +1064,28 @@ class SessionCardVisualTests(unittest.TestCase):
             )
         )
 
-    def test_running_status_is_green_but_ended_status_is_not(self) -> None:
+    def test_running_title_is_green_but_ended_title_is_not(self) -> None:
+        """进行中用绿色标题区分；侧边栏不再展示 Running / Ended 文案。"""
         cases = (
-            (self._card(live=True), "Running", True),
-            (self._card(keepalive_name="pickup-opencode-visual"), "Running (hosted)", True),
-            (self._card(), "Ended", False),
+            (self._card(live=True), "live", True),
+            (self._card(keepalive_name="pickup-opencode-visual"), "hosted", True),
+            (self._card(), "ended", False),
         )
-        for card, status_text, expected_green in cases:
-            with self.subTest(status=status_text), mock.patch.object(
+        for card, label, expected_green in cases:
+            with self.subTest(status=label), mock.patch.object(
                 SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 3),
             ):
                 rendered = card.render()
 
-            lines = rendered.plain.splitlines()
-            status_start = rendered.plain.index("\n") + 1
-            status_end = status_start + len(status_text)
-            # 运行中用略降饱和的成功绿，不用 ANSI green
+            plain = rendered.plain
+            self.assertNotIn("Running", plain)
+            self.assertNotIn("Ended", plain)
+            self.assertNotIn("hosted", plain.lower())
+            title_end = plain.index("\n")
             green_spans = [
                 span for span in rendered.spans
                 if "#3f9a6a" in str(span.style).lower()
-                and span.start <= status_start
-                and span.end >= status_end
+                and span.start < title_end
             ]
             self.assertEqual(bool(green_spans), expected_green)
 

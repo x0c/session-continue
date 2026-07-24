@@ -2,7 +2,8 @@
 
 侧边栏布局硬约定（凡往左栏加控件都必须遵守，见 AGENTS.md / MAINTAINER_GUIDE）：
 搜索框/新建项最后一行是间隔空行，画在控件自身高度内并算进命中区；禁止用 margin
-或兄弟空隙做分隔。当前：搜索框高 2、新建项高 2、会话卡高 3（三行正文，无末行空行）。
+或兄弟空隙做分隔。当前：搜索框高 2、新建项高 2、会话卡高 3（标题 / 运行时 /
+时间；进行中绿色标题，无状态文案，无末行空行）。
 
 业务格式化逻辑（相对时间、宽字符对齐、标题兜底）直接复用 pickup.py 里已测试的
 纯函数，这里只负责「怎么在 Textual 里画卡片、怎么响应选择」。
@@ -41,7 +42,11 @@ class SessionMultiToggleRequested(Message):
 
 
 class SessionCard(Widget):
-    """会话卡片：三行正文（总高 3）——标题 / 状态+运行时 / 时间。"""
+    """会话卡片：三行正文（总高 3）——标题 / 运行时 / 时间。
+
+    进行中（running / hosted）用绿色标题区分，已结束保持默认配色；不再展示
+    「运行中 / 已结束」等状态文案。
+    """
 
     # Textual 默认所有 Widget 都允许鼠标拖拽文本选择（ALLOW_SELECT=True）；这类
     # 卡片是"点击=选中该会话"的列表项，不是可选文本内容，必须关掉——否则鼠标
@@ -129,12 +134,6 @@ class SessionCard(Widget):
         is_running = is_keepalive or bool(session.get("live"))
         from pickup.i18n import t
 
-        status_text = (
-            t("status.running_hosted")
-            if is_keepalive
-            else (t("status.running") if is_running else t("status.ended"))
-        )
-
         project_path = pickup._normalize_cwd(session.get("cwd"))
         project = (
             os.path.basename(project_path)
@@ -151,26 +150,27 @@ class SessionCard(Widget):
         runtime_id = getattr(runtime, "id", None) or str(session.get("source") or "")
 
         title_cell = pickup._fit_cell(title_prefix + title, width, ellipsis=True)
-
-        runtime_width = min(width - 1, max(1, pickup._text_width(runtime_name)))
-        status_width = width - runtime_width
-        status_cell = pickup._fit_cell(status_text, status_width)
-        runtime_cell = pickup._fit_cell_right(runtime_name, runtime_width)
+        runtime_cell = pickup._fit_cell_right(runtime_name, width)
 
         relative_time = pickup._format_relative_time(session.get("mtime") or 0)
         time_cell = pickup._fit_cell_right(relative_time, width)
 
-        # 项目名 bold、其后「: 标题」dim——终端里比单纯 bold 更有对比。
+        # 进行中：整行标题用成功绿；已结束：项目名 bold、其后「: 标题」dim。
         out = Text(title_cell)
         content_len = len(title_cell.rstrip(" "))
-        project_start = len(spinner_prefix)
+        project_start = len(multi_prefix) + len(spinner_prefix)
         project_end = min(project_start + len(project), content_len)
-        if project_end > project_start:
-            out.stylize("bold", project_start, project_end)
-        if content_len > project_end:
-            out.stylize("dim", project_end, content_len)
+        if is_running:
+            if content_len > 0:
+                out.stylize("#3F9A6A", 0, content_len)
+            if project_end > project_start:
+                out.stylize("bold #3F9A6A", project_start, project_end)
+        else:
+            if project_end > project_start:
+                out.stylize("bold", project_start, project_end)
+            if content_len > project_end:
+                out.stylize("dim", project_end, content_len)
         out.append("\n")
-        out.append(status_cell, style="#3F9A6A" if is_running else "dim")
         out.append(runtime_cell, style=pickup.runtime_label_style(runtime_id))
         out.append("\n")
         out.append(time_cell, style="dim")

@@ -62,7 +62,7 @@ server (socket name `pickup-keepalive`) so the underlying process survives an SS
 what stays running after `pickup` exits:
 
 - The wrapped runtime process (and everything it does) keeps running in the background until it exits
-  on its own, is manually closed (`x` in the TUI), or is auto-reaped after being idle (default 24h, see
+  on its own, is manually closed (`x` in the TUI), or is auto-reaped after being idle (default 6h, see
   `PICKUP_KEEPALIVE_IDLE_HOURS`, legacy name `SC_KEEPALIVE_IDLE_HOURS`).
 - To detect which sessions are already backgrounded, `pickup` reads the local process table (`ps -eo
   pid,ppid`) and lists the tmux server's own sessions (`tmux -L pickup-keepalive list-sessions`). This is

@@ -172,7 +172,7 @@ class ReapIdleTests(unittest.TestCase):
     def test_kills_sessions_past_idle_threshold(self) -> None:
         # 新旧两种前缀的会话都要被回收（sc-* 是改名前留下的存量）
         rows = "pickup-claude-old|1000\nsc-claude-legacy|1000\npickup-claude-fresh|99999\n"
-        now = 100000.0  # 前两个空闲 99000 秒 ≈ 27.5 小时，超过默认 24 小时阈值
+        now = 100000.0  # 前两个空闲 99000 秒 ≈ 27.5 小时，超过默认 6 小时阈值
 
         with mock.patch.dict("os.environ", {}, clear=True), \
              mock.patch("pickup.keepalive.shutil.which", return_value="/usr/bin/tmux"), \

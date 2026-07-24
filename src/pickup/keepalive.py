@@ -26,7 +26,7 @@ from pickup.models import LaunchPlan
 SOCKET_NAME = "pickup-keepalive"
 SESSION_PREFIX = "pickup-"
 LEGACY_SESSION_PREFIX = "sc-"  # 项目改名 sessionContinue → pickup 前的旧会话名前缀
-_DEFAULT_IDLE_HOURS = 24.0
+_DEFAULT_IDLE_HOURS = 6.0
 _SUBPROCESS_TIMEOUT = 1.5
 _MAX_ANCESTOR_DEPTH = 20
 
@@ -231,7 +231,7 @@ def kill(name: str) -> bool:
 
 
 def reap_idle(now: float | None = None) -> list[str]:
-    """关闭空闲超过阈值（默认 24 小时，`PICKUP_KEEPALIVE_IDLE_HOURS=0` 禁用）的保活会话。
+    """关闭空闲超过阈值（默认 6 小时，`PICKUP_KEEPALIVE_IDLE_HOURS=0` 禁用）的保活会话。
 
     会话历史仍在各自运行时的磁盘记录里，关闭的只是 tmux 后台进程，不丢数据。
     """
